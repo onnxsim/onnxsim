@@ -390,16 +390,19 @@ class BisectError(RuntimeError):
 
 @dataclass(frozen=True)
 class ChangeUnit:
-    """A connected group of changed nodes and initializers, applied or reverted together.
+    """A connected group of changes, applied or reverted together.
 
-    ``nodes`` labels each node as ``name`` or ``op:first_output``. The ``_apply``
-    field holds the indices needed to build a state and is kept out of equality
-    and the repr.
+    ``nodes`` labels each changed node as ``name`` or ``op:first_output``.
+    ``blocks`` names the fusion blocks those changes fall in, such as ``Conv+Relu``;
+    under a fusion preset, changes in the same block always share one unit. The
+    ``_apply`` field holds the indices needed to build a state and is kept out of
+    equality and the repr.
     """
 
     index: int
     nodes: Tuple[str, ...]
     initializers: Tuple[str, ...]
+    blocks: Tuple[str, ...]
     _apply: Tuple[frozenset, Tuple[int, ...], frozenset] = field(
         repr=False, compare=False
     )
@@ -450,11 +453,71 @@ def _match_nodes(
     return matched, {i: j for j, i in matched.items()}
 
 
-def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
+# Fusion presets as (head ops, tail ops). A head starts a block, and a tail joins
+# the block when it consumes the block's output and nothing else does, so Conv+Relu
+# or MatMul+Add form one block, the way an accelerator's fused kernel would.
+_ACTIVATION_TAILS = (
+    "Relu",
+    "Clip",
+    "Sigmoid",
+    "Tanh",
+    "HardSigmoid",
+    "HardSwish",
+    "LeakyRelu",
+    "Elu",
+    "Gelu",
+    "Add",
+    "Mul",
+    "BatchNormalization",
+)
+FUSION_PRESETS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "node": ((), ()),
+    "conv-act": (("Conv", "ConvTranspose"), _ACTIVATION_TAILS),
+    "matmul-act": (("MatMul", "Gemm"), _ACTIVATION_TAILS),
+    "default": (("Conv", "ConvTranspose", "MatMul", "Gemm"), _ACTIVATION_TAILS),
+}
+
+
+def _fusion_blocks(
+    nodes: Sequence[NodeProto], outputs: Sequence[str], fusion: str
+) -> List[int]:
+    """Block id of each node of a topologically ordered graph under ``fusion``.
+
+    A node's block id is the index of the block's first node. A graph output is
+    never fused past, since its value has to exist on its own.
+    """
+    if fusion not in FUSION_PRESETS:
+        raise ValueError(
+            f"unknown fusion preset {fusion!r}; choose from {sorted(FUSION_PRESETS)}"
+        )
+    heads, tails = FUSION_PRESETS[fusion]
+    uses: Dict[str, int] = {o: 1 for o in outputs}
+    for n in nodes:
+        for t in n.input:
+            if t:
+                uses[t] = uses.get(t, 0) + 1
+    block_of: List[int] = []
+    open_out: Dict[str, int] = {}  # tensor -> block that can still grow through it
+    for idx, n in enumerate(nodes):
+        first = n.input[0] if n.input else ""
+        joined = n.op_type in tails and first in open_out and uses.get(first, 0) == 1
+        bid = open_out.pop(first) if joined else idx
+        block_of.append(bid)
+        if n.output and n.output[0] and (joined or n.op_type in heads):
+            open_out[n.output[0]] = bid
+    return block_of
+
+
+def _plan(base: ModelProto, cand: ModelProto, fusion: str) -> List[ChangeUnit]:
     """Split the difference between ``base`` and ``cand`` into units in apply order."""
     bn = list(base.graph.node)
     cn = list(cand.graph.node)
     matched, inverse = _match_nodes(bn, cn)
+    block_of = _fusion_blocks(bn, [o.name for o in base.graph.output], fusion)
+    block_of_tensor = {o: block_of[i] for i, n in enumerate(bn) for o in n.output if o}
+    members: Dict[int, List[int]] = {}
+    for i, b in enumerate(block_of):
+        members.setdefault(b, []).append(i)
 
     diff_cand = [
         j
@@ -475,16 +538,36 @@ def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
         != tensor_digest(numpy_helper.to_array(cand_inits[name]))
     )
 
-    # Items: ("base", i), ("cand", j), ("init", name). Each has produced and consumed tensors and a position.
-    items = []
+    # Items: (kind, ref, produced, consumed, position, block key). A block key is
+    # ("block", id) for a node that belongs to a fusion block, ("cand", j) for an
+    # added node outside any base block, and None for an initializer.
+    items: List[tuple] = []
     for i in diff_base:
         items.append(
-            ("base", i, bn[i].output, bn[i].input, inverse.get(i, len(cn) + i))
+            (
+                "base",
+                i,
+                bn[i].output,
+                bn[i].input,
+                inverse.get(i, len(cn) + i),
+                ("block", block_of[i]),
+            )
         )
     for j in diff_cand:
-        items.append(("cand", j, cn[j].output, cn[j].input, j))
+        if j in matched:
+            key = ("block", block_of[matched[j]])
+        else:
+            key = next(
+                (
+                    ("block", block_of_tensor[t])
+                    for t in cn[j].input
+                    if t in block_of_tensor
+                ),
+                ("cand", j),
+            )
+        items.append(("cand", j, cn[j].output, cn[j].input, j, key))
     for name in init_diff:
-        items.append(("init", name, [name], [], -1))
+        items.append(("init", name, [name], [], -1, None))
 
     parent = list(range(len(items)))
     producers: Dict[str, List[int]] = {}
@@ -499,6 +582,13 @@ def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
     for ks in producers.values():
         for p in ks[1:]:
             parent[_find(parent, p)] = _find(parent, ks[0])
+    first_in_key: Dict[tuple, int] = {}
+    for k, item in enumerate(items):
+        if item[5] is not None:
+            if item[5] in first_in_key:
+                parent[_find(parent, k)] = _find(parent, first_in_key[item[5]])
+            else:
+                first_in_key[item[5]] = k
 
     groups: Dict[int, List[int]] = {}
     for k in range(len(items)):
@@ -508,28 +598,50 @@ def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
     units = []
     for idx, group in enumerate(ordered):
         base_rm: Set[int] = set()
-        cand_add: List[int] = []
+        cand_add: Set[int] = set()
         inits: Set[str] = set()
         labels: List[str] = []
         init_names: List[str] = []
+        blocks: List[str] = []
+        block_ids: Set[int] = set()
         for k in sorted(group, key=lambda k: items[k][4]):
-            kind, ref = items[k][0], items[k][1]
+            kind, ref, key = items[k][0], items[k][1], items[k][5]
             if kind == "base":
                 base_rm.add(ref)
                 labels.append(_node_label(bn[ref]))
             elif kind == "cand":
-                cand_add.append(ref)
+                cand_add.add(ref)
                 labels.append(_node_label(cn[ref]))
             else:
                 assert isinstance(ref, str)
                 inits.add(ref)
                 init_names.append(ref)
+            if key is not None:
+                if key[0] == "block":
+                    block_ids.add(key[1])
+                    label = "+".join(bn[i].op_type for i in members[key[1]])
+                else:
+                    label = _node_label(cn[key[1]])
+                if label not in blocks:
+                    blocks.append(label)
+        # A fused block runs as one kernel, so applying any change in it swaps in
+        # every node of the block from the candidate, not only the changed ones.
+        for b in block_ids:
+            for i in members[b]:
+                base_rm.add(i)
+                if i in inverse:
+                    cand_add.add(inverse[i])
         units.append(
             ChangeUnit(
                 index=idx,
                 nodes=tuple(labels),
                 initializers=tuple(init_names),
-                _apply=(frozenset(base_rm), tuple(cand_add), frozenset(inits)),
+                blocks=tuple(blocks),
+                _apply=(
+                    frozenset(base_rm),
+                    tuple(sorted(cand_add)),
+                    frozenset(inits),
+                ),
             )
         )
     return units
@@ -627,19 +739,31 @@ def bisect_failure(
     cases: Sequence[Case],
     atol: float = 1e-5,
     rtol: float = 1e-4,
+    fusion: str = "default",
 ) -> Optional[BisectResult]:
     """Find the single modified subgraph that makes ``candidate`` fail against ``base``.
 
     Returns ``None`` when the candidate passes every case. Otherwise the change is
-    split into units (connected groups of modified nodes and initializers), and
-    binary search over the apply order finds the first prefix that fails. Its
-    last unit is the culprit. The search assumes that once a prefix fails, every
-    longer prefix also fails; a non-monotone change can point at a unit that is
-    not the real cause, so the result should be read with that in mind.
+    split into units, and binary search over the apply order finds the first
+    prefix that fails. Its last unit is the culprit.
+
+    A unit is a connected group of modified nodes and initializers, where changes
+    in the same fusion block are always grouped. ``fusion`` picks the block
+    preset: ``"default"`` fuses Conv or MatMul/Gemm heads with their activation
+    and elementwise tails, ``"conv-act"`` and ``"matmul-act"`` cover one head kind
+    each, and ``"node"`` gives one block per node.
+
+    The search assumes that once a prefix fails, every longer prefix also fails;
+    a non-monotone change can point at a unit that is not the real cause, so the
+    result should be read with that in mind.
     """
+    if fusion not in FUSION_PRESETS:
+        raise ValueError(
+            f"unknown fusion preset {fusion!r}; choose from {sorted(FUSION_PRESETS)}"
+        )
     if all(r.ok for r in check_equivalent(base, candidate, cases, atol, rtol)):
         return None
-    units = _plan(base, candidate)
+    units = _plan(base, candidate, fusion)
     if not units:
         raise BisectError(
             "the candidate fails but differs from the base in no node or initializer"

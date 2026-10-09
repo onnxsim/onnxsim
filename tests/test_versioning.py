@@ -309,3 +309,38 @@ def test_bisect_finds_the_harmful_change_among_benign_ones():
     assert "Abs:c" in result.culprit.nodes
     assert result.culprit.initializers == ("half",)
     assert result.evaluations == 1
+
+
+def _matmul_relu(weight_name, tail):
+    model = _model(
+        f"""
+        g (float[1,4] x) => (float[1,4] y)
+        {{
+          h = MatMul (x, {weight_name})
+          y = {tail}
+        }}
+        """
+    )
+    return model
+
+
+def test_fusion_block_names_the_head_and_tail_it_belongs_to():
+    base = _with_weight(_matmul_relu("W", "Relu (h)"), "W", W)
+    candidate = _with_weight(_matmul_relu("W2", "Relu (h)"), "W2", W + 1.0)
+    cases = [GeneratedCase("c", seed=0, specs=_spec())]
+
+    fused = bisect_failure(base, candidate, cases, fusion="default")
+    assert set(fused.culprit.nodes) == {"MatMul:h"}
+    assert fused.culprit.blocks == ("MatMul+Relu",)
+
+    per_node = bisect_failure(base, candidate, cases, fusion="node")
+    assert per_node.culprit.blocks == ("MatMul",)
+
+
+def test_unknown_fusion_preset_is_rejected():
+    base = _chain(_BASE_CHAIN)
+    candidate = _chain(_BASE_CHAIN.replace("Abs", "Neg"))
+    with pytest.raises(ValueError, match="unknown fusion preset"):
+        bisect_failure(
+            base, candidate, [GeneratedCase("c", 0, _spec())], fusion="bogus"
+        )
