@@ -125,6 +125,31 @@ def test_failures_inside_certify_never_break_simplify(monkeypatch, capsys):
     assert _meta(sim, "onnxsim.certify") == "error"
 
 
+def test_range_lookup_failure_never_breaks_simplify(monkeypatch, capsys):
+    def boom(*a, **k):
+        raise RuntimeError("bad range annotation")
+
+    monkeypatch.setattr(R, "get_ranges", boom)
+    sim, ok = onnxsim.simplify(_conv_bn_relu(), check_n=0)
+    assert isinstance(sim, onnx.ModelProto) and ok
+    assert _meta(sim, "onnxsim.certify") == "error"
+    assert "bad range annotation" in _meta(sim, "onnxsim.certify.detail")
+
+
+def test_malformed_report_never_breaks_simplify(monkeypatch):
+    import onnxsim.certify as C
+
+    class BadReport:
+        @property
+        def ok(self):
+            raise AttributeError("report has no verdict")
+
+    monkeypatch.setattr(C, "certify", lambda *a, **k: BadReport())
+    sim, ok = onnxsim.simplify(_conv_bn_relu())
+    assert isinstance(sim, onnx.ModelProto) and ok
+    assert _meta(sim, "onnxsim.certify") == "error"
+
+
 def test_check_n_draws_random_inputs_from_annotated_range(monkeypatch):
     m = _model("m (float[1,8] x) => (float[1,8] y) { y = Relu(x) }")
     R.set_range(m, "x", 10.0, 11.0)
