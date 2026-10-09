@@ -614,7 +614,11 @@ events. They use the same Chrome Trace/Perfetto output as local spans.
 
 On a machine with the AXCL SDK, configure with `-DONNX_REMOTE_AXCL=ON`.
 The resulting `onnx-remote-axcl-worker` accepts the `.axmodel` path as the
-request operation and currently requires float32 model inputs and outputs:
+request operation. Each tensor must carry the model's exact ONNX dtype and byte
+size: float32 travels in `data`; fp16, bf16, int8/int16/int32/int64 and the
+other integer and double types travel as raw little-endian bytes in
+`raw_data`. Outputs come back with the dtype the engine reports, so an LLM
+layer's bf16 hidden state and KV cache round-trip unchanged:
 
 ```sh
 cmake -S tools/onnx-remote -B build/onnx-remote \
