@@ -5,6 +5,10 @@
 // subgraph to an axmodel and use this worker as its Execute() transport.  The
 // worker accepts and returns float32 tensors, which matches the existing AX
 // operator-test corpus and avoids pulling a serializer onto the device.
+//
+// Tensors carry their own ONNX dtype: float32 in `data`, any other dtype
+// (fp16/bf16/int8/...) as raw little-endian bytes in `raw_data`. That is what
+// lets a compiled LLM layer (bf16 hidden state, KV cache and mask) run here.
 #include "remote_transport.h"
 
 #include <axcl.h>
@@ -92,6 +96,31 @@ static uint64_t elapsed_us(const std::chrono::steady_clock::time_point& start) {
       std::chrono::steady_clock::now() - start).count());
 }
 
+// AXCL engine dtype (axclrtEngineDataType) -> ONNX TensorProto.DataType, so a
+// tensor carries its real element type over the wire instead of float32 only.
+// Engine types with no ONNX counterpart (int4, fp8, fp4) are rejected.
+static bool onnx_dtype_of_axcl(uint32_t axcl, uint8_t& onnx) {
+  switch (axcl) {
+    // llm_build layers report their fp16 hidden state / KV cache / output as
+    // NONE rather than FLOAT16 (seen on llama_p64_l0_together.axmodel), so NONE
+    // is read as FLOAT16. Byte sizes are still checked against the engine.
+    case 0:  onnx = 10; return true;   // NONE -> FP16 (llm_build convention)
+    case 3:  onnx = 3;  return true;   // INT8
+    case 4:  onnx = 2;  return true;   // UINT8
+    case 5:  onnx = 5;  return true;   // INT16
+    case 6:  onnx = 4;  return true;   // UINT16
+    case 7:  onnx = 6;  return true;   // INT32
+    case 8:  onnx = 12; return true;   // UINT32
+    case 9:  onnx = 7;  return true;   // INT64
+    case 10: onnx = 13; return true;   // UINT64
+    case 13: onnx = 10; return true;   // FP16
+    case 14: onnx = 16; return true;   // BF16
+    case 15: onnx = 1;  return true;   // FP32
+    case 16: onnx = 11; return true;   // FP64
+    default: return false;
+  }
+}
+
 static Response execute_axmodel(const Request& request) {
   Response response;
   response.request_id = request.request_id;
@@ -109,8 +138,8 @@ static Response execute_axmodel(const Request& request) {
   std::vector<uint64_t> input_bytes, output_bytes;
   auto fail = [&](const std::string& message) {
     response.ok = false; response.error = message;
-    for (void* p : inputs) axclrtFree(p);
-    for (void* p : outputs) axclrtFree(p);
+    for (void* p : inputs) if (p) axclrtFree(p);
+    for (void* p : outputs) if (p) axclrtFree(p);
     if (io) axclrtEngineDestroyIO(io);
     if (info) axclrtEngineDestroyIOInfo(info);
     if (model) axclrtEngineUnload(model);
@@ -133,11 +162,21 @@ static Response execute_axmodel(const Request& request) {
     axclrtEngineDataType type{};
     axclrtEngineGetInputDataType(info, i, &type);
     input_bytes[i] = axclrtEngineGetInputSizeByIndex(info, 0, i);
-    if (type != 15 || input_bytes[i] != request.inputs[i].data.size() * sizeof(float) ||
+    // Float32 keeps its historical home in `data`; every other dtype travels
+    // as its little-endian payload in `raw_data`.
+    const Tensor& in = request.inputs[i];
+    uint8_t expected = 0;
+    if (!onnx_dtype_of_axcl(type, expected) || in.dtype != expected)
+      return fail("AXCL input " + std::to_string(i) + " dtype mismatch: model wants ONNX dtype " +
+                  std::to_string(expected) + ", request sent " + std::to_string(in.dtype));
+    const void* src = in.dtype == 1 ? static_cast<const void*>(in.data.data())
+                                    : static_cast<const void*>(in.raw_data.data());
+    const uint64_t src_bytes = in.dtype == 1 ? in.data.size() * sizeof(float) : in.raw_data.size();
+    if (input_bytes[i] != src_bytes ||
         axclrtMalloc(&inputs[i], input_bytes[i], AXCL_MEM_MALLOC_NORMAL_ONLY) ||
         axclrtEngineSetInputBufferByIndex(io, i, inputs[i], input_bytes[i]))
-      return fail("AXCL input must be float32 with the model's exact size");
-    if (axclrtMemcpy(inputs[i], request.inputs[i].data.data(), input_bytes[i], AXCL_MEMCPY_HOST_TO_DEVICE))
+      return fail("AXCL input " + std::to_string(i) + " must have the model's exact size");
+    if (axclrtMemcpy(inputs[i], src, input_bytes[i], AXCL_MEMCPY_HOST_TO_DEVICE))
       return fail("AXCL input upload failed");
   }
   response.outputs.resize(n_out);
@@ -146,27 +185,35 @@ static Response execute_axmodel(const Request& request) {
     axclrtEngineGetOutputDataType(info, i, &type);
     axclrtEngineGetOutputDims(info, 0, i, &dims);
     output_bytes[i] = axclrtEngineGetOutputSizeByIndex(info, 0, i);
-    if (type != 15 || output_bytes[i] % sizeof(float) ||
-        axclrtMalloc(&outputs[i], output_bytes[i], AXCL_MEM_MALLOC_NORMAL_ONLY) ||
+    Tensor& out = response.outputs[i];
+    if (!onnx_dtype_of_axcl(type, out.dtype) || dtype_bytes(out.dtype) == 0)
+      return fail("AXCL output " + std::to_string(i) + " has an unsupported dtype");
+    if (axclrtMalloc(&outputs[i], output_bytes[i], AXCL_MEM_MALLOC_NORMAL_ONLY) ||
         axclrtEngineSetOutputBufferByIndex(io, i, outputs[i], output_bytes[i]))
-      return fail("AXCL output must be float32");
-    response.outputs[i].shape.reserve(dims.dimCount);
+      return fail("AXCL output buffer setup failed");
+    out.shape.reserve(dims.dimCount);
     uint64_t elements = 1;
     for (int k = 0; k < dims.dimCount; ++k) {
-      response.outputs[i].shape.push_back(dims.dims[k]);
+      out.shape.push_back(dims.dims[k]);
       elements *= static_cast<uint64_t>(dims.dims[k]);
     }
-    if (elements * sizeof(float) != output_bytes[i]) return fail("AXCL output shape/size mismatch");
-    response.outputs[i].data.resize(static_cast<size_t>(elements));
+    if (elements * dtype_bytes(out.dtype) != output_bytes[i])
+      return fail("AXCL output shape/size mismatch");
+    if (out.dtype == 1) out.data.resize(static_cast<size_t>(elements));
+    else out.raw_data.resize(static_cast<size_t>(output_bytes[i]));
   }
   const uint64_t execute_begin = elapsed_us(started);
   if (axclrtEngineExecute(model, context, 0, io)) return fail("AXCL execute failed");
   add_profile("axcl_execute", execute_begin,
               elapsed_us(started) - execute_begin, "AXCL engine execution");
   const uint64_t download_begin = elapsed_us(started);
-  for (uint32_t i = 0; i < n_out; ++i)
-    if (axclrtMemcpy(response.outputs[i].data.data(), outputs[i], output_bytes[i], AXCL_MEMCPY_DEVICE_TO_HOST))
+  for (uint32_t i = 0; i < n_out; ++i) {
+    Tensor& out = response.outputs[i];
+    void* dst = out.dtype == 1 ? static_cast<void*>(out.data.data())
+                               : static_cast<void*>(out.raw_data.data());
+    if (axclrtMemcpy(dst, outputs[i], output_bytes[i], AXCL_MEMCPY_DEVICE_TO_HOST))
       return fail("AXCL output download failed");
+  }
   if (request.profiling == ProfilingLevel::Detailed) {
     add_profile("axcl_download", download_begin,
                 elapsed_us(started) - download_begin, "device-to-host outputs");
@@ -189,7 +236,8 @@ static Response execute_request(const Request& request) {
         "\"runner_id\":\"axcl-worker\",\"ready\":true,"
         "\"graph_execution\":false,"
         "\"supported_ops\":[\"load_compiled\",\"run_compiled\"],"
-        "\"supported_dtypes\":[\"FLOAT\"],"
+        "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\",\"DOUBLE\","
+        "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\",\"UINT32\",\"INT64\",\"UINT64\"],"
         "\"profiling\":true}";
     return response;
   }
