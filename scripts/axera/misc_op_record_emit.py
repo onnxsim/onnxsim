@@ -35,7 +35,9 @@ whole records only (``docs/axera-misc-op-record-emit.md``):
   lane pattern, one float32 formula per lane run:
 
   * Softmax: ``1/s_x``, ``s_x``, ``1/s_y``, ``s_y``, plus one ``0x1b10 = zp_x``
-    write before the first run (``zp_y`` is 0 and fixed);
+    write before the first run (``zp_y`` is 0 and fixed). The same rules
+    serve the last-axis ``[1, 64]`` template; ``softmax_codes`` is the op's
+    measured arithmetic and ``softmax_output_scale`` its calibration rule;
   * Log: ``1/s_x`` and ``s_y`` (the dequantize lanes), plus a 258-entry u8
     table (two u16 entries per record, registers ``0x1050..0x1850``;
     ``0x1850`` is written after an unrelated ``0x1860..0x1a50`` block):
@@ -349,6 +351,60 @@ def log_table(scales: Mapping[str, float], zero_points: Mapping[str, int]) -> li
         v = np.rint(np.log(q * sx) / sy) + int(zero_points["y"])
     v = np.clip(np.nan_to_num(v, nan=0.0, neginf=0.0), 0, 255).astype(int).tolist()
     return v + [v[255], 0]
+
+
+def minmax_input_calibration(samples: Sequence[np.ndarray]) -> tuple[float, int]:
+    """``(scale, zero_point)`` Pulsar2's MinMax gives a uint8 tensor from its
+    calibration samples: the range is widened to include 0, ``s = (hi - lo) /
+    255`` and ``zp = rint(-lo / s)``. Bit-exact in float32 on the five
+    ``Softmax:1x64:axis1`` held-out builds (zero points 64, 128 and 232)."""
+    lo = min(0.0, min(float(np.min(x)) for x in samples))
+    hi = max(0.0, max(float(np.max(x)) for x in samples))
+    scale = (hi - lo) / 255.0
+    return scale, int(np.rint(-lo / scale))
+
+
+def softmax_output_scale(samples: Sequence[np.ndarray], axis: int = -1) -> float:
+    """A Softmax output's scale: the largest probability over the calibration
+    samples divided by 255 (zero point 0), not ``1/255``. So the output
+    saturates at code 255 on any row whose largest probability exceeds what
+    calibration saw. Matches the held-out builds to 1e-7 relative (Pulsar2's
+    own float rounding)."""
+    top = 0.0
+    for x in samples:
+        x = np.asarray(x, dtype=np.float64)
+        e = np.exp(x - x.max(axis=axis, keepdims=True))
+        top = max(top, float((e / e.sum(axis=axis, keepdims=True)).max()))
+    return top / 255.0
+
+
+def softmax_codes(
+    x: np.ndarray,
+    scales: Mapping[str, float],
+    zero_points: Mapping[str, int],
+    axis: int = -1,
+) -> np.ndarray:
+    """Output codes of the compiled Softmax for float input ``x`` (the device
+    returns ``codes * s_y``).
+
+    The input is quantized to ``q = clip(rint(x / s_x) + zp_x, 0, 255)``. Each
+    element then depends only on its code distance below the row maximum,
+    ``d = max(q) - q``: ``p = exp(-d * s_x) / sum(exp(-d * s_x))`` and the code
+    is ``clip(rint(p / s_y), 0, 255)``. The quantized row is not renormalized.
+
+    Measured on an AX8850 at ``[1, 64]`` over six calibrations: every code is
+    within 1 of this model and 98.8% are equal; the misses all sit at rounding
+    ties. Shifting a row by whole input codes leaves the device output
+    bit-identical, which is what the distance form predicts
+    (``docs/axera-misc-op-record-emit.md``, "Softmax semantics")."""
+    sx = np.float32(scales["x"])
+    q = np.clip(
+        np.rint(np.asarray(x, dtype=np.float32) / sx) + int(zero_points["x"]), 0, 255
+    )
+    dist = q.max(axis=axis, keepdims=True) - q
+    t = np.exp(-dist.astype(np.float64) * float(sx))
+    p = t / t.sum(axis=axis, keepdims=True) / float(scales["y"])
+    return np.clip(np.rint(p), 0, 255).astype(np.int64)
 
 
 def _retarget_log_table(words, old_sc, new_sc, zp) -> list[bytes]:

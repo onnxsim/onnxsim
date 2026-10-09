@@ -122,6 +122,7 @@ record in both directions, and reproduces itself from its own calibration.
 | op (nodes) | template key | calibration records | status |
 | --- | --- | --- | --- |
 | Softmax (3) | `Softmax:16x1000:axis1` | lanes `1/s_x`, `s_x`, `1/s_y`, `s_y`; one `0x1b10 = zp_x` before the first run | conditional: `zp_x != 0`, `zp_y = 0` (a Softmax output always calibrates to 0). The held-out pair also moves `zp_x` 127 → 126 |
+| Softmax (not in the step) | `Softmax:1x64:axis1` | the same lanes and `0x1b10 = zp_x` write | same conditions. Five held-out builds cover `zp_x` 64, 128 and 232, device-checked on an AX8850 (see "Softmax at an LLM shape") |
 | Log (2) | `Log:16x1000` | lane `1/s_x`; a 258-entry u8 lookup table, two u16 entries per record at `0x1050..0x1850`: `clip(rint(log((q − zp_x)·s_x)/s_y) + zp_y, 0, 255)` for `q` = 0..255 (`log 0` → 0), then entry 255 again and 0. The table is exact on both builds. `0x1850` is written after an unrelated `0x1860..0x1a50` block, so the emitter finds table records by register | conditional: zero points fixed at the template's (0, 255). Log's input is a Softmax output, so `zp_x = 0` |
 | MaxPool (1) | `MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1` | lanes `1/s_x`, `s_x` (`s_y = s_x`) | conditional: zero points fixed (0; input is a Relu) |
 | ReduceMean (1) | `ReduceMean:16x512x7x7:axes2,3:k1` | lanes `1/s_x`, `s_x/(s_y·N)` (`N` = 49 reduced elements), `s_y` | conditional: zero points fixed (0; input is a Relu) |
@@ -234,3 +235,62 @@ with zero-point write omission on top. A sweep of 20+ builds of `Neg [1,1]`
   record, including the step's own class: the step's Neg inputs are
   cross-entropy sums (`<= 0`), which calibrate to `zp_x = 255, zp_y = 0`
   (`step_neg__v4`, large program).
+
+## Softmax at an LLM shape: `Softmax:1x64:axis1`
+
+A last-axis Softmax on `x[1, 64]` (float32 I/O, Pulsar2 7.0-lite, MinMax over 16
+samples) is one more template for the existing Softmax rules. Nothing in the emitter
+changed. Six builds at different calibrations have the same 3360-byte MCode layout and
+474 records in segment 2. They differ in 32 lane records (`1/s_x`, `s_x`, `1/s_y`, `s_y`
+on `0x0f50..0x0fc0`) and the `0x1b10 = zp_x` write. Rebuilding one calibration twice
+changes only segment 0's slot table, as elsewhere.
+
+| build | input range | `s_x` | `zp_x` | `s_y` |
+| --- | --- | --- | --- | --- |
+| template | U[−4, 4] | 0.031351 | 128 | 0.00070684 |
+| `softmax_1x64_pm1` | U[−1, 1] | 0.0078377 | 128 | 0.00015480 |
+| `softmax_1x64_pm8` | U[−8, 8] | 0.062702 | 128 | 0.0016829 |
+| `softmax_1x64_pm0p5` | U[−0.5, 0.5] | 0.0039189 | 128 | 0.00010082 |
+| `softmax_1x64_asym` | U[−1, 3] | 0.015675 | 64 | 0.00030302 |
+| `softmax_1x64_asym2` | U[−5, 0.5] | 0.021554 | 232 | 0.00044158 |
+
+Every held-out build retargets to every other one record for record (20 ordered pairs,
+plus `emit_spec` from the template with `axis=-1`).
+
+**On the device** (AX8850, AXCL V3.6.5, 2026-10-09): the template retargeted to each of
+the five held-out calibrations gives output bit-identical to the native build, 7,680
+values per build, 0 mismatches. The card's health check read 0.0 before and after.
+
+### Calibration rules
+
+* Input: the range is widened to include 0, `s_x = (hi − lo)/255`, `zp_x = rint(−lo/s_x)`.
+  Bit-exact in float32 on the five held-out builds (`minmax_input_calibration`).
+* Output: `s_y` is the largest probability seen in calibration divided by 255, with
+  `zp_y = 0` (`softmax_output_scale`). It is not `1/255`. It matches the builds to 1e-7
+  relative. A row whose largest probability exceeds the calibrated one saturates at code
+  255: 4 of 300 random rows at U[−4, 4], 13 of 120 at U[−0.5, 0.5].
+
+### Softmax semantics
+
+`softmax_codes` models the compiled op:
+
+    q    = clip(rint(x / s_x) + zp_x, 0, 255)
+    d    = max(q) − q                          # per row
+    p    = exp(−d · s_x) / Σ exp(−d · s_x)
+    code = clip(rint(p / s_y), 0, 255)         # the device returns code · s_y
+
+Against 46,080 device codes over the six calibrations, every code is within 1 of the
+model and 98.8% are equal (97.3% to 99.8% per build). The misses are all within about
+0.12 of a rounding tie, in both directions, so they are arithmetic precision and not
+structure. Evidence for the distance form: 40 rows, each shifted by ±16 and ±32 input
+codes, gave bit-identical device outputs. The quantized row is not renormalized (row
+sums 0.88 to 1.005).
+
+Not determined: the arithmetic behind the last 1.2% (a per-row scale factor explains
+465 of 500 rows, so it is not only the reciprocal of the sum; a table estimated from
+the capture matches `exp(−d · s_x)` to 0.15%, the noise floor of that estimate). Tie
+rounding is therefore unverified. Only `[1, 64]` was measured.
+
+A subset of the capture is committed (`fixtures/misc_op_record_emit/
+softmax_1x64_device.npz`: 20 rows per calibration and 6 shift probes) and checked by
+`tests/test_axera_misc_op_record_emit.py`.
