@@ -47,13 +47,40 @@ whole records only (``docs/axera-misc-op-record-emit.md``):
   * ReduceMean: ``1/s_x``, ``s_x/(s_y*N)`` with ``N`` the reduced element
     count, and ``s_y``.
 
-  Their zero points are fixed by the template except Softmax's ``zp_x``.
+  Their zero points are fixed by the template except Softmax's ``zp_x`` and
+  ReduceMean's: ReduceMean has ReduceSum's three zero-point stages (its
+  requantize ``0x1a90`` is ``zp_x * N``), so the ReduceSum rules below the
+  lanes, elision and re-padding included, retarget both of its zero points
+  (measured at ``[1, 64]``; ``zp_x = 0`` stays refused, as for ReduceSum).
 
 * **Neg** ``[1,1]`` (``s_y = s_x``, ``zp_y = 255 - zp_x``) compiles to one of
   two programs, picked by the scale alone (float32 ``s < 1/64``: small). Each
   has lanes ``1/s_x`` and ``s_x``, and zero-point writes on ``0x1a90``,
   ``0x1ad0`` and ``0x1b10`` that are omitted when the register already holds
   the value (outside register-block dumps), so any zero point retargets.
+
+* **Sigmoid, Mul, Add, Div** at ``[1, 64]`` (standalone, float32 I/O; scale
+  and zero-point keys ``x``/``y``, or ``a``/``b``/``y`` for two inputs). Lane
+  runs in program order, each preceded by a fixed list of zero-point writes on
+  ``0x1a90``/``0x1ad0``/``0x1b10``:
+
+  * Sigmoid: ``1/s_x`` (``0x1b10 = zp_x``) and ``s_y``, plus Log's table
+    layout holding ``clip(rint(sigmoid((q - zp_x) s_x) / s_y) + zp_y)``;
+  * Mul: ``1/s_a`` (``0x1b10 = zp_a``), ``1/s_b``, ``s_y/(s_a s_b)``
+    (``0x1a90 = 0x1ad0 = zp_a = zp_b``, ``0x1b10 = zp_y``) and ``s_y``
+    (``0x1a90 = zp_y``);
+  * Add: ``1/s_a`` (``0x1b10 = zp_a = zp_b``), ``1/s_b`` and ``s_y``
+    (``0x1a90 = zp_y``), plus the int32 ``add_offset`` on ``0x1ef0..0x1f20``.
+    The Q15 input weights ``add_q15`` live in ``npu_params``, which this
+    module does not rewrite;
+  * Div: ``1/s_a`` (``0x1b10 = zp_a``), ``1/s_b``, ``s_a/(s_b s_y)``
+    (``0x1a90 = zp_a``, ``0x1b10 = zp_y``) and ``s_y`` (``0x1a90 = zp_y``).
+
+  Refused because no build measured them: ``zp_a != zp_b`` (Mul, Add), a
+  nonzero Div ``zp_b`` or Sigmoid ``zp_y``, a zero point that is 0 on one side
+  of the retarget only, a write that would repeat its register's value where
+  the template's does not (or the reverse), and an Add target whose Q15
+  weights differ from the template's.
 
 * **Greater -> Cast** is not quantized at all. Builds at the same shape and
   different calibrations are record-identical except segment 0's slot table
@@ -128,8 +155,24 @@ OPS = (
     "MaxPool",
     "ReduceMean",
     "Neg",
+    "Sigmoid",
+    "Mul",
+    "Add",
+    "Div",
 )
 CALIBRATED = ("ReduceSum", "Sqrt", "Softmax", "Log", "MaxPool", "ReduceMean", "Neg")
+# standalone [1,64] ops whose lane runs are matched in program order
+STAGED = ("Sigmoid", "Mul", "Add", "Div")
+CALIBRATED += STAGED
+TWO_INPUT = ("Mul", "Add", "Div")
+ZP_AUX = 0x1AD0
+ADD_SHIFT = 0x1EA0  # holds 15 before Add's offset block
+ADD_OFFSET_BASE = 0x1EF0  # Add's int32 offset, four lanes
+ADD_OFFSET_LANES = 4
+ADD_Q15 = 15
+# verb 0xa8 records on these registers pick a slot of segment 0's slot table
+SLOT_VERB = 0xA8
+SLOT_REGS = (0x03D0, 0x02B0)
 LOG_TABLE_BASE = 0x1050
 LOG_TABLE_RECORDS = 129  # 258 u16 entries
 CALIBRATION_FREE = (
@@ -157,6 +200,8 @@ def lane_values(
 ) -> dict[str, int]:
     """Float32 bit patterns of each scale-lane formula of ``op``.
     ``reduce_count`` is ReduceMean's number of reduced elements."""
+    if op in TWO_INPUT:
+        return _two_input_lane_values(op, scales)
     sx, sy = float(scales["x"]), float(scales["y"])
     if op == "ReduceSum":
         vals = {"1/s_x": 1.0 / sx, "s_x/s_y": sx / sy, "s_y": sy}
@@ -180,8 +225,23 @@ def lane_values(
         if _f32(sx) != _f32(sy):
             raise ValueError("Neg shares one scale between input and output")
         vals = {"1/s_x": 1.0 / sx, "s_x": sx}
+    elif op == "Sigmoid":
+        vals = {"1/s_x": 1.0 / sx, "s_y": sy}
     else:
         raise ValueError(f"{op!r} has no scale lanes")
+    return {k: _bits(_f32(v)) for k, v in vals.items()}
+
+
+def _two_input_lane_values(op: str, scales: Mapping[str, float]) -> dict[str, int]:
+    """Mul/Add/Div lane formulas in program order (float32 scales combined in
+    float64, rounded to float32)."""
+    sa, sb, sy = (_f32(scales[k]) for k in ("a", "b", "y"))
+    vals = {"1/s_a": 1.0 / sa, "1/s_b": 1.0 / sb}
+    if op == "Mul":
+        vals["s_y/(s_a*s_b)"] = sy / (sa * sb)
+    elif op == "Div":
+        vals["s_a/(s_b*s_y)"] = sa / (sb * sy)
+    vals["s_y"] = sy
     return {k: _bits(_f32(v)) for k, v in vals.items()}
 
 
@@ -236,6 +296,8 @@ def _retarget_lanes(
     words, op, old, new, reduce_count=None
 ) -> tuple[list[bytes], list[tuple[int, str]]]:
     """Rewrite scale lanes; returns the words and each lane run's ``(index, kind)``."""
+    if op in STAGED:
+        return _retarget_ordered_lanes(words, op, old, new)
     old_v = lane_values(op, old, reduce_count)
     new_v = lane_values(op, new, reduce_count)
     _check_distinct(old_v, "template")
@@ -521,6 +583,219 @@ def _zp_in_word(words) -> bytes:
     raise ValueError("stream has no 0x1b10 record to copy")
 
 
+# Zero-point register writes (verb 0xa1) between the previous calibration lane
+# run and each lane run, in order: (register, zero-point key or the constant 0).
+_ZP_HEAD = ((ZP_ACC, 0), (ZP_AUX, 0))  # part of the 0x1a60.. block dump
+ZP_STAGE_WRITES = {
+    "Sigmoid": {"1/s_x": (*_ZP_HEAD, (ZP_IN, "x")), "s_y": ((ZP_IN, 0),)},
+    "Mul": {
+        "1/s_a": (*_ZP_HEAD, (ZP_IN, "a")),
+        "1/s_b": (),
+        "s_y/(s_a*s_b)": ((ZP_ACC, "a"), (ZP_AUX, "b"), (ZP_IN, "y")),
+        "s_y": ((ZP_ACC, "y"), (ZP_AUX, 0), (ZP_IN, 0)),
+    },
+    "Add": {
+        "1/s_a": (*_ZP_HEAD, (ZP_IN, "a")),
+        "1/s_b": (),
+        "s_y": ((ZP_ACC, "y"), (ZP_IN, 0)),
+    },
+    "Div": {
+        "1/s_a": (*_ZP_HEAD, (ZP_IN, "a")),
+        "1/s_b": ((ZP_IN, "b"),),
+        "s_a/(s_b*s_y)": ((ZP_ACC, "a"), (ZP_IN, "y")),
+        "s_y": ((ZP_ACC, "y"), (ZP_IN, 0)),
+    },
+}
+
+
+def _retarget_ordered_lanes(
+    words, op, old, new
+) -> tuple[list[bytes], list[tuple[int, str]]]:
+    """Sigmoid/Mul/Add/Div: the lane runs holding the template's values must
+    come in the op's program order, one run per formula. Matching by order
+    rather than by value alone lets two formulas coincide (``s_a == s_b``)."""
+    old_v, new_v = lane_values(op, old), lane_values(op, new)
+    order = list(old_v)
+    out = list(words)
+    kinds: list[tuple[int, str]] = []
+    for i, v in lane_runs(words):
+        if len(kinds) < len(order) and v == old_v[order[len(kinds)]]:
+            kind = order[len(kinds)]
+            kinds.append((i, kind))
+            for j in range(i, i + LANES):
+                out[j] = _with_val(out[j], new_v[kind])
+        elif kinds and v in old_v.values():
+            raise ValueError(f"{op} lane runs are not in the measured order {order}")
+    if kinds and len(kinds) != len(order):
+        raise ValueError(f"{op}: found lane runs {kinds}, expected {order}")
+    return out, kinds
+
+
+def sigmoid_table(
+    scales: Mapping[str, float], zero_points: Mapping[str, int]
+) -> list[int]:
+    """Sigmoid's u8 lookup table in Log's 258-entry layout: ``clip(rint(
+    sigmoid((q - zp_x) * s_x) / s_y) + zp_y, 0, 255)`` for ``q`` in 0..255,
+    then entry 255 repeated and a 0. Equal to the device on all 19,200 codes
+    of three calibrations (``docs/axera-misc-op-record-emit.md``)."""
+    sx, sy = _f32(scales["x"]), _f32(scales["y"])
+    q = np.arange(256, dtype=np.float64) - int(zero_points["x"])
+    v = np.rint(1.0 / (1.0 + np.exp(-q * sx)) / sy) + int(zero_points["y"])
+    v = np.clip(v, 0, 255).astype(int).tolist()
+    return v + [v[255], 0]
+
+
+def add_q15(scales: Mapping[str, float]) -> tuple[int, int]:
+    """Add's two input weights, ``round(s_a/s_y * 2**15)`` and ``round(s_b/s_y
+    * 2**15)``: the first two little-endian u16 of ``npu_params``."""
+    sa, sb, sy = (_f32(scales[k]) for k in ("a", "b", "y"))
+    return int(np.rint(sa / sy * 2**ADD_Q15)), int(np.rint(sb / sy * 2**ADD_Q15))
+
+
+def add_offset(scales: Mapping[str, float], zero_points: Mapping[str, int]) -> int:
+    """Add's int32 offset on ``0x1ef0..0x1f20``: ``trunc((zp_y - zp_a * r_a -
+    zp_b * r_b) * 2**15)`` with ``r = float32(s / s_y)``."""
+    sa, sb, sy = (_f32(scales[k]) for k in ("a", "b", "y"))
+    ra, rb = _f32(sa / sy), _f32(sb / sy)
+    zp = {k: int(zero_points[k]) for k in ("a", "b", "y")}
+    return int(np.trunc((zp["y"] - zp["a"] * ra - zp["b"] * rb) * 2**ADD_Q15))
+
+
+def _check_staged_target(op, old_scales, new_scales, old_zp, new_zp) -> None:
+    """Refuse what no Sigmoid/Mul/Add/Div build measured."""
+    keys = ("a", "b", "y") if op in TWO_INPUT else ("x", "y")
+    for zp in (old_zp, new_zp):
+        if set(zp) != set(keys):
+            raise ValueError(f"{op} needs zero points {keys}, got {sorted(zp)}")
+        if op in ("Mul", "Add") and int(zp["a"]) != int(zp["b"]):
+            raise ValueError(f"{op} with zp_a != zp_b is not measured")
+        if op == "Div" and int(zp["b"]) != 0:
+            raise ValueError("Div with zp_b != 0 is not measured")
+        if op == "Sigmoid" and int(zp["y"]) != 0:
+            raise ValueError("Sigmoid with zp_y != 0 is not measured")
+    for k in keys:
+        if (int(old_zp[k]) == 0) != (int(new_zp[k]) == 0):
+            raise ValueError(
+                f"{op} zp_{k} {old_zp[k]} -> {new_zp[k]}: a zero point of 0 on one "
+                "side only is not measured (write elision)"
+            )
+    if op == "Add" and add_q15(old_scales) != add_q15(new_scales):
+        raise ValueError(
+            f"Add Q15 weights {add_q15(new_scales)} differ from the template's "
+            f"{add_q15(old_scales)}; npu_params is not rewritten"
+        )
+
+
+def _repeated_writes(writes: Sequence[tuple[int, int]]) -> list[bool]:
+    """Which writes leave their register's value unchanged (registers start at 0)."""
+    state: dict[int, int] = {}
+    flags = []
+    for reg, v in writes:
+        flags.append(state.get(reg, 0) == v)
+        state[reg] = v
+    return flags
+
+
+def _retarget_staged_zps(words, kinds, op, old_zp, new_zp) -> list[bytes]:
+    """Sigmoid/Mul/Add/Div zero points: each lane run's ``ZP_STAGE_WRITES``
+    records are checked against the template's zero points and rewritten."""
+    out = list(words)
+    old_w: list[tuple[int, int]] = []
+    new_w: list[tuple[int, int]] = []
+    prev = 0
+    for i, kind in kinds:
+        want = ZP_STAGE_WRITES[op][kind]
+        at = [
+            j
+            for j in range(prev, i)
+            if words[j][0] == 0xA1 and _reg(words[j]) in (ZP_ACC, ZP_AUX, ZP_IN)
+        ]
+        if [_reg(words[j]) for j in at] != [reg for reg, _ in want]:
+            raise ValueError(f"{op} {kind} stage has an unmeasured zero-point layout")
+        for j, (reg, key) in zip(at, want):
+            old = int(old_zp[key]) if key else 0
+            new = int(new_zp[key]) if key else 0
+            if _val(words[j]) != old:
+                raise ValueError(
+                    f"{op} {kind} stage: {reg:#06x} holds {_val(words[j])}, "
+                    f"not the template's {old}"
+                )
+            out[j] = _with_val(words[j], new)
+            old_w.append((reg, old))
+            new_w.append((reg, new))
+        prev = i + LANES
+    if any(w[0] == 0xA1 and _reg(w) in (ZP_ACC, ZP_AUX, ZP_IN) for w in words[prev:]):
+        raise ValueError(f"{op} writes a zero-point register after its last lane run")
+    if _repeated_writes(old_w) != _repeated_writes(new_w):
+        raise ValueError(
+            f"{op}: a zero-point write would repeat its register's value where the "
+            "template's does not (or the reverse); that elision is not measured"
+        )
+    return out
+
+
+def _retarget_add_offset(words, old: int, new: int) -> list[bytes]:
+    """Add: the four ``0x1ef0..0x1f20`` records right after ``0x1ea0 = 15``."""
+    regs = [ADD_OFFSET_BASE + 0x10 * k for k in range(ADD_OFFSET_LANES)]
+    hits = [
+        j + 1
+        for j, w in enumerate(words)
+        if _reg(w) == ADD_SHIFT
+        and _val(w) != 0
+        and [_reg(x) for x in words[j + 1 : j + 1 + ADD_OFFSET_LANES]] == regs
+    ]
+    if len(hits) != 1 or _val(words[hits[0] - 1]) != ADD_Q15:
+        raise ValueError("expected one Add offset block after a 0x1ea0 = 15 write")
+    out = list(words)
+    for j in range(hits[0], hits[0] + ADD_OFFSET_LANES):
+        if _val(words[j]) != old & 0xFFFFFFFF:
+            raise ValueError("Add offset does not match the template's calibration")
+        out[j] = _with_val(words[j], new & 0xFFFFFFFF)
+    return out
+
+
+def _retarget_u8_table(words, old_t, new_t, what: str) -> list[bytes]:
+    """Rewrite a 258-entry table in Log's layout (``_retarget_log_table``):
+    two u16 entries per record on ``0x1050..0x1850``, found by register."""
+    at: dict[int, list[int]] = {}
+    for j, w in enumerate(words):
+        r = _reg(w)
+        if (
+            LOG_TABLE_BASE <= r < LOG_TABLE_BASE + 0x10 * LOG_TABLE_RECORDS
+            and w[0] == 0xA1
+        ):
+            at.setdefault(r, []).append(j)
+    regs = [LOG_TABLE_BASE + 0x10 * k for k in range(LOG_TABLE_RECORDS)]
+    if any(len(at.get(r, [])) != 1 for r in regs):
+        raise ValueError(f"expected each {what} table register written exactly once")
+    out = list(words)
+    for k, r in enumerate(regs):
+        j = at[r][0]
+        if _val(words[j]) != old_t[2 * k] | (old_t[2 * k + 1] << 16):
+            raise ValueError(f"{what} table does not match the template's calibration")
+        out[j] = _with_val(words[j], new_t[2 * k] | (new_t[2 * k + 1] << 16))
+    return out
+
+
+def _retarget_staged(
+    words, kinds, op, old_scales, new_scales, old_zp, new_zp
+) -> list[bytes]:
+    """Everything but the lanes of a Sigmoid/Mul/Add/Div segment."""
+    new = _retarget_staged_zps(words, kinds, op, old_zp, new_zp)
+    if op == "Sigmoid":
+        new = _retarget_u8_table(
+            new,
+            sigmoid_table(old_scales, old_zp),
+            sigmoid_table(new_scales, new_zp),
+            "Sigmoid",
+        )
+    elif op == "Add":
+        new = _retarget_add_offset(
+            new, add_offset(old_scales, old_zp), add_offset(new_scales, new_zp)
+        )
+    return new
+
+
 def retarget(
     mc: bytes,
     op: str,
@@ -532,8 +807,9 @@ def retarget(
 ) -> bytes:
     """``mc`` with its calibration moved from ``old_*`` to ``new_*``.
 
-    ReduceSum may change both zero points and Softmax its ``zp_x``; every other
-    op keeps its template's."""
+    ReduceSum and ReduceMean may change both zero points, Softmax its ``zp_x``
+    and Sigmoid/Mul/Add/Div theirs within ``_check_staged_target``; every
+    other op keeps its template's."""
     if op not in CALIBRATED:
         raise ValueError(f"no calibration edit for {op!r}")
     old_zp = dict(old_zero_points or {})
@@ -544,7 +820,14 @@ def retarget(
         "Softmax": {"x"},
         "MaxPool": {"x", "y"},
         "Neg": {"x", "y"},
+        "ReduceMean": {"x", "y"},
+        "Sigmoid": {"x", "y"},
+        "Mul": {"a", "b", "y"},
+        "Add": {"a", "b", "y"},
+        "Div": {"a", "b", "y"},
     }.get(op, set())
+    if op in STAGED:
+        _check_staged_target(op, old_scales, new_scales, old_zp, new_zp)
     if op == "Neg":
         if int(new_zp["y"]) != 255 - int(new_zp["x"]):
             raise ValueError("Neg's output zero point is 255 - zp_x")
@@ -568,6 +851,10 @@ def retarget(
             new = _retarget_input_zp(new, kinds, int(old_zp["x"]), int(new_zp["x"]))
         elif op == "MaxPool" and old_zp != new_zp:
             new = _retarget_shared_zp(new, old_zp, new_zp)
+        elif op in STAGED:
+            new = _retarget_staged(
+                new, kinds, op, old_scales, new_scales, old_zp, new_zp
+            )
         if op == "ReduceSum" and old_zp and old_zp != new_zp:
             pad = _pad_count(words)
             new = _retarget_reducesum_zps(new[: len(new) - pad], kinds, old_zp, new_zp)
@@ -576,6 +863,14 @@ def retarget(
         elif op == "Neg":
             pad = _pad_count(words)
             new = _retarget_neg_zps(new[: len(new) - pad], old_zp, new_zp)
+            new += [bytes(RECORD)] * (-len(new) % PAD_GROUP)
+        elif op == "ReduceMean" and old_zp and old_zp != new_zp:
+            # ReduceSum's three stages; the requantize 0x1a90 is zp_x * N
+            if any(_reg(w) == ZP_PACKED_BASE for w in words):
+                raise ValueError("ReduceMean with packed zp_x lanes is not measured")
+            stages = [(i, k.replace("s_x/(s_y*N)", "s_x/s_y")) for i, k in kinds]
+            pad = _pad_count(words)
+            new = _retarget_reducesum_zps(new[: len(new) - pad], stages, old_zp, new_zp)
             new += [bytes(RECORD)] * (-len(new) % PAD_GROUP)
         new_raw = b"".join(new)
         if new_raw != raw:
@@ -715,6 +1010,23 @@ def normalized_records(mc: bytes) -> list[list[bytes]]:
     segs = [_chunks(s) for s in suc.decode_segments(mc)]
     if segs:
         segs[0] = [w for i, w in enumerate(segs[0]) if i not in SEG0_NOISE]
+    return segs
+
+
+def slot_normalized_records(mc: bytes) -> list[list[bytes]]:
+    """``normalized_records`` with the slot ids of the ``0x03d0``/``0x02b0``
+    select records (verb 0xa8) renumbered by first appearance, 0 kept.
+
+    Pulsar2 may bind a two-input op's inputs to segment 0's slots in either
+    order (Add and Div ``[1, 64]``: the ``asym`` builds swap slots 1,2 and
+    3,4 against the template). The ids pair with segment 0's slot table, which
+    ``normalized_records`` already drops as per-build noise."""
+    segs = normalized_records(mc)
+    for words in segs:
+        ids: dict[int, int] = {0: 0}
+        for j, w in enumerate(words):
+            if w[0] == SLOT_VERB and _reg(w) in SLOT_REGS:
+                words[j] = _with_val(w, ids.setdefault(_val(w), len(ids)))
     return segs
 
 

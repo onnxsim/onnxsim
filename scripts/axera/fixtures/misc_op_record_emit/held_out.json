@@ -505,5 +505,251 @@
    "count": 16,
    "seed": 0
   }
+ },
+ "misc_op_record_emit/sigmoid_1x64_pm1.axmodel.gz": {
+  "op": "Sigmoid",
+  "scales": {
+   "x": 0.007837736047804356,
+   "y": 0.002866127295419574
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 0
+  },
+  "calibration": {
+   "ranges": {
+    "x": [
+     -1.0,
+     1.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/sigmoid_1x64_asym.axmodel.gz": {
+  "op": "Sigmoid",
+  "scales": {
+   "x": 0.01567547209560871,
+   "y": 0.0037352312356233597
+  },
+  "zero_points": {
+   "x": 64,
+   "y": 0
+  },
+  "calibration": {
+   "ranges": {
+    "x": [
+     -1.0,
+     3.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/mul_1x64_pm1.axmodel.gz": {
+  "op": "Mul",
+  "scales": {
+   "a": 0.007837736047804356,
+   "b": 0.007812942378222942,
+   "y": 0.007572716102004051
+  },
+  "zero_points": {
+   "a": 128,
+   "b": 128,
+   "y": 125
+  },
+  "calibration": {
+   "ranges": {
+    "a": [
+     -1.0,
+     1.0
+    ],
+    "b": [
+     -1.0,
+     1.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/mul_1x64_asym.axmodel.gz": {
+  "op": "Mul",
+  "scales": {
+   "a": 0.01567547209560871,
+   "b": 0.015625882893800735,
+   "y": 0.04428038001060486
+  },
+  "zero_points": {
+   "a": 64,
+   "b": 64,
+   "y": 65
+  },
+  "calibration": {
+   "ranges": {
+    "a": [
+     -1.0,
+     3.0
+    ],
+    "b": [
+     -1.0,
+     3.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/add_1x64_pm1.axmodel.gz": {
+  "op": "Add",
+  "scales": {
+   "a": 0.007837736047804356,
+   "b": 0.007812942378222942,
+   "y": 0.015215504914522171
+  },
+  "zero_points": {
+   "a": 128,
+   "b": 128,
+   "y": 130
+  },
+  "calibration": {
+   "ranges": {
+    "a": [
+     -1.0,
+     1.0
+    ],
+    "b": [
+     -1.0,
+     1.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/add_1x64_asym.axmodel.gz": {
+  "op": "Add",
+  "scales": {
+   "a": 0.01567547209560871,
+   "b": 0.015625882893800735,
+   "y": 0.03043101169168949
+  },
+  "zero_points": {
+   "a": 64,
+   "b": 64,
+   "y": 65
+  },
+  "calibration": {
+   "ranges": {
+    "a": [
+     -1.0,
+     3.0
+    ],
+    "b": [
+     -1.0,
+     3.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/div_1x64_pm1.axmodel.gz": {
+  "op": "Div",
+  "scales": {
+   "a": 0.007837736047804356,
+   "b": 0.005874774418771267,
+   "y": 0.014593847095966339
+  },
+  "zero_points": {
+   "a": 128,
+   "b": 0,
+   "y": 135
+  },
+  "calibration": {
+   "ranges": {
+    "a": [
+     -1.0,
+     1.0
+    ],
+    "b": [
+     0.5,
+     1.5
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/div_1x64_asym.axmodel.gz": {
+  "op": "Div",
+  "scales": {
+   "a": 0.01567547209560871,
+   "b": 0.011749548837542534,
+   "y": 0.014637443237006664
+  },
+  "zero_points": {
+   "a": 64,
+   "b": 0,
+   "y": 67
+  },
+  "calibration": {
+   "ranges": {
+    "a": [
+     -1.0,
+     3.0
+    ],
+    "b": [
+     1.0,
+     3.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/reducemean_1x64_pm1.axmodel.gz": {
+  "op": "ReduceMean",
+  "scales": {
+   "x": 0.007837736047804356,
+   "y": 0.0009371469495818019
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 85
+  },
+  "calibration": {
+   "ranges": {
+    "x": [
+     -1.0,
+     1.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
+ },
+ "misc_op_record_emit/reducemean_1x64_asym.axmodel.gz": {
+  "op": "ReduceMean",
+  "scales": {
+   "x": 0.01567547209560871,
+   "y": 0.0051702712662518024
+  },
+  "zero_points": {
+   "x": 64,
+   "y": 0
+  },
+  "calibration": {
+   "ranges": {
+    "x": [
+     -1.0,
+     3.0
+    ]
+   },
+   "count": 16,
+   "seed": 0
+  }
  }
 }

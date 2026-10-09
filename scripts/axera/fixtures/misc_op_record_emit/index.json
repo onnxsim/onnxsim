@@ -927,5 +927,97 @@
    "x": 128,
    "y": 0
   }
+ },
+ "Sigmoid:1x64": {
+  "file": "misc_op_step_templates/Sigmoid_1x64.axmodel.gz",
+  "op": "Sigmoid",
+  "scales": {
+   "x": 0.03135094419121742,
+   "y": 0.003850757610052824
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/sigmoid/pm4: pulsar2 7.0-lite, MinMax, 16 samples per input, default_rng(0), x U[-4,4]",
+  "zero_points": {
+   "x": 128,
+   "y": 0
+  }
+ },
+ "Mul:1x64": {
+  "file": "misc_op_step_templates/Mul_1x64.axmodel.gz",
+  "op": "Mul",
+  "scales": {
+   "a": 0.03135094419121742,
+   "b": 0.03125176951289177,
+   "y": 0.12116345763206482
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/mul/pm4: pulsar2 7.0-lite, MinMax, 16 samples per input, default_rng(0), a U[-4,4], b U[-4,4]",
+  "zero_points": {
+   "a": 128,
+   "b": 128,
+   "y": 125
+  }
+ },
+ "Add:1x64": {
+  "file": "misc_op_step_templates/Add_1x64.axmodel.gz",
+  "op": "Add",
+  "scales": {
+   "a": 0.03135094419121742,
+   "b": 0.03125176951289177,
+   "y": 0.060862019658088684
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/add/pm4: pulsar2 7.0-lite, MinMax, 16 samples per input, default_rng(0), a U[-4,4], b U[-4,4]",
+  "zero_points": {
+   "a": 128,
+   "b": 128,
+   "y": 130
+  }
+ },
+ "Div:1x64": {
+  "file": "misc_op_step_templates/Div_1x64.axmodel.gz",
+  "op": "Div",
+  "scales": {
+   "a": 0.03135094419121742,
+   "b": 0.015659749507904053,
+   "y": 0.0567147471010685
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/div/pm4: pulsar2 7.0-lite, MinMax, 16 samples per input, default_rng(0), a U[-4,4], b U[0.5,4]",
+  "zero_points": {
+   "a": 128,
+   "b": 0,
+   "y": 133
+  }
+ },
+ "ReduceMean:1x64:axes1:k1": {
+  "file": "misc_op_step_templates/ReduceMean_1x64.axmodel.gz",
+  "op": "ReduceMean",
+  "reduce_count": 64,
+  "scales": {
+   "x": 0.03135094419121742,
+   "y": 0.0037485877983272076
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/reducemean/pm4: pulsar2 7.0-lite, MinMax, 16 samples per input, default_rng(0), x U[-4,4]",
+  "zero_points": {
+   "x": 128,
+   "y": 85
+  }
  }
 }

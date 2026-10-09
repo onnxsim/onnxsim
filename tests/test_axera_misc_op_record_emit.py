@@ -39,10 +39,11 @@ def test_own_calibration_is_identity(key):
     meta = INDEX[key]
     mc = _mcode(meta["file"])
     sc, zp, n = meta["scales"], meta["zero_points"], meta.get("reduce_count")
-    # MaxPool and Neg share one scale; Neg's shift stays inside its program
+    # MaxPool and Neg share one scale; Neg's shift stays inside its program;
+    # Add's Q15 input weights (npu_params) only survive a common factor
     x = 1.1 if meta["op"] == "Neg" else 1.5
-    y = x if meta["op"] in ("MaxPool", "Neg") else 0.75
-    shifted = {"x": sc["x"] * x, "y": sc["y"] * y}
+    y = x if meta["op"] in ("MaxPool", "Neg", "Add") else 0.75
+    shifted = {k: v * (y if k == "y" else x) for k, v in sc.items()}
     moved = mre.retarget(mc, meta["op"], sc, shifted, zp, zp, n)
     assert mre.normalized_records(moved) != mre.normalized_records(mc)
     back = mre.retarget(moved, meta["op"], shifted, sc, zp, zp, n)
@@ -162,6 +163,213 @@ def test_softmax_device_output_is_shift_invariant():
     x = _SOFTMAX_DEVICE["shift_x"]
     got = mre.softmax_codes(x.reshape(-1, 64), scales, zps).reshape(codes.shape)
     assert np.array_equal(got[:, 1:], np.repeat(got[:, :1], 4, axis=1))
+
+
+# Standalone [1, 64] ops: template (pm4) plus the pm1 and asym held-out builds.
+LLM_KEYS = {
+    "Sigmoid": "Sigmoid:1x64",
+    "Mul": "Mul:1x64",
+    "Add": "Add:1x64",
+    "Div": "Div:1x64",
+    "ReduceMean": "ReduceMean:1x64:axes1:k1",
+}
+
+
+def _llm_builds(op):
+    meta = INDEX[LLM_KEYS[op]]
+    builds = {meta["file"]: meta}
+    for calib in ("pm1", "asym"):
+        rel = f"misc_op_record_emit/{op.lower()}_1x64_{calib}.axmodel.gz"
+        builds[rel] = HELD[rel]
+    return builds
+
+
+LLM_PAIRS = [
+    (op, src, dst)
+    for op in LLM_KEYS
+    for src, dst in itertools.permutations(_llm_builds(op), 2)
+]
+LLM_TARGETS = [(op, dst) for op in LLM_KEYS for dst in list(_llm_builds(op))[1:]]
+
+
+def _llm_records(op, mc):
+    # Add and Div: the asym builds bind the two inputs to segment 0's slots
+    # in the other order, which the emitter does not (and need not) follow.
+    if op in ("Add", "Div"):
+        return mre.slot_normalized_records(mc)
+    return mre.normalized_records(mc)
+
+
+@pytest.mark.parametrize("op,src,dst", LLM_PAIRS)
+def test_llm_op_1x64_matches_held_out_builds(op, src, dst):
+    # Every build retargets to every other one. The asym builds move the
+    # zero points; ReduceMean's asym build (zp_y = 0) also drops a record.
+    builds = _llm_builds(op)
+    a, b = builds[src], builds[dst]
+    got = mre.retarget(
+        _mcode(src),
+        op,
+        a["scales"],
+        b["scales"],
+        a["zero_points"],
+        b["zero_points"],
+        INDEX[LLM_KEYS[op]].get("reduce_count"),
+    )
+    assert _llm_records(op, got) == _llm_records(op, _mcode(dst))
+
+
+@pytest.mark.parametrize("op,dst", LLM_TARGETS)
+def test_llm_op_1x64_emit_spec_matches_held_out_build(op, dst):
+    b = _llm_builds(op)[dst]
+    reduce = {"axes": [-1], "keepdims": 1} if op == "ReduceMean" else {}
+    model = mre.emit_spec(
+        op, (1, 64), scales=b["scales"], zero_points=b["zero_points"], **reduce
+    )
+    got = bytes(mre.mcode_initializer(model).raw_data)
+    assert _llm_records(op, got) == _llm_records(op, _mcode(dst))
+
+
+@pytest.mark.parametrize("op", ["Add", "Div"])
+def test_two_input_asym_build_differs_in_slot_selects_only(op):
+    # Outside segment 0's slot table the asym build differs from the
+    # retargeted template in four 0x03d0/0x02b0 slot-select records only.
+    builds = _llm_builds(op)
+    (src, a), (dst, b) = list(builds.items())[0], list(builds.items())[2]
+    got = mre.retarget(
+        _mcode(src), op, a["scales"], b["scales"], a["zero_points"], b["zero_points"]
+    )
+    got, want = mre.normalized_records(got), mre.normalized_records(_mcode(dst))
+    assert [len(s) for s in got] == [len(s) for s in want]
+    diff = [(g, w) for gs, ws in zip(got, want) for g, w in zip(gs, ws) if g != w]
+    assert len(diff) == 4
+    for g, w in diff:
+        assert g[:4] == w[:4] and g[0] == mre.SLOT_VERB
+        assert mre._reg(g) in mre.SLOT_REGS
+    assert sorted(mre._val(g) for g, _ in diff) == [1, 2, 3, 4]
+    assert sorted(mre._val(w) for _, w in diff) == [1, 2, 3, 4]
+
+
+def test_reducemean_1x64_asym_build_elides_a_record():
+    # zp_y = 0: the output stage's 0x1b10 = 0 write is elided, so the s_y
+    # lanes start one record earlier and the segment gains a pad record.
+    builds = _llm_builds("ReduceMean")
+    starts, pads = [], []
+    for rel in builds:
+        words = mre._chunks(mre.suc.decode_segments(_mcode(rel))[2])
+        starts.append(mre.lane_runs(words)[-1][0])
+        pads.append(mre._pad_count(words))
+    assert starts == [239, 239, 238] and pads == [2, 2, 3]
+
+
+def test_step_node_keys_reducemean_last_axis(tmp_path):
+    model = parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["" : 13]>
+        g (float[1,64] x) => (float[1,1] y) {
+            y = ReduceMean <axes = [-1], keepdims = 1> (x)
+        }
+        """
+    )
+    path = str(tmp_path / "reducemean.onnx")
+    onnx.save(model, path)
+    assert mre.step_node_keys(path) == [("ReduceMean", LLM_KEYS["ReduceMean"])]
+    assert mre.coverage(path)["ReduceMean"]["covered"] == 1
+
+
+@pytest.mark.parametrize("rel", list(_llm_builds("Add")))
+def test_add_q15_weights_are_npu_params(rel):
+    # round(s_a/s_y * 2**15), round(s_b/s_y * 2**15): identical in the three
+    # builds, so the emitter refuses a target that would need other words.
+    with gzip.open(os.path.join(FIXTURES, rel), "rb") as f:
+        model = onnx.load_model_from_string(f.read())
+    raw = next(i for i in model.graph.initializer if i.name == "npu_params").raw_data
+    words = tuple(int(v) for v in np.frombuffer(raw[:4], dtype="<u2"))
+    assert words == mre.add_q15(_llm_builds("Add")[rel]["scales"]) == (16879, 16826)
+
+
+def test_sigmoid_table_formula():
+    meta = INDEX[LLM_KEYS["Sigmoid"]]
+    t = mre.sigmoid_table(meta["scales"], meta["zero_points"])
+    assert len(t) == 258 and t[256] == t[255] and t[257] == 0
+    assert t[:256] == sorted(t[:256])  # sigmoid is monotonic
+    half = 0.5 / meta["scales"]["y"]
+    assert t[meta["zero_points"]["x"]] == int(np.rint(half))  # sigmoid(0)
+
+
+def test_mul_accepts_equal_input_scales():
+    # Lane runs are matched in program order, so 1/s_a == 1/s_b is fine.
+    meta = INDEX[LLM_KEYS["Mul"]]
+    scales = {"a": 0.02, "b": 0.02, "y": 0.05}
+    model = mre.emit_spec("Mul", (1, 64), scales=scales)
+    mc = bytes(mre.mcode_initializer(model).raw_data)
+    runs = [
+        v for _, v in mre.lane_runs(mre._chunks(mre.suc.decode_segments(mc)[2])) if v
+    ]
+    assert runs == list(mre.lane_values("Mul", scales).values())
+    back = mre.retarget(
+        mc, "Mul", scales, meta["scales"], meta["zero_points"], meta["zero_points"]
+    )
+    assert back == _mcode(meta["file"])
+
+
+@pytest.mark.parametrize(
+    "op,scale_factors,zps",
+    [
+        ("Mul", {}, {"a": 128, "b": 120, "y": 125}),  # zp_a != zp_b
+        ("Add", {}, {"a": 128, "b": 120, "y": 130}),  # zp_a != zp_b
+        ("Div", {}, {"a": 128, "b": 3, "y": 133}),  # zp_b != 0
+        ("Sigmoid", {}, {"x": 128, "y": 3}),  # zp_y != 0
+        # a zero point of 0 on one side only
+        ("Sigmoid", {}, {"x": 0, "y": 0}),
+        ("Mul", {}, {"a": 0, "b": 0, "y": 125}),
+        ("Mul", {}, {"a": 128, "b": 128, "y": 0}),
+        ("Add", {}, {"a": 0, "b": 0, "y": 130}),
+        ("Add", {}, {"a": 128, "b": 128, "y": 0}),
+        ("Div", {}, {"a": 0, "b": 0, "y": 133}),
+        ("Div", {}, {"a": 128, "b": 0, "y": 0}),
+        # Mul writes zp_y to 0x1b10 while it holds zp_a: equal values would
+        # make that a repeated write, whose elision was not measured
+        ("Mul", {}, {"a": 128, "b": 128, "y": 128}),
+        # Add: other Q15 input weights than the template's npu_params
+        ("Add", {"y": 2.0}, None),
+        ("Add", {"a": 1.01}, None),
+        # zero points are required for these ops
+        ("Mul", {}, {"a": 128, "y": 125}),
+    ],
+)
+def test_llm_ops_refuse_unmeasured_targets(op, scale_factors, zps):
+    meta = INDEX[LLM_KEYS[op]]
+    scales = {k: v * scale_factors.get(k, 1.0) for k, v in meta["scales"].items()}
+    with pytest.raises(ValueError):
+        mre.emit_spec(op, (1, 64), scales=scales, zero_points=zps)
+    with pytest.raises(ValueError):
+        mre.retarget(
+            _mcode(meta["file"]),
+            op,
+            meta["scales"],
+            scales,
+            meta["zero_points"],
+            zps or meta["zero_points"],
+        )
+
+
+@pytest.mark.parametrize("op", ["Mul", "Add", "Div"])
+def test_two_input_template_refuses_unmeasured_template_zero_points(op):
+    # "vice versa": a template whose own zero point is 0 does not take a
+    # nonzero one. The asym held-out Div build has zp_b = 0 like every Div.
+    builds = _llm_builds(op)
+    rel, meta = list(builds.items())[2]
+    zero = dict(meta["zero_points"], y=0)
+    with pytest.raises(ValueError):
+        mre.retarget(
+            _mcode(rel), op, meta["scales"], meta["scales"], zero, meta["zero_points"]
+        )
+
+
+def test_reducemean_1x64_refuses_zero_input_zero_point():
+    meta = INDEX[LLM_KEYS["ReduceMean"]]
+    with pytest.raises(ValueError):
+        mre.emit_model(LLM_KEYS["ReduceMean"], meta["scales"], {"x": 0, "y": 85})
 
 
 STEP_PAIRS = sorted(
