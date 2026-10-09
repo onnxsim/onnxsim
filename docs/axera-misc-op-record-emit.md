@@ -320,3 +320,14 @@ rounding is therefore unverified. Only `[1, 64]` was measured.
 A subset of the capture is committed (`fixtures/misc_op_record_emit/
 softmax_1x64_device.npz`: 20 rows per calibration and 6 shift probes) and checked by
 `tests/test_axera_misc_op_record_emit.py`.
+
+## Other widths
+
+Shape does not enter any edit on this page: a template serves the exact shape it was
+built at. `scripts/axera/width_retarget.py` (`docs/axera-width-and-linear-emit.md`) moves
+the `[1,64]` Softmax and Neg templates (and Sigmoid, Mul, Add, Div, Sqrt) to other
+widths, and emits ReduceMean over `[1,n]` from two templates. The Neg retarget on this
+page then applies unchanged at the new width: `[1,64]` to `[1,576]` equals the native
+build for both Neg programs. The ReduceMean lane `s_x/(s_y*N)` above is the `[1,64]`
+form; wide ReduceMean uses `float32(float32(s_x/s_y)/N)`, which differs by one ulp on the
+native `[1,384]` build.

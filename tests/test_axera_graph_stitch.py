@@ -4,6 +4,7 @@ equal the native fused build outside segment 0's slot table."""
 
 import copy
 import gzip
+import json
 import os
 import sys
 
@@ -297,3 +298,103 @@ def test_graph_inputs_must_name_the_graph_inputs():
     wiring["graph_inputs"] = ["q"]
     with pytest.raises(ValueError, match="graph_inputs"):
         gs.stitch_model(wiring, scales, zps, signed)
+
+
+# ---- width 576: the output PARAM placement and the wide ReduceMean ---------------
+WIDTH_FIXTURES = os.path.join(AXERA, "fixtures", "width_retarget")
+with open(os.path.join(WIDTH_FIXTURES, "index.json")) as _f:
+    WIDTH_INDEX = json.load(_f)
+
+
+def _width_model(file):
+    return gs.load_model(os.path.join(WIDTH_FIXTURES, file))
+
+
+def _width_case(graph, cal):
+    """``(wiring, scales, zero_points, native fused model)`` of a ``[1,576]``
+    graph: native standalone components (all built at ``pm1``) and the fused
+    graph's calibration."""
+    g = WIDTH_INDEX["graphs"][graph]
+    ops = [
+        dict(o, program=_width_model(WIDTH_INDEX["builds"][o["component"]]["file"]))
+        for o in g["ops"]
+    ]
+    wiring = {k: g[k] for k in ("inputs", "graph_inputs", "output")}
+    wiring["ops"] = ops
+    if "output_param" in g:
+        wiring["output_param"] = g["output_param"]
+    q = g["calibrations"][cal]
+    return wiring, q["scales"], q["zero_points"], _width_model(q["oracle"])
+
+
+@pytest.mark.parametrize("cal", ["pm1", "pm4"])
+def test_rmsnorm_576_stitches_from_native_components(cal):
+    wiring, scales, zps, oracle = _width_case("rmsnorm576", cal)
+    st = gs.stitch(wiring, scales, zps)
+    assert [len(s) // gs.REC for s in st.segments] == [8, 4, 532, 52, 56]
+    assert gs.compare_models(gs.stitched_model(st), oracle) == []
+    # the output's PARAM job runs before ReduceMean's core (op 1), unlike the
+    # [1,64] graph where it runs before the DEQUANT job
+    roles = [e["label"].split(":", 1)[1] for e in st.log]
+    assert roles.index("Mul:job3:PARAM") + 1 == roles.index("ReduceMean:job3:CORE")
+    assert roles[-1] == "Mul:job4:DEQUANT"
+
+
+def test_rmsnorm_576_needs_the_output_param_placement():
+    # with the [1,64] graph's order the program is 12 records longer
+    wiring, scales, zps, oracle = _width_case("rmsnorm576", "pm1")
+    del wiring["output_param"]
+    st = gs.stitch(wiring, scales, zps)
+    assert [len(s) // gs.REC for s in st.segments] == [8, 4, 544, 52, 56]
+    assert gs.compare_models(gs.stitched_model(st), oracle) != []
+
+
+@pytest.mark.parametrize("cal", ["pm1", "pm4"])
+def test_silu_576_stitches_from_native_components(cal):
+    wiring, scales, zps, oracle = _width_case("silu576", cal)
+    assert gs.compare_models(gs.stitch_model(wiring, scales, zps), oracle) == []
+
+
+def test_output_param_moves_only_the_job_order():
+    wiring, scales, zps, signed, oracle = _case("rmsnorm")
+    late = gs.stitch(dict(wiring, output_param="late"), scales, zps, signed)
+    # "late" is where the [1,64] graph already has it
+    assert gs.compare_models(gs.stitched_model(late), oracle) == []
+    early = gs.stitch(dict(wiring, output_param=1), scales, zps, signed)
+    labels = [e["label"] for e in early.log]
+    assert labels.index("op5:Mul:job3:PARAM") + 1 == labels.index(
+        "op1:ReduceMean:job2:CORE"
+    )
+    assert early.params == late.params and early.segments[:2] == late.segments[:2]
+    assert early.segments[gs.MAIN] != late.segments[gs.MAIN]
+
+
+@pytest.mark.parametrize(
+    "where,why", [(7, "no CORE job of op 7"), ("soon", "expected")]
+)
+def test_bad_output_param_is_refused(where, why):
+    wiring, scales, zps, signed, _ = _case("rmsnorm")
+    with pytest.raises(ValueError, match=why):
+        gs.stitch(dict(wiring, output_param=where), scales, zps, signed)
+
+
+def test_reducemean_lane_is_single_precision():
+    # float32(float32(s_x / s_y) / n); the float64 form s_x / (s_y * n) is one
+    # ulp above it on the native [1,384] build
+    b = WIDTH_INDEX["builds"]["reducemean_384_pm1"]
+    sx, sy = b["scales"]["x"], b["scales"]["y"]
+    lane = gs.reducemean_lane(sx, sy, 384)
+    assert lane == 0x3D38ECB5 and gs._f32bits(sx / (sy * 384)) == lane + 1
+    prog = gs.Program(_width_model(b["file"]), "reducemean_384")
+    (core,) = [j for j in prog.jobs if j.role == "CORE"]
+    written = {gs._reg(w): gs._val(w) for w in core.records if w[0] == gs.A1}
+    assert {written[r] for r in gs.LANES_LO} == {lane}
+    # one 256-wide pooling window of zero points, and the pad bytes
+    assert written[gs.REG_ZP_A] == b["zero_points"]["x"] * 256
+    assert {written[r] for r in gs.LANES_PACKED} == {b["zero_points"]["x"] * 0x01010101}
+    # every committed [1,64] build has equal float32 and float64 forms
+    for cal, q in INDEX["components"]["reducemean"]["calibrations"].items():
+        s = q["scales"]
+        assert gs.reducemean_lane(s["x"], s["y"], 64) == gs._f32bits(
+            s["x"] / (s["y"] * 64)
+        ), cal
