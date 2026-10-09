@@ -1,0 +1,1015 @@
+{
+ "builds": {
+  "sigmoid_64_pm1": {
+   "op": "Sigmoid",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_sigmoid_pm1.axmodel.gz",
+   "source": "llm-ops/sigmoid/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.002866127295419574
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "mul_64_pm1": {
+   "op": "Mul",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_mul_pm1.axmodel.gz",
+   "source": "llm-ops/mul/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.007837736047804356,
+    "b": 0.007812942378222942,
+    "y": 0.007572716102004051
+   },
+   "zero_points": {
+    "a": 128,
+    "b": 128,
+    "y": 125
+   },
+   "output_param": "late"
+  },
+  "add_64_pm1": {
+   "op": "Add",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_add_pm1.axmodel.gz",
+   "source": "llm-ops/add/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.007837736047804356,
+    "b": 0.007812942378222942,
+    "y": 0.015215504914522171
+   },
+   "zero_points": {
+    "a": 128,
+    "b": 128,
+    "y": 130
+   },
+   "output_param": "late"
+  },
+  "sqrt_64_pm1": {
+   "op": "Sqrt",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_sqrt_pm1.axmodel.gz",
+   "source": "llm-ops/sqrt/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.003919710870832205,
+    "y": 0.003920639865100384
+   },
+   "zero_points": {
+    "x": 0,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "reducemean_64_pm1": {
+   "op": "ReduceMean",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_reducemean_pm1.axmodel.gz",
+   "source": "llm-ops/reducemean/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.0009371469495818019
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 85
+   },
+   "output_param": "late"
+  },
+  "reducemean_64_pm4": {
+   "op": "ReduceMean",
+   "width": 64,
+   "calibration": "pm4",
+   "file": "../graph_stitch/op_reducemean_pm4.axmodel.gz",
+   "source": "llm-ops/reducemean/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.03135094419121742,
+    "y": 0.0037485877983272076
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 85
+   },
+   "output_param": "late"
+  },
+  "div_64_pm1": {
+   "op": "Div",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "div_64_pm1.axmodel.gz",
+   "source": "llm-ops/div/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.007837736047804356,
+    "b": 0.005874774418771267,
+    "y": 0.014593847095966339
+   },
+   "zero_points": {
+    "a": 128,
+    "b": 0,
+    "y": 135
+   },
+   "output_param": "late"
+  },
+  "softmax_64_pm1": {
+   "op": "Softmax",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../misc_op_record_emit/softmax_1x64_pm1.axmodel.gz",
+   "source": "softmax-build/var_pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.00015479736612178385
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "neg_64_pm1": {
+   "op": "Neg",
+   "width": 64,
+   "calibration": "pm1",
+   "file": "../misc_op_record_emit/neg_1x64_pm1.axmodel.gz",
+   "source": "llm-ops/neg/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.007837736047804356
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 127
+   }
+  },
+  "neg_576_pm1": {
+   "op": "Neg",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "neg_576_pm1.axmodel.gz",
+   "source": "llm-576/neg/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.00784226506948471
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 128
+   }
+  },
+  "neg_64_pm4": {
+   "op": "Neg",
+   "width": 64,
+   "calibration": "pm4",
+   "file": "../misc_op_record_emit/neg_1x64_pm4.axmodel.gz",
+   "source": "llm-ops/neg/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.03135094419121742,
+    "y": 0.03135094419121742
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 127
+   }
+  },
+  "neg_576_pm4": {
+   "op": "Neg",
+   "width": 576,
+   "calibration": "pm4",
+   "file": "neg_576_pm4.axmodel.gz",
+   "source": "llm-576/neg/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.03136906027793884,
+    "y": 0.03136906027793884
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 128
+   }
+  },
+  "sigmoid_100_pm1": {
+   "op": "Sigmoid",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "sigmoid_100_pm1.axmodel.gz",
+   "source": "llm-w/sigmoid_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.002866127295419574
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "sigmoid_384_pm1": {
+   "op": "Sigmoid",
+   "width": 384,
+   "calibration": "pm1",
+   "file": "sigmoid_384_pm1.axmodel.gz",
+   "source": "llm-w/sigmoid_384/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.002866891445592046
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "sigmoid_512_pm1": {
+   "op": "Sigmoid",
+   "width": 512,
+   "calibration": "pm1",
+   "file": "sigmoid_512_pm1.axmodel.gz",
+   "source": "llm-w/sigmoid_512/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.002866891445592046
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "early"
+  },
+  "sigmoid_576_pm1": {
+   "op": "Sigmoid",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "sigmoid_576_pm1.axmodel.gz",
+   "source": "llm-576/sigmoid/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.002866891445592046
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "sigmoid_2048_pm1": {
+   "op": "Sigmoid",
+   "width": 2048,
+   "calibration": "pm1",
+   "file": "sigmoid_2048_pm1.axmodel.gz",
+   "source": "llm-w/sigmoid_2048/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784293282777071,
+    "y": 0.002866891445592046
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "mul_100_pm1": {
+   "op": "Mul",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "mul_100_pm1.axmodel.gz",
+   "source": "llm-w/mul_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.007837736047804356,
+    "b": 0.007837081328034401,
+    "y": 0.007575764786452055
+   },
+   "zero_points": {
+    "a": 128,
+    "b": 128,
+    "y": 128
+   },
+   "output_param": "late"
+  },
+  "mul_384_pm1": {
+   "op": "Mul",
+   "width": 384,
+   "calibration": "pm1",
+   "file": "mul_384_pm1.axmodel.gz",
+   "source": "llm-w/mul_384/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784226506948471,
+    "b": 0.007839703001081944,
+    "y": 0.007746405899524689
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 127,
+    "y": 128
+   },
+   "output_param": "late"
+  },
+  "mul_512_pm1": {
+   "op": "Mul",
+   "width": 512,
+   "calibration": "pm1",
+   "file": "mul_512_pm1.axmodel.gz",
+   "source": "llm-w/mul_512/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784226506948471,
+    "b": 0.007841480895876884,
+    "y": 0.0077186464332044125
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 128,
+    "y": 126
+   },
+   "output_param": "late"
+  },
+  "mul_576_pm1": {
+   "op": "Mul",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "mul_576_pm1.axmodel.gz",
+   "source": "llm-576/mul/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784226506948471,
+    "b": 0.007841480895876884,
+    "y": 0.007759246975183487
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 128,
+    "y": 127
+   },
+   "output_param": "late"
+  },
+  "mul_2048_pm1": {
+   "op": "Mul",
+   "width": 2048,
+   "calibration": "pm1",
+   "file": "mul_2048_pm1.axmodel.gz",
+   "source": "llm-w/mul_2048/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784293282777071,
+    "b": 0.00784294493496418,
+    "y": 0.0077351853251457214
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 128,
+    "y": 128
+   },
+   "output_param": "late"
+  },
+  "add_100_pm1": {
+   "op": "Add",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "add_100_pm1.axmodel.gz",
+   "source": "llm-w/add_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.007837736047804356,
+    "b": 0.007837081328034401,
+    "y": 0.01532493531703949
+   },
+   "zero_points": {
+    "a": 128,
+    "b": 128,
+    "y": 128
+   },
+   "output_param": "late"
+  },
+  "add_576_pm1": {
+   "op": "Add",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "add_576_pm1.axmodel.gz",
+   "source": "llm-576/add/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784226506948471,
+    "b": 0.007841480895876884,
+    "y": 0.015550825744867325
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 128,
+    "y": 127
+   },
+   "output_param": "late"
+  },
+  "div_100_pm1": {
+   "op": "Div",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "div_100_pm1.axmodel.gz",
+   "source": "llm-w/div_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.007837736047804356,
+    "b": 0.00588061660528183,
+    "y": 0.01513186190277338
+   },
+   "zero_points": {
+    "a": 128,
+    "b": 0,
+    "y": 128
+   },
+   "output_param": "late"
+  },
+  "div_576_pm1": {
+   "op": "Div",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "div_576_pm1.axmodel.gz",
+   "source": "llm-576/div/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784226506948471,
+    "b": 0.005881836172193289,
+    "y": 0.015209231525659561
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 0,
+    "y": 128
+   },
+   "output_param": "late"
+  },
+  "sqrt_100_pm1": {
+   "op": "Sqrt",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "sqrt_100_pm1.axmodel.gz",
+   "source": "llm-w/sqrt_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.003919710870832205,
+    "y": 0.003920639865100384
+   },
+   "zero_points": {
+    "x": 0,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "sqrt_576_pm1": {
+   "op": "Sqrt",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "sqrt_576_pm1.axmodel.gz",
+   "source": "llm-576/sqrt/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.003921556286513805,
+    "y": 0.00392156234011054
+   },
+   "zero_points": {
+    "x": 0,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "softmax_100_pm1": {
+   "op": "Softmax",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "softmax_100_pm1.axmodel.gz",
+   "source": "llm-w/softmax_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 9.397603571414948e-05
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "softmax_384_pm1": {
+   "op": "Softmax",
+   "width": 384,
+   "calibration": "pm1",
+   "file": "softmax_384_pm1.axmodel.gz",
+   "source": "llm-w/softmax_384/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 2.489142025297042e-05
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "softmax_512_pm1": {
+   "op": "Softmax",
+   "width": 512,
+   "calibration": "pm1",
+   "file": "softmax_512_pm1.axmodel.gz",
+   "source": "llm-w/softmax_512/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 1.8682727386476472e-05
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "softmax_576_pm1": {
+   "op": "Softmax",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "softmax_576_pm1.axmodel.gz",
+   "source": "llm-576/softmax/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 1.6796002455521375e-05
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "softmax_2048_pm1": {
+   "op": "Softmax",
+   "width": 2048,
+   "calibration": "pm1",
+   "file": "softmax_2048_pm1.axmodel.gz",
+   "source": "llm-w/softmax_2048/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784293282777071,
+    "y": 4.493254436965799e-06
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   },
+   "output_param": "late"
+  },
+  "reducemean_100_pm1": {
+   "op": "ReduceMean",
+   "width": 100,
+   "calibration": "pm1",
+   "file": "reducemean_100_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_100/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.0006344437133520842
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 103
+   },
+   "output_param": "late"
+  },
+  "reducemean_128_pm1": {
+   "op": "ReduceMean",
+   "width": 128,
+   "calibration": "pm1",
+   "file": "reducemean_128_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_128/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.0009394877124577761
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 159
+   },
+   "output_param": "late"
+  },
+  "reducemean_256_pm1": {
+   "op": "ReduceMean",
+   "width": 256,
+   "calibration": "pm1",
+   "file": "reducemean_256_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_256/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007838242687284946,
+    "y": 0.0007815628778189421
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 162
+   },
+   "output_param": "late"
+  },
+  "reducemean_288_pm1": {
+   "op": "ReduceMean",
+   "width": 288,
+   "calibration": "pm1",
+   "file": "reducemean_288_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_288/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.007838242687284946,
+    "y": 0.0007484519737772644
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 139
+   },
+   "output_param": "late"
+  },
+  "reducemean_384_pm1": {
+   "op": "ReduceMean",
+   "width": 384,
+   "calibration": "pm1",
+   "file": "reducemean_384_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_384/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.00045235088327899575
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 131
+   },
+   "output_param": "late"
+  },
+  "reducemean_512_pm1": {
+   "op": "ReduceMean",
+   "width": 512,
+   "calibration": "pm1",
+   "file": "reducemean_512_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_512/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.0004967564600519836
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 128
+   },
+   "output_param": "early"
+  },
+  "reducemean_576_pm1": {
+   "op": "ReduceMean",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "reducemean_576_pm1.axmodel.gz",
+   "source": "llm-576/reducemean/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.0004795352288056165
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 153
+   },
+   "output_param": "early"
+  },
+  "reducemean_2048_pm1": {
+   "op": "ReduceMean",
+   "width": 2048,
+   "calibration": "pm1",
+   "file": "reducemean_2048_pm1.axmodel.gz",
+   "source": "llm-w/reducemean_2048/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784293282777071,
+    "y": 0.000144293051562272
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 98
+   },
+   "output_param": "late"
+  },
+  "reducemean_576_pm4": {
+   "op": "ReduceMean",
+   "width": 576,
+   "calibration": "pm4",
+   "file": "reducemean_576_pm4.axmodel.gz",
+   "source": "llm-576/reducemean/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.03136906027793884,
+    "y": 0.001918140915222466
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 153
+   },
+   "output_param": "early"
+  },
+  "c576_mulxx_pm1": {
+   "op": "Mul",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "c576_mulxx_pm1.axmodel.gz",
+   "graph": "Mul(x, x), x [1,576]",
+   "source": "llm-w/c576_mulxx/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.003921518102288246
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 0
+   }
+  },
+  "c576_divb_pm1": {
+   "op": "Div",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "c576_divb_pm1.axmodel.gz",
+   "graph": "Div(a, b), a [1,576], b [1,1]",
+   "source": "llm-w/c576_divb/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "a": 0.00784226506948471,
+    "b": 0.0056139579974114895,
+    "y": 0.013666321523487568
+   },
+   "zero_points": {
+    "a": 127,
+    "b": 0,
+    "y": 127
+   }
+  },
+  "c576_mulc_pm1": {
+   "op": "Mul",
+   "width": 576,
+   "calibration": "pm1",
+   "file": "c576_mulc_pm1.axmodel.gz",
+   "graph": "Mul(x, gain), gain = default_rng(100).uniform(0.5, 1.5, (1, 576))",
+   "source": "llm-w/c576_mulc/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.00784226506948471,
+    "gain": 0.005873233079910278,
+    "y": 0.011482097208499908
+   },
+   "zero_points": {
+    "x": 127,
+    "gain": 0,
+    "y": 126
+   }
+  },
+  "c_addc_pm1": {
+   "op": "Add",
+   "width": 1,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_c_addc_pm1.axmodel.gz",
+   "source": "llm-stitch/c_addc/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.003679681569337845,
+    "eps": 3.921568492160077e-08,
+    "y": 0.0036797206848859787
+   },
+   "zero_points": {
+    "x": 0,
+    "eps": 0,
+    "y": 0
+   }
+  },
+  "c_sqrt11_pm1": {
+   "op": "Sqrt",
+   "width": 1,
+   "calibration": "pm1",
+   "file": "../graph_stitch/op_c_sqrt11_pm1.axmodel.gz",
+   "source": "llm-stitch/c_sqrt11/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+   "scales": {
+    "x": 0.003679681569337845,
+    "y": 0.0037987004034221172
+   },
+   "zero_points": {
+    "x": 0,
+    "y": 0
+   }
+  }
+ },
+ "graphs": {
+  "rmsnorm576": {
+   "graph": "y = x / Sqrt(ReduceMean(x * x) + eps) * gain, x [1,576], eps = 1e-5, gain = default_rng(100).uniform(0.5, 1.5, (1, 576))",
+   "inputs": [
+    "x"
+   ],
+   "graph_inputs": [
+    "x"
+   ],
+   "output": "y",
+   "output_param": 1,
+   "ops": [
+    {
+     "op": "Mul",
+     "component": "c576_mulxx_pm1",
+     "in": {
+      "x": "x"
+     },
+     "onnx_inputs": [
+      "x",
+      "x"
+     ],
+     "out": [
+      "y",
+      "sq"
+     ]
+    },
+    {
+     "op": "ReduceMean",
+     "component": "reducemean_576_pm1",
+     "in": {
+      "x": "sq"
+     },
+     "out": [
+      "y",
+      "ms"
+     ],
+     "attrs": {
+      "count": 576
+     }
+    },
+    {
+     "op": "Add",
+     "component": "c_addc_pm1",
+     "in": {
+      "x": "ms"
+     },
+     "onnx_inputs": [
+      "ms",
+      "eps"
+     ],
+     "consts": [
+      {
+       "name": "eps",
+       "size": 1,
+       "values": [
+        1e-05
+       ]
+      }
+     ],
+     "out": [
+      "y",
+      "me"
+     ]
+    },
+    {
+     "op": "Sqrt",
+     "component": "c_sqrt11_pm1",
+     "in": {
+      "x": "me"
+     },
+     "out": [
+      "y",
+      "rt"
+     ]
+    },
+    {
+     "op": "Div",
+     "component": "c576_divb_pm1",
+     "in": {
+      "a": "x",
+      "b": "rt"
+     },
+     "onnx_inputs": [
+      "x",
+      "rt"
+     ],
+     "out": [
+      "y",
+      "n"
+     ]
+    },
+    {
+     "op": "Mul",
+     "component": "c576_mulc_pm1",
+     "in": {
+      "x": "n"
+     },
+     "onnx_inputs": [
+      "n",
+      "gain"
+     ],
+     "consts": [
+      {
+       "name": "gain",
+       "size": 576
+      }
+     ],
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_rmsnorm576_pm1.axmodel.gz",
+     "source": "llm-576/rmsnorm/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+     "scales": {
+      "x": 0.00784226506948471,
+      "sq": 0.003921518102288246,
+      "ms": 0.0014037452638149261,
+      "eps": 3.921568492160077e-08,
+      "me": 0.0014037844957783818,
+      "rt": 0.002346281660720706,
+      "n": 0.013776950538158417,
+      "gain": 0.005873233079910278,
+      "y": 0.01999841444194317
+     },
+     "zero_points": {
+      "x": 127,
+      "sq": 0,
+      "ms": 0,
+      "eps": 0,
+      "me": 0,
+      "rt": 0,
+      "n": 128,
+      "gain": 0,
+      "y": 127
+     }
+    },
+    "pm4": {
+     "oracle": "fused_rmsnorm576_pm4.axmodel.gz",
+     "source": "llm-576/rmsnorm/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+     "scales": {
+      "x": 0.03136906027793884,
+      "sq": 0.06274428963661194,
+      "ms": 0.02245992422103882,
+      "eps": 3.921568492160077e-08,
+      "me": 0.022459963336586952,
+      "rt": 0.009385003708302975,
+      "n": 0.013777150772511959,
+      "gain": 0.005873233079910278,
+      "y": 0.019998699426651
+     },
+     "zero_points": {
+      "x": 127,
+      "sq": 0,
+      "ms": 0,
+      "eps": 0,
+      "me": 0,
+      "rt": 0,
+      "n": 128,
+      "gain": 0,
+      "y": 127
+     }
+    }
+   }
+  },
+  "silu576": {
+   "graph": "y = x * Sigmoid(x), x [1,576]",
+   "inputs": [
+    "x"
+   ],
+   "graph_inputs": [
+    "x"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "Sigmoid",
+     "component": "sigmoid_576_pm1",
+     "in": {
+      "x": "x"
+     },
+     "out": [
+      "y",
+      "s"
+     ]
+    },
+    {
+     "op": "Mul",
+     "component": "mul_576_pm1",
+     "in": {
+      "a": "x",
+      "b": "s"
+     },
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_silu576_pm1.axmodel.gz",
+     "source": "llm-576/silu/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+     "scales": {
+      "x": 0.00784226506948471,
+      "s": 0.002866891445592046,
+      "y": 0.003921484109014273
+     },
+     "zero_points": {
+      "x": 127,
+      "s": 0,
+      "y": 69
+     }
+    },
+    "pm4": {
+     "oracle": "fused_silu576_pm4.axmodel.gz",
+     "source": "llm-576/silu/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0)",
+     "scales": {
+      "x": 0.03136906027793884,
+      "s": 0.0038510325830429792,
+      "y": 0.016496049240231514
+     },
+     "zero_points": {
+      "x": 127,
+      "s": 0,
+      "y": 17
+     }
+    }
+   }
+  }
+ }
+}

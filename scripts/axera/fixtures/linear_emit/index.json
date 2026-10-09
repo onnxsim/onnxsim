@@ -1,0 +1,132 @@
+{
+ "builds": {
+  "linear64_w1": {
+   "width": 64,
+   "weight_seed": 1,
+   "weight_sha256": "690b94bc68122a29a52dc7ed0a5041c1a3076fddbe88984e1d6d457b981a93f3",
+   "calibration": "pm1",
+   "file": "linear64_w1.axmodel.gz",
+   "source": "llm-w/linear64_w1/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.006955758202821016
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 132
+   }
+  },
+  "linear64_w2": {
+   "width": 64,
+   "weight_seed": 2,
+   "weight_sha256": "d5d969244da33f545b9ad7b13ac8a8cc009f5f766b3721985f2efc93634bd3f8",
+   "calibration": "pm1",
+   "file": "linear64_w2.axmodel.gz",
+   "source": "llm-w/linear64_w2/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.0073600830510258675
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 135
+   }
+  },
+  "linear64_w3": {
+   "width": 64,
+   "weight_seed": 3,
+   "weight_sha256": "efe973da660ba03bc3deb735e1a8f97fa560b3db6ac1ae713ca65efd1ea4507b",
+   "calibration": "pm1",
+   "file": "linear64_w3.axmodel.gz",
+   "source": "llm-w/linear64_w3/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.006736627779901028
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 127
+   }
+  },
+  "linear64_w4": {
+   "width": 64,
+   "weight_seed": 4,
+   "weight_sha256": "9497371d26ab4c1f9ac77615c29dfa9cb8d9201e1a633874f2c7e181743aa3c6",
+   "calibration": "pm1",
+   "file": "linear64_w4.axmodel.gz",
+   "source": "llm-w/linear64_w4/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.00643510464578867
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 136
+   }
+  },
+  "linear64_w5": {
+   "width": 64,
+   "weight_seed": 5,
+   "weight_sha256": "610759437c49b8b5eb0bce8e907635e657626dbf86802d985e013fe66f84f293",
+   "calibration": "pm1",
+   "file": "linear64_w5.axmodel.gz",
+   "source": "llm-w/linear64_w5/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.008315122686326504
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 104
+   }
+  },
+  "linear64_w6": {
+   "width": 64,
+   "weight_seed": 6,
+   "weight_sha256": "3b4b652d930f9b4061097d79495e9e037cc285884717f0643472f675648f2669",
+   "calibration": "pm1",
+   "file": "linear64_w6.axmodel.gz",
+   "source": "llm-w/linear64_w6/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.007837736047804356,
+    "y": 0.006083750631660223
+   },
+   "zero_points": {
+    "x": 128,
+    "y": 134
+   }
+  },
+  "linear576_w1_pm1": {
+   "width": 576,
+   "weight_seed": 1,
+   "weight_sha256": "5453fa29bfb85cf0fa34a88731129dcd18276a5dbfc8e2c915c006ed652aff33",
+   "calibration": "pm1",
+   "file": "linear576_w1_pm1.axmodel.gz",
+   "source": "llm-w/linear576_w1/pm1: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.00784226506948471,
+    "y": 0.023511730134487152
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 116
+   }
+  },
+  "linear576_w100_pm4": {
+   "width": 576,
+   "weight_seed": 100,
+   "weight_sha256": "ee45eed2832fa8f7bb3e2b628a51862aa8fa5ef9856b59c9c5f1e23828c5e47d",
+   "calibration": "pm4",
+   "file": "linear576_w100_pm4.axmodel.gz",
+   "source": "llm-576/linear/pm4: Pulsar2 7.0-lite, AX650, MinMax, 16 samples default_rng(0); w = default_rng(weight_seed).uniform(-0.1, 0.1, (n, n)).astype(float32), [in, out]",
+   "scales": {
+    "x": 0.03136906027793884,
+    "y": 0.09371377527713776
+   },
+   "zero_points": {
+    "x": 127,
+    "y": 122
+   }
+  }
+ }
+}

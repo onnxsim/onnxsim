@@ -102,6 +102,22 @@ at its definition:
   copied from the native fused attention build; only its operand addresses
   and permutation are taken from the standalone copy-engine job.
 
+* **Where the output's PARAM job runs** (RMSNorm at ``[1,576]``): in the
+  ``[1,64]`` graphs the graph output's PARAM job runs where the last op's
+  standalone program has it. The native ``[1,576]`` RMSNorm runs it just
+  before ReduceMean's core job instead, and standalone builds differ too
+  (Sigmoid at 512 and ReduceMean at 512 and 576 run it before the core, the
+  other widths after). Nothing found predicts it, so it is a wiring input
+  (``output_param``). A job that moves is emitted from the register state its
+  op has at that job in the standalone order.
+* **Wide ReduceMean** (standalone ReduceMean at 64 to 2048, RMSNorm at 576):
+  the lane is single precision, ``float32(float32(s_x / s_y) / n)``; the
+  accumulator zero point is ``zp_x * min(n, 256)`` (one 256-wide pooling
+  window); a core that writes the eight packed lanes ``0x0d30..0x0da0`` (its
+  pad bytes, widths that are not a multiple of 256) holds ``zp_x`` in all four
+  bytes of each. The pad group ``0x0cd0..0x0da0`` is live only while the pad
+  mode word ``0x0c20`` is nonzero (an exception to the always-live mode group).
+
 Three structural choices are assumptions: no build contradicts them and
 none isolates them. Scratch buffers, PARAM words and each engine's
 sub-programs are numbered in op order.
@@ -116,13 +132,16 @@ unknown); two ops on one matrix engine; a copy-engine sub-program that would
 need a register restore; a sub-program placed on an engine of another kind;
 several MatMul-like ops without an explicit ``place`` for each;
 a main-engine CORE job of an op with no calibration model; a copy-engine
-loader with no standalone template. ``ValueError``: a tensor without a scale
+loader with no standalone template. ``ValueError``: an ``output_param`` that
+names no op with a core job; a tensor without a scale
 or zero point; constants that do not account for a program's ``npu_params``;
 constant values that do not quantize to the standalone program's bytes; a
 standalone program that breaks one of the checked rules.
 
-Limits: the fused scales and zero points still come from Pulsar2 (its
-``quant_axmodel.json``); every program serves one shape; the learned rules
+Limits: the fused scales and zero points are inputs (Pulsar2's
+``quant_axmodel.json``, or ``pulsar_free_calibration`` from the float graph
+and its samples); every program serves one shape (``width_retarget`` moves a
+``[1,64]`` program to another width); the learned rules
 rest on one native graph each; an engine placement other than the native
 build's is accepted when no rule refuses it, but nothing has verified it.
 Add's two ``npu_params`` scale words are written in ONNX input order, which
@@ -182,6 +201,15 @@ REG_DTYPE = 0x1B50  # data type of the tensor a job writes: 2 = u8, 3 = s8
 REG_MODE_END = 0x0DF0
 LANES_LO = tuple(range(0x0F50, 0x0FC1, 0x10))
 LANES_HI = tuple(range(0x0FD0, 0x1041, 0x10))
+# ReduceMean's pad lanes: the input zero point in all four bytes (a core over
+# a width that is not a multiple of REDUCE_WINDOW pads its last window)
+LANES_PACKED = tuple(range(0x0D30, 0x0DA1, 0x10))
+REDUCE_WINDOW = 256
+# LEARNED (standalone ReduceMean at 288 and 384): the pad group is live only
+# while the pad mode word 0x0c20 is nonzero. The PARAM job after the padded
+# core writes 0x0c20 = 0 and leaves the pad group alone.
+REG_PAD_MODE = 0x0C20
+PAD_GROUP = tuple(range(0x0CD0, 0x0DA1, 0x10))
 TABLE_REGS = tuple(range(0x1050, 0x1851, 0x10))
 ADD_OFFSET_REGS = (0x1EF0, 0x1F00, 0x1F10, 0x1F20)
 JOB_PARAM = 0x100601
@@ -409,9 +437,20 @@ def quantize_constant(values, scale: float, zero_point: int) -> bytes:
     )
 
 
-def _core_values(op, core_index, ports, in_ts, out_t, sc, zp, signed, attrs):
+def reducemean_lane(s_x: float, s_y: float, n: int) -> int:
+    """ReduceMean's lane word: ``float32(float32(s_x / s_y) / n)``, every step
+    in single precision. The float64 form ``s_x / (s_y * n)`` is one ulp off
+    on some builds (the standalone ``[1,384]`` build is one)."""
+    f = np.float32
+    return int(f(f(f(s_x) / f(s_y)) / f(n)).view(np.uint32))
+
+
+def _core_values(
+    op, core_index, ports, in_ts, out_t, sc, zp, signed, attrs, written=()
+):
     """Register -> value owned by CORE job ``core_index`` of ``op``. ``ports``
-    maps "A"/"B" to the fused tensor read through ``0x02c0``/``0x0500``."""
+    maps "A"/"B" to the fused tensor read through ``0x02c0``/``0x0500``;
+    ``written`` is the set of registers the standalone job writes."""
 
     def port(name):
         if name not in ports:
@@ -443,8 +482,11 @@ def _core_values(op, core_index, ports, in_ts, out_t, sc, zp, signed, attrs):
         if not attrs.get("count"):
             raise ValueError("ReduceMean needs attrs['count'], its reduced elements")
         t, n = port("A"), int(attrs["count"])
-        out[REG_ZP_A], out[REG_ZP_OUT] = zp[t] * n, zp[out_t]
-        out.update({r: _f32bits(sc[t] / (sc[out_t] * n)) for r in LANES_LO})
+        out[REG_ZP_A], out[REG_ZP_OUT] = zp[t] * min(n, REDUCE_WINDOW), zp[out_t]
+        lane = reducemean_lane(sc[t], sc[out_t], n)
+        out.update({r: lane for r in LANES_LO})
+        if LANES_PACKED[0] in written:
+            out.update({r: zp[t] * 0x01010101 for r in LANES_PACKED})
     elif op == "Div":
         a, b = port("A"), port("B")
         if zp[b]:
@@ -845,6 +887,8 @@ def infer_gates(programs: Iterable[Program], mode: frozenset[int]) -> dict:
     """Register -> gate set: the gates on in every standalone job writing it.
 
     LEARNED (SiLU): the mode group itself is always live (empty gate set).
+    LEARNED (ReduceMean at 288/384): except its pad group, live only while
+    ``0x0c20`` is nonzero.
     LEARNED (RMSNorm): the registers of one input-port block share the
     intersection of their gate sets."""
     gates: dict[int, frozenset] = {}
@@ -855,6 +899,9 @@ def infer_gates(programs: Iterable[Program], mode: frozenset[int]) -> dict:
                 gates[r] = gates[r] & on if r in gates else on
     for r in mode:
         gates[r] = frozenset()
+    for r in PAD_GROUP:
+        if r in gates:
+            gates[r] = frozenset({("en", REG_PAD_MODE)})
     for b in range(PORT_BLOCKS):
         lo = PORT_BLOCK_BASE + b * PORT_BLOCK_SIZE
         regs = [r for r in gates if lo <= r < lo + PORT_BLOCK_SIZE and r not in mode]
@@ -988,11 +1035,48 @@ class _Stitcher:
             a, b = self._plan_op(oi)
             first += a
             rest += b
-        self.eng_tasks[MAIN] = first + rest
+        self.eng_tasks[MAIN] = self._place_output_param(first + rest)
         for e in range(5):
             for n, t in enumerate(self.eng_tasks[e]):
                 t.pos = n
         self._number_signals()
+
+    def _place_output_param(self, main: list[_Fused]) -> list[_Fused]:
+        """LEARNED (RMSNorm at 576; not predicted, see the module docstring):
+        ``wiring["output_param"]`` moves the graph output's PARAM job to just
+        before the first CORE job of op k (an int), or to just before the
+        DEQUANT job (``"late"``). Without it the job stays where the last
+        op's standalone program has it."""
+        where = self.wiring.get("output_param")
+        if where is None:
+            return main
+
+        def find(what, test):
+            at = next((i for i, t in enumerate(main) if test(t)), None)
+            if at is None:
+                raise ValueError(f"output_param={where!r}: the graph has no {what}")
+            return at
+
+        def role(t, name):
+            return t.kind == "job" and t.job.role == name
+
+        out = self.wiring["output"]
+        at = find(
+            "PARAM job of its output",
+            lambda t: role(t, "PARAM") and self.states[t.op].name[t.job.tensor] == out,
+        )
+        if where == "late":
+            task = main.pop(at)
+            main.insert(find("DEQUANT job", lambda t: role(t, "DEQUANT")), task)
+            return main
+        if isinstance(where, bool) or not isinstance(where, int):
+            raise ValueError(f"output_param={where!r}: expected an op index or 'late'")
+        core = find(
+            f"CORE job of op {where}", lambda t: role(t, "CORE") and t.op == where
+        )
+        task = main.pop(at)
+        main.insert(core - (at < core), task)
+        return main
 
     def result(self) -> Stitched:
         main = self._main_segment()
@@ -1283,10 +1367,21 @@ class _Stitcher:
         self.param_dst: dict[int, int] = {}  # fused IO index -> PARAM job's buffer
         self.log: list[dict] = []
         out = self.out
+        # (op, job index) -> the op's (shadow, core count) before that job; a
+        # job emitted after later jobs of its op (``output_param``) is emitted
+        # from the state its op has at that job in the standalone order
+        before: dict[tuple[int, int], tuple[dict, int]] = {}
         for t in self.eng_tasks[MAIN]:
             st = self.states[t.op]
-            if t.kind == "job":
+            if t.kind == "job" and t.job.index < st.cursor:
+                now = st.shadow, st.n_core
+                shadow, st.n_core = before[t.op, t.job.index]
+                st.shadow = dict(shadow)
+                self._run_job(st, t.job, t.waits)
+                st.shadow, st.n_core = now
+            elif t.kind == "job":
                 for skipped in st.program.jobs[st.cursor : t.job.index]:
+                    before[t.op, skipped.index] = dict(st.shadow), st.n_core
                     self._run_job(st, skipped, None)
                 self._run_job(st, t.job, t.waits)
                 st.cursor = t.job.index + 1
@@ -1342,6 +1437,7 @@ class _Stitcher:
             zp,
             self.signed,
             o["attrs"],
+            j.written,
         )
 
     def _fused_record(self, st, j, w, owned, keep):
@@ -1540,6 +1636,7 @@ def stitch(
 
         {"inputs": [graph inputs in compiled slot order], "output": name,
          "graph_inputs": [the source graph's input order],   # optional
+         "output_param": op index | "late",                  # optional
          "ops": [{"op": "Mul", "program": path | bytes | ModelProto | Program,
                   "in": {standalone input name: fused tensor},
                   "out": (standalone output name, fused tensor),
@@ -1557,7 +1654,11 @@ def stitch(
     standalone build used the same constant. ``place`` pins an op's engine
     sub-programs to engines (a LEARNED input: attention's placement cannot be
     derived); without it the matrix and transpose sub-programs keep their
-    standalone engine and loaders alternate. ``gate_corpus`` adds standalone
+    standalone engine and loaders alternate. ``output_param`` places the graph
+    output's PARAM job before the first core job of that op, or (``"late"``)
+    before the DEQUANT job; like the slot order it is not predicted, so the
+    caller chooses it (default: where the last op's standalone program has
+    it). ``gate_corpus`` adds standalone
     programs used only to infer the register order, the liveness gates and
     loader templates."""
     return _Stitcher(wiring, scales, zero_points, signed, gate_corpus).result()

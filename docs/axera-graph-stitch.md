@@ -102,6 +102,9 @@ that graph agree.
 | Graph-input jobs run before the first core job | learned | `attention` |
 | Engine placement of each MatMul (`place`) | learned | `attention` |
 | The main-engine transpose job (`MAIN_TRANSPOSE_JOB`) | learned | `attention` |
+| Where the output's PARAM job runs (`wiring["output_param"]`) | learned, not predicted | `rmsnorm` at `[1,576]` |
+| Wide ReduceMean: single-precision lane, `zp_x * min(n, 256)`, packed pad lanes | learned | ReduceMean at 64 to 2048, `rmsnorm` at `[1,576]` |
+| The pad group `0x0cd0..0x0da0` is live only while `0x0c20` is nonzero | learned | ReduceMean at 288 and 384 |
 
 The transpose job is the largest learned item. In the fused attention block, the second
 MatMul's operand transpose runs as a 30-record main-engine job. No standalone program
@@ -112,6 +115,30 @@ come from the standalone copy-engine job.
 
 Three structural choices are assumptions that no build contradicts and none isolates:
 scratch buffers, PARAM words and each engine's sub-programs are numbered in op order.
+
+## Width 576
+
+Two graphs were also built at `[1,576]` (`docs/axera-width-and-linear-emit.md`, fixtures
+in `scripts/axera/fixtures/width_retarget/`). SiLU stitches from the `[1,576]` Sigmoid
+and Mul programs with no new rule. RMSNorm needed the last three rows of the table:
+
+- **Output PARAM placement.** The native `[1,576]` RMSNorm runs the graph output's PARAM
+  job just before ReduceMean's core job; the `[1,64]` one runs it just before the DEQUANT
+  job. Standalone builds differ the same way (Sigmoid at 512 and ReduceMean at 512 and
+  576 run it before the core, every other width after), and nothing found predicts it.
+  It is a wiring input: `"output_param": k` (before the first core job of op `k`) or
+  `"late"`. A job that moves is emitted from the register state its op has at that job
+  in the standalone order. Without the placement the stitched RMSNorm has 544 main-engine
+  records instead of 532.
+- **Wide ReduceMean calibration.** The lane is `float32(float32(s_x / s_y) / n)` (the
+  float64 form is one ulp off on the native `[1,384]` build and equal on every `[1,64]`
+  one); the accumulator zero point is `zp_x * min(n, 256)`; a padded core holds `zp_x` in
+  all four bytes of `0x0d30..0x0da0`.
+- **Pad group liveness.** An exception to "the mode group is always live": the pad group
+  is restored only while `0x0c20` is nonzero.
+
+With them RMSNorm at `[1,576]` stitched from native components (built at `pm1`) equals
+the native fused build at both calibrations: records 8 / 4 / 532 / 52 / 56.
 
 ## Record counts
 
@@ -141,6 +168,8 @@ calibrations (except the `mul_sig` blob size):
 - A one-op graph stitched from each of the 30 standalone programs reproduces that
   program's segments, `npu_params` and model. The exception is the `asym` Add build: its
   two `npu_params` scale words are in the other order.
+- SiLU and RMSNorm at `[1,576]` (two calibrations each) equal their native builds, and
+  the ReduceMean lane is pinned on the `[1,384]` build.
 - The refused cases below raise.
 
 ## Device results
@@ -161,13 +190,28 @@ The large-program Neg retarget (`docs/axera-misc-op-record-emit.md`) was run the
 way at `[1,64]`: `pm4` to `asym` and `asym` to `pm4`, 6,400 values in each direction,
 bit-identical to the native build of the target calibration.
 
+AX8850, AXCL V3.6.5, 2026-10-10, at `[1,576]`. Stitched model versus native fused
+build: the outputs were bit-identical.
+
+| graph | values compared |
+| --- | --- |
+| `silu` at `[1,576]` | 34,560 per calibration |
+| `rmsnorm` at `[1,576]`, from native components | 34,560 |
+
+Calibrate + stitch without Pulsar2's quant json was run the same day
+(`docs/axera-pulsar-free-calibration.md`).
+
 ## Limits
 
-- **Calibration still comes from Pulsar2.** The fused scales and zero points are read
-  from the fused build's `quant_axmodel.json`. The stitcher replaces the compiler, not
-  the quantizer.
-- **One shape per graph.** A standalone program serves the exact shape it was built at.
-  Every graph here was stitched at one shape.
+- **Calibration is an input.** The stitcher replaces the compiler, not the quantizer.
+  The fused scales and zero points come from the fused build's `quant_axmodel.json`, or
+  from `pulsar_free_calibration` (float graph plus samples, no Pulsar2; about 8% of its
+  scales are one float32 ulp from Pulsar2's).
+- **One shape per program.** A standalone program serves the exact shape it was built
+  at. `width_retarget` moves a `[1,64]` program of seven ops to other widths and emits
+  ReduceMean at the measured widths (`docs/axera-width-and-linear-emit.md`).
+- **The output PARAM placement is not predicted.** At `[1,576]` the caller has to give
+  it (`output_param`); the value used here was read off the native build.
 - **Sqrt and Div zero points.** A Sqrt with a nonzero input or output zero point and a
   Div with a nonzero divisor zero point raise `NotImplementedError`. No standalone build
   has one, so their registers are unknown.
