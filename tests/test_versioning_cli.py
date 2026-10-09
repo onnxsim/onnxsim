@@ -201,3 +201,61 @@ def test_backend_spec_without_a_function_is_a_usage_error(project, tmp_path):
         main(["verify", project, "--cases", cases, "--backend", "no_colon"])
         == EXIT_ERROR
     )
+
+
+def test_build_with_simplify_records_its_configuration(project, tmp_path, capsys):
+    out = str(tmp_path / "simplified.onnx")
+    assert main(["build", project, "-o", out, "--simplify"]) == EXIT_PASS
+    assert "simplify check: pass" in capsys.readouterr().out
+    assert onnx.load(out).graph.node
+    manifest, _ = read_project(project)
+    (build,) = manifest["builds"]
+    assert build["output"] == "simplified.onnx"
+    assert build["simplify"] == {}
+    assert build["simplify_checked"] is True
+    assert build["onnxsim_version"]
+    assert build["executor"]
+
+
+def test_simplify_options_are_parsed_and_recorded(project, tmp_path):
+    out = str(tmp_path / "opt.onnx")
+    code = main(
+        [
+            "build",
+            project,
+            "-o",
+            out,
+            "--simplify-opt",
+            "skip_fuse_bn=true",
+            "--simplify-opt",
+            "tensor_size_threshold=4KB",
+        ]
+    )
+    assert code == EXIT_PASS
+    manifest, _ = read_project(project)
+    assert manifest["builds"][-1]["simplify"] == {
+        "skip_fuse_bn": True,
+        "tensor_size_threshold": "4KB",
+    }
+
+
+def test_an_unknown_simplify_option_fails_before_anything_is_written(
+    project, tmp_path, capsys
+):
+    out = tmp_path / "never.onnx"
+    assert (
+        main(["build", project, "-o", str(out), "--simplify-opt", "no_such_option=1"])
+        == EXIT_ERROR
+    )
+    assert "no_such_option" in capsys.readouterr().err
+    assert not out.exists()
+    manifest, _ = read_project(project)
+    assert "builds" not in manifest
+
+
+def test_a_simplify_option_without_a_value_is_a_usage_error(project, tmp_path):
+    out = str(tmp_path / "bad.onnx")
+    assert (
+        main(["build", project, "-o", out, "--simplify-opt", "skip_fuse_bn"])
+        == EXIT_ERROR
+    )

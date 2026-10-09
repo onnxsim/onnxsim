@@ -93,6 +93,29 @@ changes; a changed weight shows up only as a changed digest.
 
 6. **Commit** `model.txt` and `manifest.json` together with the change.
 
+To write a simplified model, add `--simplify`, and pass any keyword option of
+`onnxsim.simplify` with `--simplify-opt NAME=VALUE` (repeatable; it implies
+`--simplify`):
+
+```
+python -m onnxsim.versioning_cli build proj -o out.onnx \
+    --simplify-opt skip_fuse_bn=true --simplify-opt tensor_size_threshold=4KB
+```
+
+Each option name is checked against `onnxsim.simplify`'s signature before anything
+runs, so a typo is an error and nothing is written. A value is read as JSON, so
+`true`, `4` and `["a"]` keep their types; anything that isn't valid JSON is taken
+as a string. If simplify's own check fails, `build` exits 1.
+
+Every build is appended to `builds` in `manifest.json`, with the output's file
+digest, the source graph hash, the simplify options (`null` when simplify was not
+used), whether simplify's check passed, the onnxsim version, and the executor. The
+simplified file differs from the graph text, so the manifest is the record of how
+it was produced.
+
+`verify` checks the unsimplified graph. Simplify changes the output, so a simplified
+build is not verified unless you verify it separately.
+
 `status` summarizes a project: the base file, the base graph hash, the current
 graph hash, and each recorded step with its verdict.
 

@@ -11,6 +11,7 @@ caller passes, by the digests in the text. Test cases come from a JSON file whos
 supplied-input paths are relative to that file.
 """
 
+import inspect
 import json
 import os
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from onnxsim.versioning import (
     load_graph_text,
     load_manifest,
     record_step,
+    save_snapshot,
 )
 
 MODEL_FILE = "model.txt"
@@ -237,3 +239,55 @@ def verify_project(
             culprit=culprit_data,
         )
     return VerifyResult(passed, tuple(reports), culprit, entry)
+
+
+def simplify_options_check(options: dict) -> None:
+    """Reject option names that ``onnxsim.simplify`` does not take, before any work."""
+    from onnxsim import simplify
+
+    accepted = set(inspect.signature(simplify).parameters) - {"model"}
+    unknown = sorted(set(options) - accepted)
+    if unknown:
+        raise ValueError(f"unknown simplify option(s): {', '.join(unknown)}")
+
+
+def build_output(
+    directory: str,
+    output: str,
+    weights: Sequence[str] = (),
+    simplify_options: Optional[dict] = None,
+) -> dict:
+    """Write the project's graph to ``output``, optionally simplified, and record how.
+
+    With ``simplify_options`` (possibly empty), ``onnxsim.simplify`` runs on the
+    rebuilt graph with those keyword options. The build's entry in the manifest
+    records the options, the simplify version, the executor and the output's digest.
+    Returns the entry; its ``simplify_checked`` is ``False`` when simplify's own
+    output check failed.
+    """
+    import onnxsim
+    from onnxsim import simplify
+
+    if simplify_options is not None:
+        simplify_options_check(simplify_options)
+    _, candidate, text = build_project(directory, weights)
+    checked: Optional[bool] = None
+    if simplify_options is not None:
+        candidate, checked = simplify(candidate, **simplify_options)
+        checked = bool(checked)
+    digest = save_snapshot(candidate, output)
+    entry = {
+        "output": os.path.basename(output),
+        "file_digest": digest,
+        "source_graph": graph_hash(text),
+        "simplify": simplify_options,
+        "simplify_checked": checked,
+        "onnxsim_version": onnxsim.__version__,
+        "executor": executor_name(),
+    }
+    path = _manifest_path(directory)
+    with open(path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest.setdefault("builds", []).append(entry)
+    _write_json(path, manifest)
+    return entry

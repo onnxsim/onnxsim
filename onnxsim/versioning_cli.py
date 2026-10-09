@@ -12,15 +12,17 @@ printed and recorded), and 2 on usage or data errors. See
 
 import argparse
 import importlib
+import json
 import sys
 from typing import List, Optional
 
-from onnxsim.versioning import FUSION_PRESETS, graph_hash, save_snapshot
+from onnxsim.versioning import FUSION_PRESETS
 from onnxsim.versioning_project import (
-    build_project,
+    build_output,
     init_project,
     load_cases,
     project_status,
+    simplify_options_check,
     verify_project,
 )
 
@@ -46,11 +48,34 @@ def _cmd_status(args) -> int:
     return EXIT_PASS
 
 
+def _simplify_options(args) -> Optional[dict]:
+    """Options for ``onnxsim.simplify``, or None when simplify is not requested."""
+    if not args.simplify and not args.simplify_opt:
+        return None
+    options = {}
+    for item in args.simplify_opt:
+        name, sep, raw = item.partition("=")
+        if not sep or not name:
+            raise ValueError(f"--simplify-opt takes NAME=VALUE, got {item!r}")
+        try:
+            options[name] = json.loads(raw)
+        except json.JSONDecodeError:
+            options[name] = raw
+    return options
+
+
 def _cmd_build(args) -> int:
-    _, candidate, text = build_project(args.directory, args.weights)
-    digest = save_snapshot(candidate, args.output)
-    print(f"wrote {args.output} (file {digest})")
-    print(f"graph: {graph_hash(text)}")
+    options = _simplify_options(args)
+    if options is not None:
+        simplify_options_check(options)
+    entry = build_output(args.directory, args.output, args.weights, options)
+    print(f"wrote {args.output} (file {entry['file_digest']})")
+    print(f"graph: {entry['source_graph']}")
+    if options is not None:
+        print(f"simplify: {json.dumps(options, sort_keys=True) or '{} (defaults)'}")
+        print(f"simplify check: {'pass' if entry['simplify_checked'] else 'FAILED'}")
+        if not entry["simplify_checked"]:
+            return EXIT_FAIL
     return EXIT_PASS
 
 
@@ -127,6 +152,18 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FILE",
         help="extra .onnx file to take weights from (repeatable)",
+    )
+    p.add_argument(
+        "--simplify",
+        action="store_true",
+        help="run onnxsim.simplify on the graph before writing it",
+    )
+    p.add_argument(
+        "--simplify-opt",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="keyword option for simplify, value as JSON or plain text (repeatable; implies --simplify)",
     )
     p.set_defaults(func=_cmd_build)
 
