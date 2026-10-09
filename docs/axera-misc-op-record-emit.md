@@ -236,6 +236,32 @@ with zero-point write omission on top. A sweep of 20+ builds of `Neg [1,1]`
   cross-entropy sums (`<= 0`), which calibrate to `zp_x = 255, zp_y = 0`
   (`step_neg__v4`, large program).
 
+### Large program: the shift and `npu_params`
+
+The large program holds three more calibration values, found on the `[1,64]` builds
+(`Neg:1x64`, where two large builds differ in them):
+
+- `0x1ea0 = k`, with `k = 15 + floor(log2 s_x)` on the float32 scale;
+- `0x1ef0..0x1f20 = 255 << k`, the four lanes after that write;
+- in `npu_params`, a zero byte, the u16 `round(2**k / s_x)` and the u16 `2**k`.
+
+`retarget` rewrites the records and `emit_model` the `npu_params` words. All 12 large
+builds (ten `[1,1]`, two `[1,64]`) follow the three formulas. `k` is 9 in every `[1,1]`
+build and in the `[1,64]` `asym` build, and 10 in `[1,64]` `pm4`. A target with any other
+`k` (float32 `s_x >= 1/16`) is refused unless the template has the same `k`.
+
+- Templates: `Neg:1x64` is the `pm4` build (large) and `Neg:1x64:small` the `pm1` build.
+  The `asym` build is held out. `pm4` to `asym` reproduces its records, `npu_params` and
+  the rest of the model proto; `asym` to `pm4` reproduces the records.
+- Device (AX8850, AXCL V3.6.5, 2026-10-09): both directions matched the native build of
+  the target calibration bit for bit over 6,400 values each.
+- Before this, `emit_model` left the template's `npu_params` in place. For `[1,1]` the
+  records were already exact, because every `[1,1]` build has `k = 9`, but the
+  multiplier word was stale in 61 of the 70 template-to-build pairs. On the device, the
+  old `[1,1]` emit path still matched a native build over all 256 input codes with
+  `npu_params` differing. That is one case, `neg_L060`; it does not show the words are
+  unused.
+
 ## Softmax at an LLM shape: `Softmax:1x64:axis1`
 
 A last-axis Softmax on `x[1, 64]` (float32 I/O, Pulsar2 7.0-lite, MinMax over 16

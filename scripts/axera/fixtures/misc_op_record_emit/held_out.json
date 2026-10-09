@@ -505,5 +505,16 @@
    "count": 16,
    "seed": 0
   }
+ },
+ "misc_op_record_emit/neg_1x64_asym.axmodel.gz": {
+  "op": "Neg",
+  "scales": {
+   "x": 0.01567547209560871,
+   "y": 0.01567547209560871
+  },
+  "zero_points": {
+   "x": 64,
+   "y": 191
+  }
  }
 }

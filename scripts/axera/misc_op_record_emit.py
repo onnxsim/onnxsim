@@ -54,6 +54,13 @@ whole records only (``docs/axera-misc-op-record-emit.md``):
   has lanes ``1/s_x`` and ``s_x``, and zero-point writes on ``0x1a90``,
   ``0x1ad0`` and ``0x1b10`` that are omitted when the register already holds
   the value (outside register-block dumps), so any zero point retargets.
+  The large program also holds a shift ``k = 15 + floor(log2 s_x)`` (float32
+  scale) in ``0x1ea0``, ``255 << k`` on the four lanes ``0x1ef0..0x1f20``
+  after it, and the u16 words ``round(2**k / s_x)`` and ``2**k`` in
+  ``npu_params``. ``retarget`` rewrites the records and ``emit_model`` the
+  ``npu_params`` words. Only ``k`` 9 and 10 were measured (``[1,1]`` builds
+  have 9; the ``[1,64]`` builds 9 and 10), so a change to any other ``k`` is
+  refused.
 
 * **Greater -> Cast** is not quantized at all. Builds at the same shape and
   different calibrations are record-identical except segment 0's slot table
@@ -90,6 +97,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import os
 import struct
 import sys
@@ -142,6 +150,11 @@ CALIBRATION_FREE = (
 # (zero points 0..255 on both sides): float32 s < 1/64 gives the small program,
 # s >= 1/64 the large one (0.01562 small, 0.015625 and 0.01563 large).
 NEG_PROGRAM_SCALE = 2.0**-6
+# The large program's shift register, the four clamp lanes that follow it,
+# and the shifts seen in native builds.
+NEG_SHIFT_REG = 0x1EA0
+NEG_CLAMP_REGS = (0x1EF0, 0x1F00, 0x1F10, 0x1F20)
+NEG_MEASURED_SHIFTS = (9, 10)
 
 
 def _f32(x: float) -> float:
@@ -513,6 +526,48 @@ def neg_program(scale: float) -> str:
     return "small" if _f32(scale) < NEG_PROGRAM_SCALE else "large"
 
 
+def neg_shift(scale: float) -> int:
+    """The large Neg program's shift ``k = 15 + floor(log2 s)`` on the float32
+    scale (``frexp`` is exact, a ``log2`` would round)."""
+    return 14 + math.frexp(_f32(scale))[1]
+
+
+def neg_params(scale: float, length: int) -> bytes:
+    """The large Neg program's ``npu_params``: a zero byte, the u16 multiplier
+    ``round(2**k / s)`` and the u16 ``2**k``, zero padded to ``length``."""
+    k = neg_shift(scale)
+    mult = int(round(2.0**k / float(scale)))
+    if not 0 < mult <= 0xFFFF:
+        raise ValueError(f"Neg multiplier {mult} does not fit a u16")
+    return struct.pack("<BHH", 0, mult, 1 << k).ljust(length, b"\0")
+
+
+def _retarget_neg_shift(words, k_old: int, k_new: int) -> tuple[list[bytes], int]:
+    """Rewrite the large Neg program's ``0x1ea0 = k`` write and the four
+    ``0x1ef0..0x1f20 = 255 << k`` lanes after it. Returns the words and the
+    number of shift writes found (0 when this segment has none)."""
+    hits = [j for j, w in enumerate(words) if _reg(w) == NEG_SHIFT_REG and _val(w)]
+    if not hits:
+        return list(words), 0
+    if len(hits) != 1 or _val(words[hits[0]]) != k_old:
+        raise ValueError(f"expected one 0x1ea0 = {k_old} write, found {hits}")
+    j = hits[0]
+    lanes = [i for i, w in enumerate(words) if _reg(w) in NEG_CLAMP_REGS and _val(w)]
+    if (
+        len(lanes) != len(NEG_CLAMP_REGS)
+        or lanes != list(range(lanes[0], lanes[0] + len(lanes)))
+        or not j < lanes[0] <= j + 4
+    ):
+        raise ValueError(f"expected four clamp lanes after record {j}, found {lanes}")
+    out = list(words)
+    out[j] = _with_val(words[j], k_new)
+    for i, reg in zip(lanes, NEG_CLAMP_REGS):
+        if _reg(words[i]) != reg or _val(words[i]) != 255 << k_old:
+            raise ValueError(f"record {i} is not {reg:#06x} = 255 << {k_old}")
+        out[i] = _with_val(words[i], 255 << k_new)
+    return out, 1
+
+
 def _zp_in_word(words) -> bytes:
     """A ``0x1b10`` record of the stream's own verb/unit, value to be set."""
     for w in words:
@@ -550,18 +605,29 @@ def retarget(
             raise ValueError("Neg's output zero point is 255 - zp_x")
         if neg_program(old_scales["x"]) != neg_program(new_scales["x"]):
             raise ValueError("the target scale compiles to the other Neg program")
+    neg_large = op == "Neg" and neg_program(new_scales["x"]) == "large"
+    if neg_large:
+        k_old, k_new = neg_shift(old_scales["x"]), neg_shift(new_scales["x"])
+        if k_new != k_old and k_new not in NEG_MEASURED_SHIFTS:
+            raise ValueError(
+                f"Neg shift k = {k_new} was never measured (only "
+                f"{NEG_MEASURED_SHIFTS}); the template has k = {k_old}"
+            )
     if changed - movable:
         raise ValueError(
             f"{op} zero points {sorted(changed - movable)} are fixed by the template"
         )
     segs = suc.decode_segments(mc)
-    found = 0
+    found = shifts = 0
     for si, raw in enumerate(segs):
         words = _chunks(raw)
         new, kinds = _retarget_lanes(words, op, old_scales, new_scales, reduce_count)
         if not kinds:
             continue
         found += len(kinds)
+        if neg_large:
+            new, n = _retarget_neg_shift(new, k_old, k_new)
+            shifts += n
         if op == "Log":
             new = _retarget_log_table(new, old_scales, new_scales, old_zp)
         elif op == "Softmax" and old_zp:
@@ -582,6 +648,8 @@ def retarget(
             mc = bose.relayout_segment(mc, si, new_raw)
     if not found:
         raise ValueError("no scale lanes of the template calibration were found")
+    if neg_large and shifts != 1:
+        raise ValueError(f"expected one Neg 0x1ea0 shift write, found {shifts}")
     return mc
 
 
@@ -643,7 +711,15 @@ def emit_model(
     )
     # a zero-point move can change the blob length: the runtime reads the
     # MCode size from the initializer's dims (0x80300709 on load otherwise)
-    return step_recalibrate.with_mcode(model, mc)
+    out = step_recalibrate.with_mcode(model, mc)
+    if meta["op"] == "Neg" and meta["program"] == "large":
+        # the large program's multiplier and 2**k live in npu_params
+        params = bose._params_init(out)
+        old = bytes(params.raw_data)
+        if old != neg_params(meta["scales"]["x"], len(old)):
+            raise ValueError("npu_params is not the Neg template calibration's")
+        params.raw_data = neg_params((scales or meta["scales"])["x"], len(old))
+    return out
 
 
 def emit_spec(

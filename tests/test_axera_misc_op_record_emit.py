@@ -448,3 +448,117 @@ def test_fused_chain_at_an_extreme_ratio_matches_native_bytes(name):
     want = bytes(mre.mcode_initializer(native).raw_data)
     assert len(got) == len(want)
     assert [i for i in range(len(got)) if got[i] != want[i] and i not in _NOISE] == []
+
+
+# Neg at an LLM shape, [1,64]: the pm4 build is the large-program template
+# (shift k = 10), asym a held-out large build (k = 9), pm1 the small template.
+NEG_1X64_HELD = "misc_op_record_emit/neg_1x64_asym.axmodel.gz"
+
+
+def _model(rel: str) -> onnx.ModelProto:
+    with gzip.open(os.path.join(FIXTURES, rel), "rb") as f:
+        return onnx.load_model_from_string(f.read())
+
+
+def _params(model: onnx.ModelProto) -> bytes:
+    return next(
+        bytes(i.raw_data) for i in model.graph.initializer if i.name == "npu_params"
+    )
+
+
+def _reg_values(mc: bytes, reg: int) -> list[int]:
+    return [
+        mre._val(w)
+        for seg in mre.suc.decode_segments(mc)
+        for w in mre._chunks(seg)
+        if mre._reg(w) == reg and mre._val(w)
+    ]
+
+
+def test_neg_1x64_large_program_matches_held_out_build():
+    # k moves 10 -> 9: the 0x1ea0 write, the four 0x1ef0.. lanes and the two
+    # npu_params words change with the lanes and zero points
+    held = HELD[NEG_1X64_HELD]
+    assert mre.neg_shift(INDEX["Neg:1x64"]["scales"]["x"]) == 10
+    assert mre.neg_shift(held["scales"]["x"]) == 9
+    got = mre.emit_model("Neg:1x64", held["scales"], held["zero_points"])
+    want = _model(NEG_1X64_HELD)
+    got_mc = bytes(mre.mcode_initializer(got).raw_data)
+    want_mc = bytes(mre.mcode_initializer(want).raw_data)
+    assert mre.normalized_records(got_mc) == mre.normalized_records(want_mc)
+    assert _reg_values(got_mc, mre.NEG_SHIFT_REG) == [9]
+    assert _reg_values(got_mc, mre.NEG_CLAMP_REGS[0]) == [255 << 9]
+    assert _params(got) == _params(want)
+    # nothing else in the model differs from the native build
+    for m in (got, want):
+        mre.mcode_initializer(m).raw_data = b""
+    assert got.SerializeToString(deterministic=True) == want.SerializeToString(
+        deterministic=True
+    )
+
+
+def test_neg_1x64_held_out_build_retargets_to_the_template():
+    # the other direction, k 9 -> 10
+    held, meta = HELD[NEG_1X64_HELD], INDEX["Neg:1x64"]
+    got = mre.retarget(
+        _mcode(NEG_1X64_HELD),
+        "Neg",
+        held["scales"],
+        meta["scales"],
+        held["zero_points"],
+        meta["zero_points"],
+    )
+    assert mre.normalized_records(got) == mre.normalized_records(_mcode(meta["file"]))
+    template = _params(_model(meta["file"]))
+    assert mre.neg_params(meta["scales"]["x"], len(template)) == template
+    held_params = _params(_model(NEG_1X64_HELD))
+    assert mre.neg_params(held["scales"]["x"], len(held_params)) == held_params
+
+
+def test_neg_1x64_small_scale_picks_the_small_template():
+    meta = INDEX["Neg:1x64:small"]
+    assert meta["program"] == mre.neg_program(meta["scales"]["x"]) == "small"
+    got = mre.emit_model("Neg:1x64", meta["scales"], meta["zero_points"])
+    want = _model(meta["file"])
+    assert bytes(mre.mcode_initializer(got).raw_data) == _mcode(meta["file"])
+    assert _params(got) == _params(want) == bytes(len(_params(want)))
+
+
+@pytest.mark.parametrize(
+    "name", sorted(k for k, v in NEG.items() if v["program"] == "large")
+)
+def test_neg_emit_model_rewrites_npu_params(name):
+    # emit_model used to leave the template's multiplier in npu_params; every
+    # [1,1] large build has k = 9, so only the multiplier word differs
+    meta = NEG[name]
+    got = mre.emit_model("Neg:1x1", meta["scales"], meta["zero_points"])
+    want = _model(f"misc_op_neg/{name}")
+    assert mre.neg_shift(meta["scales"]["x"]) == 9
+    assert _params(got) == _params(want)
+    assert mre.normalized_records(
+        bytes(mre.mcode_initializer(got).raw_data)
+    ) == mre.normalized_records(bytes(mre.mcode_initializer(want).raw_data))
+
+
+def test_neg_refuses_an_unmeasured_shift():
+    zps = {"x": 128, "y": 127}
+    # s >= 1/16 needs k = 11; only 9 and 10 were measured
+    assert mre.neg_shift(0.07) == 11
+    with pytest.raises(ValueError, match="never measured"):
+        mre.emit_model("Neg:1x1", {"x": 0.07, "y": 0.07}, zps)
+    with pytest.raises(ValueError, match="never measured"):
+        mre.emit_model("Neg:1x64", {"x": 0.07, "y": 0.07}, zps)
+    # k = 10 is accepted from a k = 9 template
+    model = mre.emit_model("Neg:1x1", {"x": 0.04, "y": 0.04}, zps)
+    mc = bytes(mre.mcode_initializer(model).raw_data)
+    assert _reg_values(mc, mre.NEG_SHIFT_REG) == [10]
+    assert _params(model)[:5] == mre.neg_params(0.04, 5)
+
+
+def test_neg_shift_records_must_match_the_template_calibration():
+    # the 0x1ea0 record is checked against the template's own k (10 here)
+    meta = INDEX["Neg:1x64"]
+    words = mre._chunks(mre.suc.decode_segments(_mcode(meta["file"]))[2])
+    assert mre._retarget_neg_shift(words, 10, 10) == (words, 1)
+    with pytest.raises(ValueError):
+        mre._retarget_neg_shift(words, 9, 10)
