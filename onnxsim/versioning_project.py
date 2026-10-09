@@ -26,6 +26,7 @@ from onnxsim.versioning import (
     CaseReport,
     ChangeUnit,
     GeneratedCase,
+    OnnxTestDataCase,
     ReproducibilityError,
     SuppliedCase,
     TensorIndex,
@@ -153,6 +154,12 @@ def case_from_dict(data: dict, base_dir: str = ".") -> Case:
     if kind == "supplied":
         return SuppliedCase(
             data["name"], os.path.join(base_dir, data["path"]), data["digests"]
+        )
+    if kind == "onnx_test_data":
+        return OnnxTestDataCase(
+            data["name"],
+            os.path.join(base_dir, data["directory"]),
+            int(data.get("test_set", 0)),
         )
     raise ValueError(f"case {data.get('name', '?')}: unknown kind {kind!r}")
 

@@ -187,7 +187,63 @@ class SuppliedCase:
     digests: Dict[str, str]
 
 
-Case = Union[GeneratedCase, SuppliedCase]
+@dataclass(frozen=True)
+class OnnxTestDataCase:
+    """One test set in the ONNX backend test-data layout.
+
+    ``directory`` holds ``test_data_set_<test_set>/input_<i>.pb`` (TensorProto files,
+    one per graph input) and, when present, ``output_<i>.pb`` expected outputs. The
+    model is the ``model.onnx`` the caller checks against, so inputs are matched to
+    the graph's non-initializer inputs in order.
+    """
+
+    name: str
+    directory: str
+    test_set: int = 0
+
+
+Case = Union[GeneratedCase, SuppliedCase, OnnxTestDataCase]
+
+
+def _read_tensor_pb(path: str) -> np.ndarray:
+    tensor = TensorProto()
+    with open(path, "rb") as f:
+        tensor.ParseFromString(f.read())
+    return numpy_helper.to_array(tensor)
+
+
+def _read_numbered(
+    data_dir: str, prefix: str, names: Sequence[str]
+) -> Dict[str, np.ndarray]:
+    files = sorted(
+        f
+        for f in os.listdir(data_dir)
+        if f.startswith(f"{prefix}_") and f.endswith(".pb")
+    )
+    if len(files) != len(names):
+        raise ValueError(
+            f"{data_dir}: {len(files)} {prefix}_*.pb files for {len(names)} graph {prefix}s"
+        )
+    return {
+        name: _read_tensor_pb(os.path.join(data_dir, f"{prefix}_{i}.pb"))
+        for i, name in enumerate(names)
+    }
+
+
+def load_onnx_test_set(
+    case_dir: str, model: ModelProto, test_set: int = 0
+) -> Tuple[Dict[str, np.ndarray], Optional[Dict[str, np.ndarray]]]:
+    """Inputs, and expected outputs if the set has them, from the ONNX test-data layout."""
+    data_dir = os.path.join(case_dir, f"test_data_set_{test_set}")
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"no test set at {data_dir}")
+    initializers = {t.name for t in model.graph.initializer}
+    input_names = [i.name for i in model.graph.input if i.name not in initializers]
+    feeds = _read_numbered(data_dir, "input", input_names)
+    output_names = [o.name for o in model.graph.output]
+    has_outputs = any(f.startswith("output_") for f in os.listdir(data_dir))
+    expected = _read_numbered(data_dir, "output", output_names) if has_outputs else None
+    return feeds, expected
 
 
 def generate_feeds(case: GeneratedCase) -> Dict[str, np.ndarray]:
@@ -208,8 +264,18 @@ def generate_feeds(case: GeneratedCase) -> Dict[str, np.ndarray]:
     return feeds
 
 
-def resolve_feeds(case: Case) -> Dict[str, np.ndarray]:
-    """Feeds for ``case``, checked against the digests recorded with it."""
+def resolve_feeds(
+    case: Case, model: Optional[ModelProto] = None
+) -> Dict[str, np.ndarray]:
+    """Feeds for ``case``, checked against the digests recorded with it.
+
+    An :class:`OnnxTestDataCase` needs ``model`` to match its inputs to graph inputs.
+    """
+    if isinstance(case, OnnxTestDataCase):
+        if model is None:
+            raise ValueError(f"case {case.name} needs the model to read its inputs")
+        feeds, _ = load_onnx_test_set(case.directory, model, case.test_set)
+        return feeds
     if isinstance(case, GeneratedCase):
         feeds = generate_feeds(case)
         recorded = case.digests or {}
@@ -245,6 +311,13 @@ def case_to_dict(case: Case) -> dict:
                 for s in case.specs
             ],
             "digests": case.digests or {},
+        }
+    if isinstance(case, OnnxTestDataCase):
+        return {
+            "name": case.name,
+            "kind": "onnx_test_data",
+            "directory": os.path.basename(os.path.normpath(case.directory)),
+            "test_set": case.test_set,
         }
     return {
         "name": case.name,
@@ -438,7 +511,7 @@ def check_equivalent(
     if base_names != cand_names:
         raise ValueError(f"output names differ: {base_names} vs {cand_names}")
     for case in cases:
-        feeds = resolve_feeds(case)
+        feeds = resolve_feeds(case, base)
         ref = run_model(base, feeds)
         if backend is None:
             got: List[Optional[np.ndarray]] = list(run_model(candidate, feeds))
@@ -464,11 +537,15 @@ def check_equivalent(
                 continue
             r64 = r.astype(np.float64)
             g64 = g.astype(np.float64)
-            diff = np.abs(g64 - r64)
-            denom = np.maximum(np.abs(r64), np.finfo(np.float64).tiny)
+            # NaN matches NaN and equal infinities match, which subtraction alone misses.
+            same = (r64 == g64) | (np.isnan(r64) & np.isnan(g64))
+            with np.errstate(invalid="ignore", over="ignore"):
+                diff = np.where(same, 0.0, np.abs(g64 - r64))
+                denom = np.maximum(np.abs(r64), np.finfo(np.float64).tiny)
+                rel = np.where(same, 0.0, diff / denom)
             max_abs = max(max_abs, float(diff.max(initial=0.0)))
-            max_rel = max(max_rel, float((diff / denom).max(initial=0.0)))
-            if not np.all(diff <= atol + rtol * np.abs(r64)):
+            max_rel = max(max_rel, float(rel.max(initial=0.0)))
+            if not np.all(same | (diff <= atol + rtol * np.abs(r64))):
                 ok = False
         status = "fail" if not ok else ("partial" if skipped else "pass")
         reports.append(

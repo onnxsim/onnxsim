@@ -130,7 +130,21 @@ graph hash, and each recorded step with its verdict.
 - **Supplied** inputs are read from an `.npz` file. A relative `path` resolves
   next to the cases file. Each tensor's digest is checked when the file is read.
 
-A case may mix both kinds. Cases are recorded in the manifest with their
+- **ONNX test data** reads a case from the ONNX backend test layout: a
+  directory with `test_data_set_<n>/input_<i>.pb` files (TensorProto), matched to
+  the model's non-initializer inputs in order:
+
+  ```json
+  {"name": "add-broadcast", "kind": "onnx_test_data",
+   "directory": "third_party/onnx/onnx/backend/test/data/pytorch-operator/test_operator_add_broadcast",
+   "test_set": 0}
+  ```
+
+  The `output_<i>.pb` files, when present, are the official expected outputs. The
+  verifier doesn't compare against them; `examples/versioning/onnx_test_data.py`
+  does, using ONNX's reference evaluator.
+
+A case may mix kinds. Cases are recorded in the manifest with their
 inputs' digests, so the step's test set is a fixed identity.
 
 ## Verdicts and exit codes
@@ -249,6 +263,22 @@ culprit against the diff in `model.txt` before acting on it.
 
 Steps are only appended. Never edit them by hand. Each `base_graph` matches the
 previous step's `output_graph`, so the steps form a chain from the original.
+
+## Running ONNX's own test cases
+
+`examples/versioning/onnx_test_data.py` runs every case in the ONNX submodule's
+backend test data through the same checks. For each case it verifies that ONNX's
+reference evaluator reproduces the official outputs, and that the model written as
+graph text and rebuilt gives the same results as the original. Run it from the
+repository root:
+
+```
+PYTHONPATH=. python examples/versioning/onnx_test_data.py --group simple --limit 20
+```
+
+Cases that ONNX Runtime can't run (for example opset-6 models in ONNX Runtime 1.29)
+are reported as skipped with the reason, not as failures. The script exits 1 only
+when an official output differs or a round trip fails.
 
 ## Python API
 

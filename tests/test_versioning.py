@@ -402,3 +402,14 @@ def test_partial_run_is_reproducible_for_the_same_seed():
     b = run_partial(cand, feeds, _numpy_backend, sizes, seed=3)
     assert a.failed_nodes == b.failed_nodes == ("Sigmoid:y",)
     assert a.skipped == b.skipped == ("y",)
+
+
+def test_nan_and_infinity_outputs_match_themselves():
+    sqrt = parser.parse_model(
+        '<ir_version: 10, opset_import: ["" : 21]> g (float[4] x) => (float[4] y) { y = Sqrt (x) }'
+    )
+    cases = [
+        GeneratedCase("c", seed=0, specs=(TensorSpec("x", "float32", (4,), -1.0, 1.0),))
+    ]
+    (report,) = check_equivalent(sqrt, sqrt, cases)
+    assert report.ok and report.status == "pass"
