@@ -25,14 +25,15 @@ Limitations of this first version:
 """
 
 import hashlib
+import heapq
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
-from onnx import ModelProto, TensorProto, numpy_helper, parser, printer
+from onnx import ModelProto, NodeProto, TensorProto, numpy_helper, parser, printer
 
 INIT_MARKER = "# onnxsim-init "
 MANIFEST_VERSION = 1
@@ -381,3 +382,286 @@ def record_step(
         json.dump(manifest, f, indent=2, sort_keys=True)
         f.write("\n")
     return entry
+
+
+class BisectError(RuntimeError):
+    """The failing change cannot be bisected: an intermediate state is not a valid graph."""
+
+
+@dataclass(frozen=True)
+class ChangeUnit:
+    """A connected group of changed nodes and initializers, applied or reverted together.
+
+    ``nodes`` labels each node as ``name`` or ``op:first_output``. The ``_apply``
+    field holds the indices needed to build a state and is kept out of equality
+    and the repr.
+    """
+
+    index: int
+    nodes: Tuple[str, ...]
+    initializers: Tuple[str, ...]
+    _apply: Tuple[frozenset, Tuple[int, ...], frozenset] = field(
+        repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True)
+class BisectResult:
+    culprit: ChangeUnit
+    units: Tuple[ChangeUnit, ...]
+    evaluations: int
+
+
+def _node_key(node) -> tuple:
+    """Content identity of a node, ignoring its name."""
+    attrs = tuple(
+        a.SerializeToString(deterministic=True)
+        for a in sorted(node.attribute, key=lambda a: a.name)
+    )
+    return (node.domain, node.op_type, tuple(node.input), tuple(node.output), attrs)
+
+
+def _node_label(node) -> str:
+    return node.name or f"{node.op_type}:{node.output[0] if node.output else ''}"
+
+
+def _find(parent: List[int], i: int) -> int:
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+
+
+def _match_nodes(
+    bn: Sequence[NodeProto], cn: Sequence[NodeProto]
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """Pair candidate nodes with the base nodes that produce the same first output.
+
+    Returns ``(matched, inverse)``: candidate index -> base index, and the reverse.
+    """
+    first_out: Dict[str, int] = {}
+    for i, n in enumerate(bn):
+        if n.output:
+            first_out.setdefault(n.output[0], i)
+    matched: Dict[int, int] = {}
+    for j, n in enumerate(cn):
+        if n.output and n.output[0] in first_out:
+            matched[j] = first_out[n.output[0]]
+    return matched, {i: j for j, i in matched.items()}
+
+
+def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
+    """Split the difference between ``base`` and ``cand`` into units in apply order."""
+    bn = list(base.graph.node)
+    cn = list(cand.graph.node)
+    matched, inverse = _match_nodes(bn, cn)
+
+    diff_cand = [
+        j
+        for j in range(len(cn))
+        if j not in matched or _node_key(cn[j]) != _node_key(bn[matched[j]])
+    ]
+    diff_base = [i for i in range(len(bn)) if i not in inverse]
+    diff_base += [matched[j] for j in diff_cand if j in matched]
+
+    base_inits = {t.name: t for t in base.graph.initializer}
+    cand_inits = {t.name: t for t in cand.graph.initializer}
+    init_diff = sorted(
+        name
+        for name in set(base_inits) | set(cand_inits)
+        if name not in base_inits
+        or name not in cand_inits
+        or tensor_digest(numpy_helper.to_array(base_inits[name]))
+        != tensor_digest(numpy_helper.to_array(cand_inits[name]))
+    )
+
+    # Items: ("base", i), ("cand", j), ("init", name). Each has produced and consumed tensors and a position.
+    items = []
+    for i in diff_base:
+        items.append(
+            ("base", i, bn[i].output, bn[i].input, inverse.get(i, len(cn) + i))
+        )
+    for j in diff_cand:
+        items.append(("cand", j, cn[j].output, cn[j].input, j))
+    for name in init_diff:
+        items.append(("init", name, [name], [], -1))
+
+    parent = list(range(len(items)))
+    producers: Dict[str, List[int]] = {}
+    for k, item in enumerate(items):
+        for t in item[2]:
+            if t:
+                producers.setdefault(t, []).append(k)
+    for k, item in enumerate(items):
+        for t in item[3]:
+            for p in producers.get(t, []):
+                parent[_find(parent, k)] = _find(parent, p)
+    for ks in producers.values():
+        for p in ks[1:]:
+            parent[_find(parent, p)] = _find(parent, ks[0])
+
+    groups: Dict[int, List[int]] = {}
+    for k in range(len(items)):
+        groups.setdefault(_find(parent, k), []).append(k)
+    ordered = sorted(groups.values(), key=lambda g: min(items[k][4] for k in g))
+
+    units = []
+    for idx, group in enumerate(ordered):
+        base_rm, cand_add, inits = set(), [], set()
+        labels, init_names = [], []
+        for k in sorted(group, key=lambda k: items[k][4]):
+            kind, ref = items[k][0], items[k][1]
+            if kind == "base":
+                base_rm.add(ref)
+                labels.append(_node_label(bn[ref]))
+            elif kind == "cand":
+                cand_add.append(ref)
+                labels.append(_node_label(cn[ref]))
+            else:
+                inits.add(ref)
+                init_names.append(ref)
+        units.append(
+            ChangeUnit(
+                index=idx,
+                nodes=tuple(labels),
+                initializers=tuple(init_names),
+                _apply=(frozenset(base_rm), tuple(cand_add), frozenset(inits)),
+            )
+        )
+    return units
+
+
+class _Invalid(Exception):
+    pass
+
+
+def _topo_order(
+    pool: List[Tuple[int, NodeProto]], avail: set, outputs: Sequence[str]
+) -> List[NodeProto]:
+    """Order ``pool`` so every node comes after the producers of its inputs."""
+    producers: Dict[str, int] = {}
+    for idx, (_, node) in enumerate(pool):
+        for t in node.output:
+            if t:
+                if t in producers:
+                    raise _Invalid(f"tensor {t} is produced twice")
+                producers[t] = idx
+    indeg = [0] * len(pool)
+    consumers: Dict[int, List[int]] = {}
+    for idx, (_, node) in enumerate(pool):
+        deps = set()
+        for t in node.input:
+            if not t or t in avail:
+                continue
+            if t not in producers:
+                raise _Invalid(
+                    f"node {_node_label(node)} reads {t}, which nothing produces"
+                )
+            deps.add(producers[t])
+        indeg[idx] = len(deps)
+        for d in deps:
+            consumers.setdefault(d, []).append(idx)
+    heap = [(pool[i][0], i) for i in range(len(pool)) if indeg[i] == 0]
+    heapq.heapify(heap)
+    order = []
+    while heap:
+        _, i = heapq.heappop(heap)
+        order.append(pool[i][1])
+        for c in consumers.get(i, []):
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                heapq.heappush(heap, (pool[c][0], c))
+    if len(order) != len(pool):
+        raise _Invalid("the graph has a cycle")
+    for o in outputs:
+        if o not in avail and o not in producers:
+            raise _Invalid(f"graph output {o} is not produced")
+    return order
+
+
+def _state(
+    base: ModelProto,
+    cand: ModelProto,
+    header: ModelProto,
+    units: Sequence[ChangeUnit],
+    applied: int,
+    inverse: Dict[int, int],
+) -> ModelProto:
+    """The base graph with the first ``applied`` units replaced by their candidate versions."""
+    bn = list(base.graph.node)
+    cn = list(cand.graph.node)
+    removed: set = set()
+    added: List[int] = []
+    inits = {t.name: t for t in base.graph.initializer}
+    cand_inits = {t.name: t for t in cand.graph.initializer}
+    for unit in units[:applied]:
+        base_rm, cand_add, names = unit._apply
+        removed |= base_rm
+        added.extend(cand_add)
+        for name in names:
+            if name in cand_inits:
+                inits[name] = cand_inits[name]
+            else:
+                inits.pop(name, None)
+    pool = [
+        (inverse.get(i, len(cn) + i), bn[i]) for i in range(len(bn)) if i not in removed
+    ]
+    pool += [(j, cn[j]) for j in added]
+    avail = {i.name for i in base.graph.input} | set(inits)
+    outputs = [o.name for o in base.graph.output]
+    order = _topo_order(pool, avail, outputs)
+    state = ModelProto()
+    state.CopyFrom(header)
+    state.graph.node.extend(order)
+    state.graph.initializer.extend(inits.values())
+    return state
+
+
+def bisect_failure(
+    base: ModelProto,
+    candidate: ModelProto,
+    cases: Sequence[Case],
+    atol: float = 1e-5,
+    rtol: float = 1e-4,
+) -> Optional[BisectResult]:
+    """Find the single modified subgraph that makes ``candidate`` fail against ``base``.
+
+    Returns ``None`` when the candidate passes every case. Otherwise the change is
+    split into units (connected groups of modified nodes and initializers), and
+    binary search over the apply order finds the first prefix that fails. Its
+    last unit is the culprit. The search assumes that once a prefix fails, every
+    longer prefix also fails; a non-monotone change can point at a unit that is
+    not the real cause, so the result should be read with that in mind.
+    """
+    if all(r.ok for r in check_equivalent(base, candidate, cases, atol, rtol)):
+        return None
+    units = _plan(base, candidate)
+    if not units:
+        raise BisectError(
+            "the candidate fails but differs from the base in no node or initializer"
+        )
+    _, inverse = _match_nodes(list(base.graph.node), list(candidate.graph.node))
+    header = ModelProto()
+    header.CopyFrom(base)
+    header.graph.ClearField("node")
+    header.graph.ClearField("initializer")
+    header.graph.ClearField("value_info")
+
+    lo, hi = 0, len(units)  # prefix lo passes (base), prefix hi fails (candidate)
+    evaluations = 0
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        try:
+            state = _state(base, candidate, header, units, mid, inverse)
+        except _Invalid as e:
+            raise BisectError(
+                f"prefix of {mid} units is not a valid graph: {e}"
+            ) from None
+        evaluations += 1
+        if all(r.ok for r in check_equivalent(base, state, cases, atol, rtol)):
+            lo = mid
+        else:
+            hi = mid
+    return BisectResult(
+        culprit=units[hi - 1], units=tuple(units), evaluations=evaluations
+    )

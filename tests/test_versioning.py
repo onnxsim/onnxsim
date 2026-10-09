@@ -13,6 +13,7 @@ from onnxsim.versioning import (
     SuppliedCase,
     TensorIndex,
     TensorSpec,
+    bisect_failure,
     case_set_id,
     check_equivalent,
     file_digest,
@@ -251,3 +252,60 @@ def test_int64_initializer_used_as_reshape_shape_round_trips():
     assert (
         rebuilt.graph.initializer[0].data_type == model.graph.initializer[0].data_type
     )
+
+
+def _chain(body, extra=()):
+    model = _model(
+        f"""
+        g (float[1,4] x) => (float[1,4] y)
+        {{
+          {body}
+        }}
+        """
+    )
+    for name, arr in extra:
+        _with_weight(model, name, arr)
+    return model
+
+
+_BASE_CHAIN = """
+  a = Identity (x)
+  b = Neg (a)
+  c = Abs (b)
+  d = Sigmoid (c)
+  y = Identity (d)
+"""
+
+
+def test_bisect_returns_none_when_candidate_passes():
+    base = _chain(_BASE_CHAIN)
+    assert (
+        bisect_failure(base, _chain(_BASE_CHAIN), [GeneratedCase("c", 0, _spec())])
+        is None
+    )
+
+
+def test_bisect_finds_the_harmful_change_among_benign_ones():
+    base = _chain(_BASE_CHAIN)
+    # Benign: Identity -> Mul by one. Harmful: Abs -> Add 0.5 (changes the output).
+    candidate = _chain(
+        """
+        a = Mul (x, one)
+        b = Neg (a)
+        c = Add (b, half)
+        d = Sigmoid (c)
+        y = Identity (d)
+        """,
+        extra=[
+            ("one", np.array([1.0], np.float32)),
+            ("half", np.array([0.5], np.float32)),
+        ],
+    )
+    result = bisect_failure(base, candidate, [GeneratedCase("c", 0, _spec())])
+    assert result is not None
+    assert len(result.units) == 2
+    assert result.culprit.index == 1
+    assert "Add:c" in result.culprit.nodes
+    assert "Abs:c" in result.culprit.nodes
+    assert result.culprit.initializers == ("half",)
+    assert result.evaluations == 1
