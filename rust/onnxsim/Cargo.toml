@@ -13,7 +13,7 @@ categories = ["api-bindings", "science"]
 keywords = ["onnx", "onnxsim", "simplifier", "machine-learning", "inference"]
 
 [dependencies]
-onnxsim-sys = { path = "../onnxsim-sys", version = "0.7.3" }
+onnxsim-sys = { path = "../onnxsim-sys", version = "0.8.0" }
 
 [package.metadata.docs.rs]
 # docs.rs cannot build the native ONNX Runtime stack; skip it and just render docs.
