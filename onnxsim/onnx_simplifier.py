@@ -8687,6 +8687,23 @@ def _with_certify(fn):
             return result
         simplified = result[0]
         status, detail = _certify_result(snap, simplified, kwargs, explicit)
+        if status == "refuted" and kwargs.get("range_opt"):
+            print(
+                Text(
+                    "WARNING: certify refuted the range-driven rewrites; returning the plain "
+                    "simplification instead",
+                    style="bold red",
+                )
+            )
+            result = fn(*args, **{**kwargs, "range_opt": False})
+            simplified = result[0]
+            status, detail = _certify_result(snap, simplified, kwargs, explicit)
+            if isinstance(simplified, onnx.ModelProto):
+                _set_metadata(
+                    simplified,
+                    "onnxsim.range_opt",
+                    "reverted: certify refuted the range-driven rewrites",
+                )
         if status == "error":
             print(
                 Text(f"WARNING: certify failed internally: {detail}", style="bold red")
@@ -8838,8 +8855,57 @@ def _with_hazard_checks(fn):
     return wrapper
 
 
+def _with_range_opt(fn):
+    """Wrap ``simplify`` so it can also apply the range-driven rewrites of ``onnxsim.range_opt``.
+
+    ``range_opt=True`` (opt-in) runs :func:`onnxsim.range_opt.apply` on the simplified model with
+    the model's ``onnxsim.range.*`` annotations as the input box. Those rewrites hold only inside
+    that box, which the rewritten model records as preconditions. The outcome is recorded in
+    ``metadata_props["onnxsim.range_opt"]``. Certification of the result, when on, checks the
+    rewritten model over the same box and falls back to the plain simplification on refutation.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, range_opt=False, **kwargs):
+        result = fn(*args, **kwargs)
+        simplified = result[0]
+        if not range_opt or not isinstance(simplified, onnx.ModelProto):
+            return result
+        from . import range_opt as _range_opt
+        from . import ranges as _ranges
+
+        if not _ranges.get_ranges(simplified):
+            note = "no ranges"
+        else:
+            try:
+                rewritten, log = _range_opt.apply(simplified)
+            except Exception as e:  # a failed rewrite must never fail simplify
+                note = f"error: {type(e).__name__}: {e}"
+            else:
+                applied = sum(1 for r in log if r.get("applied"))
+                note = f"applied {applied} rewrite(s)"
+                simplified = rewritten
+        _set_metadata(simplified, "onnxsim.range_opt", note[:300])
+        return (simplified, *result[1:])
+
+    sig = inspect.signature(fn)
+    wrapper.__signature__ = sig.replace(
+        parameters=list(sig.parameters.values())
+        + [
+            inspect.Parameter(
+                "range_opt",
+                inspect.Parameter.KEYWORD_ONLY,
+                default=False,
+                annotation=bool,
+            )
+        ]
+    )
+    return wrapper
+
+
 @_with_hazard_checks
 @_with_certify
+@_with_range_opt
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -8898,6 +8964,11 @@ def simplify(
             Stored in ``metadata_props["onnxsim.gradient_health"]``.
     :param gradient_precision: Format the gradients are computed in for ``check_gradients``:
             ``"fp32"`` (default), ``"fp16"`` or ``"bf16"``.
+    :param range_opt: Opt in: apply the range-driven rewrites of :mod:`onnxsim.range_opt` (dead
+            Relu/Clip/Min/Max, decided Where/If, softmax without max-subtraction), proven over the
+            box of the model's ``onnxsim.range.*`` annotations. The rewritten model records that box
+            as preconditions (see :func:`onnxsim.range_opt.check_precondition`). Stored in
+            ``metadata_props["onnxsim.range_opt"]``.
     :param perform_optimization: Whether to run onnx optimizer on the model
     :param skip_fuse_bn: Skip fuse_bn_into_conv onnx optimizer
     :param overwrite_input_shapes: If the model has dynamic input shape, user must pass a fixed input shape
