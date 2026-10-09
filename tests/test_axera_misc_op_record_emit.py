@@ -7,6 +7,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import onnx
 import pytest
 from onnx import parser
@@ -73,6 +74,94 @@ def test_reducesum_matches_held_out_builds(src, dst):
         b["zero_points"],
     )
     assert mre.normalized_records(got) == mre.normalized_records(_mcode(dst))
+
+
+SOFTMAX_1X64 = sorted(k for k in HELD if "softmax_1x64" in k)
+SOFTMAX_1X64_KEY = "Softmax:1x64:axis1"
+
+
+@pytest.mark.parametrize("src,dst", list(itertools.permutations(SOFTMAX_1X64, 2)))
+def test_softmax_1x64_matches_held_out_builds(src, dst):
+    # Last-axis Softmax at an LLM-like shape. The builds cover zp_x 64, 128
+    # and 232, so pairs across them move the 0x1b10 = zp_x write's value.
+    a, b = HELD[src], HELD[dst]
+    got = mre.retarget(
+        _mcode(src),
+        "Softmax",
+        a["scales"],
+        b["scales"],
+        a["zero_points"],
+        b["zero_points"],
+    )
+    assert mre.normalized_records(got) == mre.normalized_records(_mcode(dst))
+
+
+@pytest.mark.parametrize("dst", SOFTMAX_1X64)
+def test_softmax_1x64_emit_spec_matches_held_out_build(dst):
+    # axis -1 resolves to the template's axis1 key
+    b = HELD[dst]
+    model = mre.emit_spec(
+        "Softmax",
+        (1, 64),
+        attrs={"axis": -1},
+        scales=b["scales"],
+        zero_points=b["zero_points"],
+    )
+    got = bytes(mre.mcode_initializer(model).raw_data)
+    assert mre.normalized_records(got) == mre.normalized_records(_mcode(dst))
+
+
+@pytest.mark.parametrize("dst", SOFTMAX_1X64)
+def test_softmax_calibration_follows_minmax_rules(dst):
+    # The output scale is the calibration's largest probability / 255, not 1/255.
+    meta, cal = HELD[dst], HELD[dst]["calibration"]
+    rng = np.random.default_rng(cal["seed"])
+    samples = [
+        rng.uniform(cal["range"][0], cal["range"][1], (1, 64)).astype(np.float32)
+        for _ in range(cal["count"])
+    ]
+    scale, zp = mre.minmax_input_calibration(samples)
+    assert np.float32(scale) == np.float32(meta["scales"]["x"])
+    assert zp == meta["zero_points"]["x"]
+    assert mre.softmax_output_scale(samples) == pytest.approx(
+        meta["scales"]["y"], rel=1e-6
+    )
+
+
+def _softmax_1x64_calibration(name):
+    if name == "pm4":
+        meta = INDEX[SOFTMAX_1X64_KEY]
+    else:
+        meta = HELD[f"misc_op_record_emit/softmax_1x64_{name}.axmodel.gz"]
+    return meta["scales"], meta["zero_points"]
+
+
+_SOFTMAX_DEVICE = np.load(
+    os.path.join(FIXTURES, "misc_op_record_emit", "softmax_1x64_device.npz")
+)
+
+
+@pytest.mark.parametrize("name", ["pm4", "pm1", "pm8", "pm0p5", "asym", "asym2"])
+def test_softmax_codes_match_device_capture(name):
+    # AX8850 outputs (codes = y / s_y) for the native build at each calibration.
+    scales, zps = _softmax_1x64_calibration(name)
+    want = _SOFTMAX_DEVICE[f"{name}_codes"].astype(np.int64)
+    got = mre.softmax_codes(_SOFTMAX_DEVICE[f"{name}_x"], scales, zps)
+    assert np.abs(got - want).max() <= 1
+    assert (got == want).mean() > 0.96
+
+
+def test_softmax_device_output_is_shift_invariant():
+    # Rows shifted by whole input codes give bit-identical device outputs:
+    # the op depends on code distances from the row maximum only.
+    codes = _SOFTMAX_DEVICE["shift_codes"]
+    assert list(_SOFTMAX_DEVICE["shift_steps"]) == [0, 16, 32, -16, -32]
+    for step in range(1, codes.shape[1]):
+        assert np.array_equal(codes[:, step], codes[:, 0])
+    scales, zps = _softmax_1x64_calibration("pm4")
+    x = _SOFTMAX_DEVICE["shift_x"]
+    got = mre.softmax_codes(x.reshape(-1, 64), scales, zps).reshape(codes.shape)
+    assert np.array_equal(got[:, 1:], np.repeat(got[:, :1], 4, axis=1))
 
 
 STEP_PAIRS = sorted(

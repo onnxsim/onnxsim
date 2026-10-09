@@ -910,5 +910,22 @@
    "x": 0,
    "y": 0
   }
+ },
+ "Softmax:1x64:axis1": {
+  "file": "misc_op_step_templates/Softmax_1x64.axmodel.gz",
+  "op": "Softmax",
+  "scales": {
+   "x": 0.03135094419121742,
+   "y": 0.000706840306520462
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "softmax_1x64/pm4: pulsar2 7.0-lite, MinMax, 16 samples of U[-4,4], default_rng(0)",
+  "zero_points": {
+   "x": 128,
+   "y": 0
+  }
  }
 }
