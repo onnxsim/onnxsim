@@ -29,7 +29,7 @@ import heapq
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import onnx
@@ -507,8 +507,11 @@ def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
 
     units = []
     for idx, group in enumerate(ordered):
-        base_rm, cand_add, inits = set(), [], set()
-        labels, init_names = [], []
+        base_rm: Set[int] = set()
+        cand_add: List[int] = []
+        inits: Set[str] = set()
+        labels: List[str] = []
+        init_names: List[str] = []
         for k in sorted(group, key=lambda k: items[k][4]):
             kind, ref = items[k][0], items[k][1]
             if kind == "base":
@@ -518,6 +521,7 @@ def _plan(base: ModelProto, cand: ModelProto) -> List[ChangeUnit]:
                 cand_add.append(ref)
                 labels.append(_node_label(cn[ref]))
             else:
+                assert isinstance(ref, str)
                 inits.add(ref)
                 init_names.append(ref)
         units.append(
