@@ -355,10 +355,15 @@ def record_step(
     cases: Sequence[Case],
     reports: Sequence[CaseReport],
     executor: str,
+    culprit: Optional[dict] = None,
 ) -> dict:
-    """Append one verified change to the manifest at ``path`` and return the entry."""
+    """Append one verified change to the manifest at ``path`` and return the entry.
+
+    ``culprit`` is the bisect result for a failing step (see :func:`bisect_failure`),
+    stored as plain data so the manifest stays JSON.
+    """
     manifest = load_manifest(path)
-    entry = {
+    entry: dict = {
         "label": label,
         "command": command,
         "base_graph": base_graph,
@@ -377,6 +382,8 @@ def record_step(
             for r in reports
         ],
     }
+    if culprit is not None:
+        entry["culprit"] = culprit
     manifest["steps"].append(entry)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
