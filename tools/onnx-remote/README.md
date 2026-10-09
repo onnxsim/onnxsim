@@ -636,14 +636,81 @@ stateless runner can skip the load operation and continue sending bytes with
 each `run_compiled` request.
 
 The worker answers `capabilities` as a non-graph compiled-artifact runner
-(`load_compiled`/`run_compiled`, float32), so ROS2/DORA discovery can verify
-it and capability-gated dispatch can reject it when graph execution is
-required.
+(`load_compiled`, `run_compiled`, `run`, `io_info`, `unload`), so ROS2/DORA
+discovery can verify it and capability-gated dispatch can reject it when graph
+execution is required. The manifest also carries `model_cache`, `max_loaded`
+and the current `loaded` count.
 
-The model is loaded for each request in this first correctness-oriented
-adapter.  That is deliberately simple and isolates model-load failures; a
-persistent model cache should be added once the wire protocol is exercised on
-the card.
+### Model cache
+
+A model is loaded once and kept: the engine model, its context, the IO
+description, the IO object and one device buffer per input and output stay
+allocated between requests, so a request for a loaded model is an upload, an
+execute and a download. That is what makes a host-side LLM decode loop usable
+(31 models per token for a 30-layer model; see
+`docs/axera-llm-rpc-decode.md`).
+
+- The cache key is the model path exactly as the request spelled it (for
+  `run_compiled`, the artifact's file under `--cache-dir`). Two spellings of
+  one file are two entries.
+- Each use checks the file's modification time and size; a model whose file
+  changed or disappeared is unloaded and loaded again (or fails), never run
+  stale. Re-sending bytes with `load_compiled` therefore replaces the model.
+- `--max-loaded N` (default 64) bounds the number of loaded models; the least
+  recently used one is unloaded to make room. If a load fails while other
+  models are loaded (the card can run out of memory before `N`), the worker
+  unloads least recently used models one at a time and retries. A path that
+  is not a file fails at once and leaves the cache alone.
+- A model whose upload, execute or download fails is dropped, so the next
+  request loads it afresh. Request errors (input count, dtype, size) keep it.
+- `--no-cache` restores the original behaviour: load, run and unload on every
+  request.
+- SIGINT/SIGTERM unload everything and finalize the runtime before exiting.
+
+With `Summary` or `Detailed` profiling a request that had to load the model
+carries an `axcl_load` event; `Detailed` adds `axcl_upload` and
+`axcl_download` around `axcl_execute`.
+
+### `io_info`, `unload` and `run`
+
+These three ops name their model by `artifact_id` (the cached artifact) or,
+with an empty artifact ID, by a path sent as UTF-8 text in the request's
+`model` bytes, since the op field holds the op name.
+
+- `io_info` loads the model (into the cache) and returns a JSON manifest, so a
+  client can pack tensors without hard-coding names, order, dtypes or sizes:
+
+  ```json
+  {"schema_version": 1, "model": "/models/llama_p128_l0_together.axmodel", "cached": true,
+   "inputs": [{"name": "K_cache", "dtype": 10, "dtype_name": "FLOAT16", "axcl_dtype": 0,
+               "shape": [1, 255, 192], "bytes": 97920}],
+   "outputs": [{"name": "output", "dtype": 10, "dtype_name": "FLOAT16", "axcl_dtype": 0,
+                "shape": [1, 1, 576], "bytes": 1152}]}
+  ```
+
+  Entries are in engine order. `dtype` is the ONNX `TensorProto.DataType` a
+  request must use for that input and the one an output comes back with,
+  from the same engine-to-ONNX mapping the run path checks against;
+  `axcl_dtype` is the engine's own code. An engine type with no ONNX
+  counterpart is reported as `"dtype": 0, "dtype_name": "UNSUPPORTED"` and
+  such a model cannot be run. `llm_build` layers report their bf16 K/V/hidden
+  tensors with engine type 0, which the worker reads as FLOAT16, and `mask` as
+  BFLOAT16; the payload is the same 16-bit pattern either way.
+- `unload` drops one model from the cache and answers
+  `{"schema_version": 1, "unloaded": 1, "loaded": 3}`; with neither an
+  artifact ID nor a path it drops every model. Unloading a model that is not
+  loaded is not an error (`"unloaded": 0`).
+- `run` runs the model at the path in `model`. It is the path-as-op request
+  form for paths longer than the op field's 128 bytes.
+
+`tools/onnx-remote/python/onnx_remote_client.py` is a numpy-only Python client
+for the wire protocol (`Client.run`, `run_path`, `io_info`, `unload`,
+`load_compiled`, `run_compiled`, `capabilities`); it works against every
+worker here.
+
+`remote_axcl_worker.cpp` can be syntax-checked without the SDK against the
+declarations in `test/axcl_stub/axcl.h` (the command is in that header). The
+stub has no definitions and is not on the real build's include path.
 
 ## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
 
