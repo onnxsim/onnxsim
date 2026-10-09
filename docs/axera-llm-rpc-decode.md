@@ -330,13 +330,32 @@ reference:
 | `s4` | `bf16` | 88 MB | diverges at the 2nd new token (float top-2 gap there is 0.17); text stays fluent | 14% after layer 1, peaks of 31% and 60% at layers 10 and 11 | 9.4 tokens/s |
 | `s8` | `fp16` | 140 MB | identical | 1% to 3% throughout | 8.8 tokens/s |
 | `bf16` | `bf16` | 438 MB | identical | 2% rising to about 15% | 8.3 tokens/s |
+| `fp16` | `bf16` | 438 MB | identical | same as `bf16` weights to four digits | 8.0 tokens/s |
+| `fp8_e4m3` | `bf16` | 438 MB | diverges at the 2nd new token (the same 0.17 near-tie); fluent, then repeats | 4% rising to 15%, bump to 12% at layers 10 and 11 | 7.9 tokens/s |
+| `fp8_e5m2` | `bf16` | 438 MB | diverges at the 1st new token (float top-2 gap 1.03); fluent, repeats | 5% and 10% early, 34% and 70% at layers 10 and 11, about 30% after | 8.1 tokens/s |
+| `s4` | `fp16` | 88 MB | diverges at the 2nd new token (the 0.17 near-tie); fluent | 14% and 26% early, 26% and 46% at layers 10 and 11, under 5% after | 8.6 tokens/s |
 
 An fp16 hidden state needs real IEEE halves on the wire. The engine reports those tensors
 with no dtype, the worker labels them FLOAT16, and the loop converts its bf16 patterns at
 the RPC boundary. Before that conversion existed the same build produced infinities.
 
-One prompt per model. Nothing here measures accuracy; the s4 row in particular is a single
-divergence on a near-tie, not a quality figure.
+The four float weight types all cost 4 bytes per weight on the card (see
+`docs/axera-llm-build-dtype-analysis.md`), so `fp8_*` loses precision without saving memory.
+
+**`s4` on Qwen3-0.6B** (411 MB against 636 MB for `s8`), `--chat`, thinking off:
+
+| prompt | `s8` (default) | `s4` |
+| --- | --- | --- |
+| "What is the capital of France?" | identical to float: "The capital of France is **Paris**." | "The capital of France is **Lille**. ..." -- diverges at the 7th new token, where the float model's top-2 gap is 4.47, and does not stop |
+| "Write one sentence about the ocean." | identical to float (28 tokens) | diverges at the 8th new token (gap 1.37); ends "...of life and life, where life and life are ever-changing." |
+
+`s4` hidden-state error is 31% and 35% after the first two layers and 10% to 20% after
+(`s8`: 3% to 11%). It is faster, 5.2 against 4.6 tokens/s. So on this model plain `s4` from
+`llm_build` changes answers the float model is confident about; `s8` did not on these two
+prompts.
+
+One or two prompts per model. Nothing here measures accuracy; the SmolLM2 `s4` and
+`fp8_e4m3` rows are a single divergence at a near-tie, the Qwen3 `s4` rows are not.
 
 The worker binary used for these runs is the one built in the VM against the real AXCL SDK;
 this change does not touch `remote_axcl_worker.cpp`. On a host without the SDK the worker can
