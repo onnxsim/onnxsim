@@ -6,9 +6,11 @@ module builds that node's model without Pulsar2's compiler: from one compiled
 calibration) plus the fused graph's scales and zero points. ``stitch`` returns
 the five decompressed segments and ``npu_params``; ``stitch_model`` wraps them
 into a complete model. On the committed graphs (SiLU, three more two-op
-graphs, RMSNorm, a single-head attention block; two calibrations each) the
-result equals the native fused build in every decompressed record outside
-segment 0's slot table, in ``npu_params`` and in the rest of the model proto
+graphs, RMSNorm, a single-head attention block at two sizes, chains of two and
+three MatMuls, attention followed by a constant-weight MatMul; two
+calibrations each) the result equals the native fused build in every
+decompressed record outside segment 0's slot table, in ``npu_params`` and in
+the rest of the model proto
 (``docs/axera-graph-stitch.md``, ``tests/test_axera_graph_stitch.py``).
 
 Method
@@ -67,9 +69,15 @@ ReduceMean, Div lanes and zero points, Softmax lanes and output data type,
 MatMul ``npu_params`` lanes, QUANT/DEQUANT lanes and zero points); the
 register order; the liveness gates of every register outside the two learned
 groups below; scratch sizes; loader fields; the matrix-engine operand offset
-(``0x0330``/``0x0320``); the sync mechanism (what a job waits for); segment
+words (``matrix_b_words``); the sync mechanism (what a job waits for); segment
 compression (segments 0 and 2 always, 4 never, 1 and 3 unless empty); the
-FlatBuffer layout and the model wrapper.
+FlatBuffer layout and the model wrapper. Also standalone-derived: a
+constant-weight MatMul (``"linear": True``) with its weight-region loader, its
+two-engine split and its per-channel lanes (``linear_const``); a matrix engine
+does not repeat a wait it already performed, except that its first
+sub-program's waits do not count; the pipelining of two sub-program groups on
+one matrix engine (the staged compute and the combined launch words occur
+inside the standalone 576-wide linear program, ``fixtures/linear_emit``).
 
 Learned from a single native fused build
 ----------------------------------------
@@ -90,18 +98,15 @@ at its definition:
   its standalone program.
 * **Sync/wait placement** (RMSNorm, attention): a job's waits precede all its
   register writes; the main engine does not repeat a wait for a signal it
-  already waited for, the other engines repeat theirs.
+  already waited for, the copy engines repeat theirs.
 * **Graph-input jobs before the first core** (attention): the PARAM+QUANT
   jobs of every graph input run first, whichever op consumes the input.
-* **Attention's engine placement**: which engine runs each MatMul's
-  sub-programs (``place`` in the wiring). The standalone MatMuls use other
-  engines.
-* **The main-engine transpose job** (attention): the second MatMul's operand
-  transpose runs as a 30-record main-engine job that no standalone program
-  contains. Its register list and four constants are ``MAIN_TRANSPOSE_JOB``,
-  copied from the native fused attention build; only its operand addresses
-  and permutation are taken from the standalone copy-engine job.
-
+* **The main-engine transpose job** (attention, attn16, mm_chain, mm_chain3):
+  a later MatMul's operand transpose runs as a main-engine job that no
+  standalone program contains. Its record order and three constants
+  (``TRANSPOSE_UNEXPLAINED``: the same in all ten native builds, and
+  unexplained) are copied from the native builds; every other value is
+  derived from standalone programs (``MAIN_TRANSPOSE_JOB``).
 * **Where the output's PARAM job runs** (RMSNorm at ``[1,576]``): in the
   ``[1,64]`` graphs the graph output's PARAM job runs where the last op's
   standalone program has it. The native ``[1,576]`` RMSNorm runs it just
@@ -122,18 +127,62 @@ Three structural choices are assumptions: no build contradicts them and
 none isolates them. Scratch buffers, PARAM words and each engine's
 sub-programs are numbered in op order.
 
+Fitted to five native fused graphs with several MatMuls
+-------------------------------------------------------
+
+Which engine runs each MatMul's sub-programs is not derivable: the standalone
+MatMuls use other engines than the fused builds, and no single placement rule
+was found that fits every build (fused and standalone). The rule set below
+(``_FITTED_RULES``, each marked ``FITTED`` where it is applied) was FITTED to
+five native fused graphs, two calibrations each: the attention block
+(``attention``), the same block at ``q [16,32]`` (``attn16``), two and three
+chained MatMuls (``mm_chain``, ``mm_chain3``) and attention followed by a
+MatMul with a constant 64x64 weight (``attn_proj``). It reproduces those ten
+builds and nothing says it holds for an eleventh. Several rules rest on one
+graph (``attn_proj``), and the three transpose-job constants are unexplained.
+An explicit ``place`` in the wiring overrides the placement rules for its op.
+
+* ``first_engine`` (all five): with several matrix ops the first MatMul runs
+  on matrix engine 0; on engine 1 when the graph has a constant-weight MatMul
+  (``attn_proj`` only).
+* ``second_engine``: a MatMul whose A operand is the previous MatMul's output
+  stays on that MatMul's engine (``mm_chain``, ``mm_chain3``); otherwise it
+  takes the other engine (``attention``, ``attn16``) unless an op already
+  uses it (``attn_proj`` only).
+* ``loader_start`` (``attention``, ``attn16``, ``mm_chain``, ``mm_chain3``):
+  loaders alternate over the graph starting on copy engine 3 when the first
+  matrix op runs on matrix engine 0, else on 4 (the RMSNorm rule).
+* ``later_transpose``: the first transpose runs on copy engine 3; later ones
+  on the main engine (``attention``, ``attn16``, ``mm_chain``,
+  ``mm_chain3``), or on copy engine 3 when the graph has a constant-weight
+  MatMul (``attn_proj`` only).
+* ``hoist_param`` (``mm_chain``, ``mm_chain3``, ``attn_proj``): the MatMul
+  pipelined right behind the first one on its engine issues its first PARAM
+  job one job early, before the last QUANT job already planned.
+* ``hoist_output_param`` (``attn_proj`` only; the other builds agree): the
+  output's PARAM job runs before the first core job that waits for an engine
+  sub-program depending on the last graph-input job. ``output_param`` in the
+  wiring overrides it.
+* ``signed_output`` (``mm_chain``, ``mm_chain3``): a MatMul whose output is a
+  signed tensor sets bit 21 of its compute's ``0x03d0`` and adds 128 to its
+  offset lane.
+* ``destination_block`` (``attn_proj`` only): the destination descriptor
+  registers (``0x0710..``) share one gate set, like an input-port block.
+
 Refused
 -------
 
 ``NotImplementedError``: an op outside ``SUPPORTED_OPS``; a Sqrt with a
 nonzero input or output zero point and a Div with a nonzero divisor zero
 point (no standalone build has one, so their zero-point registers are
-unknown); two ops on one matrix engine; a copy-engine sub-program that would
-need a register restore; a sub-program placed on an engine of another kind;
-several MatMul-like ops without an explicit ``place`` for each;
+unknown); a matrix-engine group that is not loads followed by one compute; a
+sub-program placed on an engine of another kind; a ``place["matrix"]`` that
+is not a mapping for a constant-weight MatMul; a constant-weight MatMul built
+with input zero point 0;
 a main-engine CORE job of an op with no calibration model; a copy-engine
 loader with no standalone template. ``ValueError``: an ``output_param`` that
-names no op with a core job; a tensor without a scale
+names no op with a core job; an unknown ``place`` key; a constant-weight
+MatMul without per-channel weight scales; a tensor without a scale
 or zero point; constants that do not account for a program's ``npu_params``;
 constant values that do not quantize to the standalone program's bytes; a
 standalone program that breaks one of the checked rules.
@@ -142,8 +191,10 @@ Limits: the fused scales and zero points are inputs (Pulsar2's
 ``quant_axmodel.json``, or ``pulsar_free_calibration`` from the float graph
 and its samples); every program serves one shape (``width_retarget`` moves a
 ``[1,64]`` program to another width); the learned rules
-rest on one native graph each; an engine placement other than the native
-build's is accepted when no rule refuses it, but nothing has verified it.
+rest on one native graph each and the fitted ones on the five graphs above;
+an engine placement other than the native build's (an explicit ``place``, or
+the fitted rules on a graph outside those five) is accepted when nothing
+refuses it, but nothing has verified it, on a device or otherwise.
 Add's two ``npu_params`` scale words are written in ONNX input order, which
 holds in both fused Add graphs and four of five standalone Add builds; the
 fifth (``add``, asym) has them swapped.
@@ -192,6 +243,7 @@ SUPPORTED_OPS = (
 REG_CTL = 0x0150  # phase/strobe register: every write is emitted
 REG_JOBTYPE = 0x0160
 REG_SRC_A_SLOT, REG_SRC_A = 0x02B0, 0x02C0
+REG_SRC_A_LEN, REG_DST_LEN = 0x02A0, 0x0710  # byte length - 1 of the port's tensor
 REG_PARAM_SLOT = 0x03D0
 REG_SRC_B_SLOT, REG_SRC_B = 0x04F0, 0x0500
 REG_DST_SLOT, REG_DST = 0x0720, 0x0730
@@ -217,7 +269,8 @@ SELECT_BITS = (8, 9, 10, 11)
 CTL_PHASES = (1, 0x100000, 0x1000000)  # any other 0x0150 value is a select word
 
 # ---- scratch ---------------------------------------------------------------------
-SCRATCH_BASE, SCRATCH_END = 0x2F7000, 0x2F8000
+# mm_chain3 allocates past 0x2f8000, the end the first six graphs stayed under
+SCRATCH_BASE, SCRATCH_END = 0x2F7000, 0x2FF000
 SCRATCH_UNIT = 0x20
 A7_HIGH = 0x17C00
 PAD_RECORDS = 4
@@ -233,36 +286,110 @@ LOADER_FIELDS = {
 # LEARNED (RMSNorm): the k-th loader of the fused graph runs on this engine,
 # whatever engine it used standalone.
 LOADER_ENGINE_ORDER = (4, 3)
-# A matrix-engine sub-program that writes 0x0330 holds there
-# (MATRIX_B_ANCHOR - address in 0x0260) / 0x20, and its 30-bit negative in 0x0320.
-MATRIX_B_ANCHOR, MATRIX_ADDR = 0x2F7E00, 0x0260
+# A matrix-engine sub-program that writes 0x0330 holds four words derived from
+# the address in 0x0260 (``matrix_b_words``).
+MATRIX_ADDR = 0x0260
 MATRIX_OFF_POS, MATRIX_OFF_NEG, MATRIX_CTL = 0x0330, 0x0320, 0x0220
+MATRIX_PAGE_POS, MATRIX_PAGE_NEG = 0x0310, 0x0300
+MATRIX_LEN, MATRIX_LAUNCH, MATRIX_A_ZP = 0x0240, 0x0230, 0x03D0
+MATRIX_LOAD, MATRIX_COMPUTE = 0x10002, 0x108001  # 0x0230 of a load / a compute
+# Two sub-program groups on one matrix engine are pipelined: the compute of
+# group k is staged (written up to 0x0220 = 0x100000, not launched) and then
+# launched together with the last load of group k + 1 by this 0x0230 word and
+# this final 0x0220 strobe. Both values, and the staging itself, also occur
+# inside one standalone program: the 576-wide linear
+# (fixtures/linear_emit/linear576_*, segment 1), so they are standalone-derived.
+MATRIX_COMBINED, MATRIX_STROBE_LOAD, MATRIX_STROBE_BOTH = (
+    0x11FF03,
+    0x02000000,
+    0x03000000,
+)
+MATRIX_STAGED_END = 0x100000
+# FITTED, rule ``signed_output`` (mm_chain, mm_chain3): bit 21 of a compute's
+# 0x03d0 is set when its output is a signed tensor (m and n of the chains,
+# read by a MatMul with two live operands; attn_proj's o, read by the
+# constant-weight MatMul, is unsigned). The low byte is the zero point of
+# operand A (standalone constant-weight MatMul).
+MATRIX_OUT_SIGNED = 0x200000
 
 # LEARNED (RMSNorm): the input-port descriptor registers form four blocks of
 # 0x120 (A 0x0290.., B 0x03b0.., C 0x04d0.., D 0x05f0..). All registers of a
 # block share one gate set, the intersection of their inferred gate sets. No
 # standalone job shows it (none writes 0x02d0/0x0310 with 0x0df0 == 0).
-PORT_BLOCK_BASE, PORT_BLOCK_SIZE, PORT_BLOCKS = 0x0290, 0x120, 4
+# FITTED, rule ``destination_block`` (attn_proj only): the destination
+# descriptor (0x0710..) is the fifth block at the same stride and shares one
+# gate set too. There the DEQUANT job restores 0x0740/0x0780 after Softmax,
+# because the output's PARAM job, which restores them in the attention block,
+# runs before Softmax.
+PORT_BLOCK_BASE, PORT_BLOCK_SIZE, PORT_BLOCKS = 0x0290, 0x120, 5
 
-# LEARNED (attention). Taken from a native Pulsar2 build, not derived: the
-# fused attention block (fixtures/graph_stitch/fused_attention_pm1 and _pm4,
-# identical there) transposes the second MatMul's B operand in a main-engine
-# job. No standalone program has such a job (none has 0x0c20 != 0), so the
-# job's register list, its record order (``_transpose_job``) and the four
-# constants below are copied from that build. Only the operand values are
-# taken from the standalone copy-engine (segment 3) transpose, register by
-# register through the three ``(first, last, shift)`` maps.
+# The rules FITTED to the five native fused graphs with several MatMuls (module
+# docstring; applied in ``_derive_placement``, ``_Stitcher.__init__``,
+# ``_derive_output_param``, ``_synth_const``, ``_moved_records`` and
+# ``infer_gates``). The values here are the fitted ones. The dict is a private
+# hook for the ablation tests, which replace one value and check which graphs
+# stop matching their native build; the comment of each rule lists them
+# (segments and ``npu_params`` that differ, both calibrations).
+_FITTED_RULES = {
+    # "standalone" (every MatMul keeps its standalone matrix engine) breaks
+    # all five graphs
+    "first_engine": "fit",
+    # "same" (always the previous MatMul's engine) breaks attention and
+    # attn16; "other" (always the other engine) breaks mm_chain, mm_chain3
+    # and attn_proj
+    "second_engine": "fit",
+    # "s4" (loaders always start on copy engine 4, the RMSNorm rule alone)
+    # breaks attention, attn16, mm_chain and mm_chain3
+    "loader_start": "fit",
+    # "copy" (every later transpose on copy engine 3) breaks attention,
+    # attn16, mm_chain and mm_chain3; "main" breaks attn_proj
+    "later_transpose": "fit",
+    # False breaks the main segment of mm_chain, mm_chain3 and attn_proj
+    "hoist_param": True,
+    # False breaks the main segment of attn_proj
+    "hoist_output_param": True,
+    # False breaks matrix segment 0 and npu_params of mm_chain and mm_chain3
+    "signed_output": True,
+    # False breaks the main segment of attn_proj
+    "destination_block": True,
+}
+
+# The main-engine transpose job. A fused graph transposes the B operand of a
+# later MatMul in a main-engine job (attention, attn16, mm_chain; twice in
+# mm_chain3). No standalone program has such a job: a standalone MatMul
+# transposes on copy engine 3. The job is DERIVED from that
+# standalone copy-engine job, except for its record order (``_transpose_job``,
+# LEARNED from the native builds) and three constants:
+#
+# * the source port block (copy engine 3: 0x0160..0x0210) and the destination
+#   port block (0x0390..0x0440) are copied register by register at a fixed
+#   shift, the distance between the two engines' port blocks: main 0x02c0 -
+#   copy 0x0180 = 0x140 for the source, main 0x0730 - copy 0x03b0 = 0x380 for
+#   the destination (scratch addresses moved to the fused layout);
+# * the permutation block follows the mode word on both engines: copy
+#   0x04e0..0x0570 (after 0x04d0) -> main 0x0c30..0x0cc0 (after 0x0c20);
+# * the job type 0x0160 is the copy engine's 0x04c0;
+# * 0x0290 is the main engine's descriptor of a scratch source, read from the
+#   DEQUANT job of the standalone programs (one value in every program).
+#
+# UNEXPLAINED: these three words are the same in every main-engine transpose
+# job of the ten native builds (five graphs, operand shapes [8,64], [16,32]
+# and [64,8]). No committed standalone job holds any of them in that
+# register (0x0c20 is 0, or 0x12 in a padded ReduceMean or Softmax core). They
+# are copied.
+TRANSPOSE_0280, TRANSPOSE_0C10, TRANSPOSE_0C20 = 0x00000001, 0x00100040, 0x00000104
+TRANSPOSE_UNEXPLAINED = {
+    0x0280: TRANSPOSE_0280,
+    0x0C10: TRANSPOSE_0C10,
+    0x0C20: TRANSPOSE_0C20,
+}
 MAIN_TRANSPOSE_JOB = {
-    "constants": {
-        0x0280: 0x00000001,
-        0x0290: 0x0003FD00,
-        0x0C10: 0x00100040,
-        0x0C20: 0x00000104,
-    },
+    "constants": TRANSPOSE_UNEXPLAINED,
+    "descriptor": 0x0290,
     "select": 0x100,
-    "source": (0x0160, 0x0210, 0x140),  # 0x0160..0x0210 -> 0x02a0..0x0350
-    "permutation": (0x04E0, 0x0570, 0x750),  # 0x04e0..0x0570 -> 0x0c30..0x0cc0
-    "destination": (0x0390, 0x0440, 0x380),  # 0x0390..0x0440 -> 0x0710..0x07c0
+    "source": (0x0160, 0x0210),  # copy-engine 3 source port block
+    "permutation": (0x04E0, 0x0570, 0x0C20 - 0x04D0),
+    "destination": (0x0390, 0x0440),  # copy-engine 3 destination port block
     "job_type_from": 0x04C0,  # copy-engine register holding the job type
 }
 
@@ -420,11 +547,60 @@ def matmul_const(template: bytes, s_a, s_b, s_y, zp_y) -> bytes:
     return block(np.float32(zp_y)) + block(np.float32(s_a * s_b / s_y))
 
 
-def matrix_b_offset(addr: int) -> tuple[int, int]:
-    """``(0x0330, 0x0320)`` values of a matrix-engine sub-program whose B
-    operand sits at scratch ``addr``."""
-    d = (MATRIX_B_ANCHOR - addr) // SCRATCH_UNIT
-    return d, (-d) & 0x3FFFFFFF
+def matrix_b_words(addr: int) -> dict[int, int]:
+    """The four operand-offset words of a matrix-engine load whose B operand
+    sits at scratch ``addr``: ``0xffff0 - addr / 0x20`` split into a 10-bit low
+    part (0x0330, negated in 0x0320) and a page (0x0310, complemented in
+    0x0300). Every standalone program has page 0x3a1; mm_chain3's third MatMul
+    (operand at 0x2f8140) has page 0x3a0."""
+    v = 0xFFFF0 - addr // SCRATCH_UNIT
+    lo, page = v & 0x3FF, v >> 10
+    return {
+        MATRIX_OFF_POS: lo,
+        MATRIX_OFF_NEG: (-lo) & 0x3FFFFFFF,
+        MATRIX_PAGE_POS: page,
+        MATRIX_PAGE_NEG: 0x1FF7FFFF - page,
+    }
+
+
+def linear_const(program, s_a, zp_a, s_w, s_y, zp_y) -> bytes:
+    """``npu_params`` head of a constant-weight MatMul: the quantized weights
+    (copied), then N offset lanes and N scale lanes (float32):
+    ``scale[c] = s_a * s_w[c] / s_y`` and
+    ``offset[c] = zp_y - scale[c] * zp_a * S[c]`` with ``S[c]`` the sum of
+    channel c's quantized weights. ``S`` is recovered from the standalone
+    program's own lanes and zero points (0x03d0 of its compute, 0x1a90 of its
+    DEQUANT job)."""
+    tpl = program.params[: program.const_len]
+    loads = [t for t in program.etasks if t.seg in MATRIX_ENGINES and t.index == 0]
+    comps = [
+        t
+        for t in program.etasks
+        if t.seg in MATRIX_ENGINES and t.launch[MATRIX_LAUNCH][1] == MATRIX_COMPUTE
+    ]
+    off = loads[0].launch[MATRIX_ADDR][1]
+    size = loads[0].launch[MATRIX_LEN][1] + 1
+    n = size // 8
+    lanes = np.frombuffer(tpl[off : off + size], "<f4")
+    off_sa, sc_sa = lanes[:n].astype(np.float64), lanes[n:].astype(np.float64)
+    zo_sa = comps[0].launch[MATRIX_A_ZP][1] & 0xFF
+    zy_sa = program.dequant[0].launch[REG_ZP_A][1]
+    if not zo_sa:
+        raise NotImplementedError(
+            "constant-weight MatMul built with input zero point 0: the weight "
+            "sums cannot be recovered from its lanes"
+        )
+    sums = np.rint((zy_sa - off_sa) / (sc_sa * zo_sa))
+    if (zy_sa - sc_sa * zo_sa * sums).astype("<f4").tobytes() != lanes[:n].tobytes():
+        raise ValueError(
+            "constant-weight MatMul lanes do not follow the offset formula"
+        )
+    s_w = np.asarray(s_w, dtype=np.float64)
+    if s_w.shape != (n,):
+        raise ValueError(f"constant-weight MatMul needs {n} per-channel weight scales")
+    scale = (float(s_a) * s_w / float(s_y)).astype("<f4")
+    offs = (zp_y - scale.astype(np.float64) * zp_a * sums).astype("<f4")
+    return tpl[:off] + offs.tobytes() + scale.tobytes() + tpl[off + size :]
 
 
 def quantize_constant(values, scale: float, zero_point: int) -> bytes:
@@ -509,13 +685,19 @@ def _core_values(
     return out
 
 
-def _synth_const(op, program, in_ts, out_t, sc, zp, n_init: int) -> bytes:
+def _synth_const(op, program, in_ts, out_t, sc, zp, n_init: int, signed=()) -> bytes:
     """The constant ``op`` synthesizes at the end of its ``npu_params`` head."""
     if op == "Add":
         return add_const(sc[in_ts[0]], sc[in_ts[1]], sc[out_t])
     if op == "MatMul":
         template = program.params[n_init : program.const_len]
-        return matmul_const(template, sc[in_ts[0]], sc[in_ts[1]], sc[out_t], zp[out_t])
+        # FITTED, rule ``signed_output`` (mm_chain, mm_chain3): a signed
+        # output's offset lane is its zero point + 128 (the compute's 0x03d0
+        # bit 21 then makes it signed)
+        zp_y = zp[out_t] + (
+            128 if out_t in signed and _FITTED_RULES["signed_output"] else 0
+        )
+        return matmul_const(template, sc[in_ts[0]], sc[in_ts[1]], sc[out_t], zp_y)
     return b""
 
 
@@ -551,18 +733,20 @@ class Task:
     len: int = 0
     off: int = 0
     dst: int = 0
+    region: bool = False  # loader into the weight region (address 0), not scratch
 
 
 def _ctl_class(v: int):
     return v if v in CTL_PHASES else "select"
 
 
-def _order_keys(job: Sequence[bytes]) -> list[tuple]:
-    """Ordering key per record: ``0x0150`` by phase, an ``a7`` by the record it
-    follows, an ``a2`` by its value, any other write by its register."""
+def _order_keys(job: Sequence[bytes], ctl: int = REG_CTL) -> list[tuple]:
+    """Ordering key per record: the control register (``0x0150`` on the main
+    engine) by phase, an ``a7`` by the record it follows, an ``a2`` by its
+    value, any other write by its register."""
     out, prev = [], None
     for w in job:
-        if w[0] == A1 and _reg(w) == REG_CTL:
+        if w[0] == A1 and _reg(w) == ctl:
             k = ("ctl", _ctl_class(_val(w)))
         elif w[0] in (A1, A8):
             k = ("reg", _reg(w))
@@ -776,26 +960,35 @@ class Program:
                         got(f["slot"]) == (A8, slot_params_blob(self.n_io))
                         and got(f["off"], (0, 0))[0] == A1
                         and got(f["dst"], (0, 0))[0] == A1
-                        and _is_scratch(got(f["dst"])[1])
                         and got(f["len"][0]) == got(f["len"][1])
                     ):
+                        # destination in scratch, or (constant-weight MatMul)
+                        # in the weight region the matrix engines address from 0
                         t.kind = "loader"
                         t.len = got(f["len"][0])[1]
                         t.off, t.dst = got(f["off"])[1], got(f["dst"])[1]
+                        t.region = not _is_scratch(t.dst)
                         if ti == 0:
                             self.templates.setdefault(seg, recs)
                 else:
+                    _require(
+                        state.get(MATRIX_LAUNCH, (0, 0))[1]
+                        in (MATRIX_LOAD, MATRIX_COMPUTE),
+                        label,
+                        "a matrix sub-program is a load or a compute",
+                    )
                     for w in recs:
                         if w[0] == A1 and _reg(w) == MATRIX_OFF_POS:
-                            d, neg = matrix_b_offset(state[MATRIX_ADDR][1])
+                            words = matrix_b_words(state[MATRIX_ADDR][1])
                             _require(
-                                _val(w) == d and state[MATRIX_OFF_NEG] == (A1, neg),
+                                all(state.get(r) == (A1, v) for r, v in words.items()),
                                 label,
                                 "matrix-engine operand offset",
                             )
                 self.etasks.append(t)
         self.loaders = sorted(
-            (t for t in self.etasks if t.kind == "loader"), key=lambda t: t.dst
+            (t for t in self.etasks if t.kind == "loader"),
+            key=lambda t: (t.region, t.dst),
         )
         _require(
             [t.off for t in self.loaders] == sorted(t.off for t in self.loaders),
@@ -806,6 +999,25 @@ class Program:
         addrs = set(self.addr_owner)
         for t in self.etasks:
             addrs |= {_val(w) for w in t.records if w[0] == A1 and _is_scratch(_val(w))}
+        # An address inside a graph tensor's buffer is a pointer into it, not a
+        # buffer (a constant-weight MatMul's second engine reads and writes
+        # the second half of its operand and of its output). The tensor's
+        # length is the QUANT job's destination length (0x0710) or the DEQUANT
+        # job's source length (0x02a0).
+        spans = [
+            (j.launch[REG_DST][1], j.launch[REG_DST_LEN][1] + 1)
+            for j in self.jobs
+            if j.role == "QUANT"
+        ]
+        dq = self.dequant[0]
+        spans.append((dq.launch[REG_SRC_A][1], dq.launch[REG_SRC_A_LEN][1] + 1))
+        self.interior = {
+            a: (base, a - base)
+            for a in addrs
+            for base, size in spans
+            if base < a < base + size
+        }
+        addrs -= set(self.interior)
         self.all_addrs = sorted(addrs)
         self.addr_size = {
             a: (self.all_addrs[n + 1] - a if n + 1 < len(self.all_addrs) else None)
@@ -835,7 +1047,9 @@ def load_program(source, label: str | None = None) -> Program:
 
 
 # ---- register order and liveness -------------------------------------------------
-def canonical_rank(job_lists: Iterable[Iterable[Sequence[bytes]]]) -> dict:
+def canonical_rank(
+    job_lists: Iterable[Iterable[Sequence[bytes]]], ctl: int = REG_CTL
+) -> dict:
     """One total register order: the topological merge of every source job's
     own write order (ties: first seen)."""
     seq: dict = {}
@@ -843,7 +1057,7 @@ def canonical_rank(job_lists: Iterable[Iterable[Sequence[bytes]]]) -> dict:
     indeg: dict = {}
     for jobs in job_lists:
         for job in jobs:
-            keys = _order_keys(job)
+            keys = _order_keys(job, ctl)
             for k in keys:
                 seq.setdefault(k, len(seq))
                 succ.setdefault(k, set())
@@ -902,7 +1116,9 @@ def infer_gates(programs: Iterable[Program], mode: frozenset[int]) -> dict:
     for r in PAD_GROUP:
         if r in gates:
             gates[r] = frozenset({("en", REG_PAD_MODE)})
-    for b in range(PORT_BLOCKS):
+    for b in range(
+        PORT_BLOCKS if _FITTED_RULES["destination_block"] else PORT_BLOCKS - 1
+    ):
         lo = PORT_BLOCK_BASE + b * PORT_BLOCK_SIZE
         regs = [r for r in gates if lo <= r < lo + PORT_BLOCK_SIZE and r not in mode]
         if regs:
@@ -930,6 +1146,14 @@ class _Fused:
     pos: int = 0
     req: dict = field(default_factory=dict)
     waits: list = field(default_factory=list)
+    # matrix engines: a compute that is staged and launched by the last load
+    # of the next group (``launch_deps``); that load (``combined``); the loads
+    # of a group that follows another group share one wait list (``unit``)
+    staged: bool = False
+    combined: bool = False
+    launch_deps: set = field(default_factory=set)
+    unit_head: bool = False
+    unit_member: bool = False
 
 
 @dataclass
@@ -986,7 +1210,13 @@ class _Stitcher:
 
     def __init__(self, wiring, scales, zero_points, signed, gate_corpus):
         self.wiring = wiring = _normalize(wiring)
-        self.sc = {k: float(v) for k, v in scales.items()}
+        self.sc, self.sc_ch = {}, {}  # per-tensor scale; per-channel weight scales
+        for k, v in scales.items():
+            if isinstance(v, (list, tuple, np.ndarray)):
+                self.sc_ch[k] = [float(x) for x in v]
+                self.sc[k] = float(v[0])
+            else:
+                self.sc[k] = float(v)
         self.zp = {k: int(v) for k, v in zero_points.items()}
         self.signed = frozenset(signed)
         self.ops = wiring["ops"]
@@ -998,20 +1228,6 @@ class _Stitcher:
             missing = sorted({t for t in used if t not in self.sc or t not in self.zp})
             if missing:
                 raise ValueError(f"no scale or zero point for tensors {missing}")
-        # Engine placement is not derivable (LEARNED, attention): with more than
-        # one op using a matrix or copy engine the caller has to give it.
-        engine_ops = [
-            o
-            for o, p in zip(self.ops, self.progs)
-            if any(t.kind == "raw" for t in p.etasks)
-        ]
-        if len(engine_ops) > 1 and any(
-            set(o["place"]) != {"matrix", "loader", "transpose"} for o in engine_ops
-        ):
-            raise NotImplementedError(
-                "several ops with matrix-engine sub-programs: each needs an "
-                "explicit place = {matrix, loader, transpose}"
-            )
         self._lay_out_constants()
         # register order, liveness gates and loader templates
         corpus = list(self.progs) + [load_program(p) for p in gate_corpus]
@@ -1022,6 +1238,21 @@ class _Stitcher:
         for prog in corpus:
             for seg, tpl in prog.templates.items():
                 self.templates.setdefault(seg, tpl)
+        # register order of each copy engine (its control register differs)
+        self.copy_rank = {
+            seg: canonical_rank(
+                [[t.records for t in p.etasks if t.seg == seg] for p in corpus],
+                LOADER_FIELDS[seg]["ctl"],
+            )
+            for seg in COPY_ENGINES
+        }
+        # the main engine's descriptor of a scratch source: a DEQUANT job's
+        descs = {
+            p.dequant[0].launch.get(MAIN_TRANSPOSE_JOB["descriptor"]) for p in corpus
+        }
+        _require(len(descs) == 1, "corpus", "one scratch-source descriptor")
+        self.scratch_desc = descs.pop()[1]
+        self._derive_placement()
         # the plan
         self.next_scratch = SCRATCH_BASE
         self.env: dict[str, int] = {}  # fused tensor -> scratch address
@@ -1033,10 +1264,36 @@ class _Stitcher:
         first, rest = [], []  # main engine: graph-input jobs, then the others
         for oi in range(len(self.ops)):
             a, b = self._plan_op(oi)
+            if (
+                _FITTED_RULES["hoist_param"]
+                and oi in self.hoist_ops
+                and a
+                and a[0].kind == "job"
+                and a[0].job.role == "PARAM"
+            ):
+                # FITTED, rule ``hoist_param`` (mm_chain, mm_chain3,
+                # attn_proj): the MatMul pipelined behind the first one issues
+                # its first PARAM job one job early, before the last QUANT job
+                # already planned
+                quants = [
+                    n
+                    for n, t in enumerate(first)
+                    if t.kind == "job" and t.job.role == "QUANT"
+                ]
+                if quants:
+                    first.insert(quants[-1], a[0])
+                    a = a[1:]
             first += a
             rest += b
-        self.eng_tasks[MAIN] = self._place_output_param(first + rest)
-        for e in range(5):
+        # copy engines: every loader (they wait for nothing), then the transposes
+        for e in COPY_ENGINES:
+            self.eng_tasks[e].sort(key=lambda t: t.kind != "loader")
+        self._group_matrix_engines()
+        if self.wiring.get("output_param") is None:
+            self.eng_tasks[MAIN] = first + self._derive_output_param(first, rest)
+        else:
+            self.eng_tasks[MAIN] = self._place_output_param(first + rest)
+        for e in (MAIN, *COPY_ENGINES):
             for n, t in enumerate(self.eng_tasks[e]):
                 t.pos = n
         self._number_signals()
@@ -1078,6 +1335,232 @@ class _Stitcher:
         main.insert(core - (at < core), task)
         return main
 
+    # ---- placement ---------------------------------------------------------------
+    def _derive_placement(self) -> None:
+        """Engines of every op's sub-programs: ``self.place[op]`` (matrix
+        engine per standalone matrix engine, transpose engine, loader engine
+        or None for the alternation), ``self.loader_order`` and
+        ``self.hoist_ops``. An explicit ``place`` of an op wins, key by key.
+
+        Standalone-derived: a graph with one matrix op keeps that op's own
+        engines; a constant-weight MatMul keeps its two-engine split.
+
+        FITTED to the native fused builds (attention, attn16, mm_chain,
+        mm_chain3, attn_proj; two calibrations each). No standalone program
+        shows these, no single rule was found that also explains the one-op
+        programs, and nothing says they hold for another graph:
+
+        * ``first_engine`` (all five): the first MatMul of a graph with
+          several matrix ops runs on matrix engine 0, or on engine 1 when the
+          graph has a constant-weight MatMul (one graph: attn_proj);
+        * ``second_engine``: a MatMul whose A operand is the previous MatMul's
+          output stays on that MatMul's engine (mm_chain, mm_chain3);
+          otherwise it takes the other engine (attention, attn16) if no op
+          uses it, else it stays (attn_proj);
+        * ``loader_start`` (attention, attn16, mm_chain, mm_chain3): loaders
+          alternate over the graph, starting on copy engine 3 + (the first
+          matrix op's engine), or on 4 without matrix ops (RMSNorm);
+        * ``later_transpose``: the first transpose runs on copy engine 3;
+          later ones on the main engine (attention, attn16, mm_chain,
+          mm_chain3), or on copy engine 3 when the graph has a constant-weight
+          MatMul (one graph: attn_proj)."""
+        progs, n_ops = self.progs, len(self.ops)
+
+        def msegs(oi):
+            return sorted(
+                {
+                    t.seg
+                    for t in progs[oi].etasks
+                    if t.kind == "raw" and t.seg in MATRIX_ENGINES
+                }
+            )
+
+        mat = [oi for oi in range(n_ops) if msegs(oi)]
+        split = {oi for oi in mat if len(msegs(oi)) > 1}
+        self.place = {
+            oi: {"matrix": {e: e for e in msegs(oi)}, "transpose": None, "loader": None}
+            for oi in range(n_ops)
+        }
+        eng: dict[int, int] = {}
+
+        def lead(oi):
+            """The op's engine; for a split op the engine of its first chunk
+            (the compute that reads the lowest operand address)."""
+            if oi not in split:
+                return eng[oi]
+            comps = [
+                t
+                for t in progs[oi].etasks
+                if t.seg in MATRIX_ENGINES
+                and t.launch[MATRIX_LAUNCH][1] == MATRIX_COMPUTE
+            ]
+            return min(comps, key=lambda t: t.launch[0x0CF0][1]).seg
+
+        if _FITTED_RULES["first_engine"] == "standalone" or (
+            len(mat) == 1 and not split
+        ):
+            for oi in mat:
+                if oi not in split:
+                    eng[oi] = msegs(oi)[0]
+        elif len(mat) > 1:
+            taken = {0, 1} if split else set()
+            prev = None
+            for oi in mat:
+                if oi in split:
+                    prev = oi
+                    continue
+                if prev is None:
+                    e = 1 if split else 0
+                else:
+                    chained = self.ops[oi]["onnx_inputs"][0] == self.ops[prev]["out"][1]
+                    e = lead(prev)
+                    if _FITTED_RULES["second_engine"] == "other" or (
+                        _FITTED_RULES["second_engine"] == "fit"
+                        and not chained
+                        and (1 - e) not in taken
+                    ):
+                        e = 1 - e
+                eng[oi] = e
+                taken.add(e)
+                prev = oi
+                self.place[oi]["matrix"] = {msegs(oi)[0]: e}
+        self.loader_order = LOADER_ENGINE_ORDER
+        if _FITTED_RULES["loader_start"] == "fit" and mat and lead(mat[0]) == 0:
+            self.loader_order = LOADER_ENGINE_ORDER[::-1]
+        transposing = [
+            oi
+            for oi in range(n_ops)
+            if any(t.kind == "raw" and t.seg in COPY_ENGINES for t in progs[oi].etasks)
+        ]
+        for n, oi in enumerate(transposing):
+            on_copy = n == 0 or bool(split) or len(mat) == 1
+            if n and _FITTED_RULES["later_transpose"] != "fit":
+                on_copy = _FITTED_RULES["later_transpose"] == "copy"
+            self.place[oi]["transpose"] = 3 if on_copy else MAIN
+        # An explicit ``place`` overrides the rules for its op, key by key.
+        for oi, o in enumerate(self.ops):
+            given = o["place"]
+            unknown = sorted(set(given) - {"matrix", "loader", "transpose"})
+            if unknown:
+                raise ValueError(f"op {oi}: unknown place keys {unknown}")
+            if "matrix" in given and msegs(oi):
+                m = given["matrix"]
+                if isinstance(m, Mapping):
+                    m = {int(k): int(v) for k, v in m.items()}
+                    if set(m) != set(msegs(oi)):
+                        raise ValueError(
+                            f"op {oi}: place['matrix'] must map its standalone "
+                            f"matrix engines {msegs(oi)}"
+                        )
+                elif oi in split:
+                    raise NotImplementedError(
+                        "a constant-weight MatMul runs on both matrix engines: "
+                        "place['matrix'] must map each standalone engine"
+                    )
+                else:
+                    m = {msegs(oi)[0]: int(m)}
+                    eng[oi] = int(given["matrix"])
+                self.place[oi]["matrix"] = m
+            if "loader" in given:
+                self.place[oi]["loader"] = int(given["loader"])
+            if "transpose" in given:
+                self.place[oi]["transpose"] = int(given["transpose"])
+        # the op pipelined right behind the first matrix op on its engine
+        self.hoist_ops = set()
+        if mat:
+            e = lead(mat[0])
+            sharing = [oi for oi in mat if e in self.place[oi]["matrix"].values()]
+            self.hoist_ops = set(sharing[1:2])
+
+    def _group_matrix_engines(self) -> None:
+        """Positions of the matrix engines' launches. Each op's sub-programs
+        on an engine form a group of loads ended by one compute. A group that
+        is not the engine's last has its compute staged and launched by the
+        last load of the next group."""
+        self.mgroups: dict[int, list[list[_Fused]]] = {}
+        for e in MATRIX_ENGINES:
+            groups: list[list[_Fused]] = []
+            for t in self.eng_tasks[e]:
+                if groups and groups[-1][0].op == t.op:
+                    groups[-1].append(t)
+                else:
+                    groups.append([t])
+            at = 0
+            for gi, g in enumerate(groups):
+                kinds = [t.src.launch[MATRIX_LAUNCH][1] for t in g]
+                if (
+                    len(g) < 2
+                    or kinds[-1] != MATRIX_COMPUTE
+                    or any(k != MATRIX_LOAD for k in kinds[:-1])
+                ):
+                    raise NotImplementedError(
+                        "a matrix-engine group that is not loads then one compute"
+                    )
+                for t in g[:-1]:
+                    t.pos = at
+                    at += 1
+                if gi:
+                    g[0].unit_head = True
+                    for t in g[1:-1]:
+                        t.unit_member = True
+                if gi == len(groups) - 1:
+                    g[-1].pos = at
+                    at += 1
+                else:
+                    nxt = groups[gi + 1]
+                    g[-1].staged = True
+                    g[-1].pos = at + len(nxt) - 2  # the next group's last load
+                    g[-1].launch_deps = {nxt[-2].fid}
+                    nxt[-2].combined = True
+            self.mgroups[e] = groups
+
+    def _closure(self, t: _Fused) -> set:
+        """Every task ``t`` transitively depends on. A staged compute counts
+        as depending on the load that launches it, for its consumers only."""
+        seen, todo = set(), list(t.deps)
+        while todo:
+            f = todo.pop()
+            if f not in seen:
+                seen.add(f)
+                todo += [*self.tasks[f].deps, *self.tasks[f].launch_deps]
+        return seen
+
+    def _derive_output_param(self, first, rest):
+        """FITTED, rule ``hoist_output_param`` (attn_proj; every other fused
+        build of ``fixtures/graph_stitch`` agrees, RMSNorm at 576 does not and
+        gives ``output_param``): the output's PARAM job stays where the last
+        op's standalone program has it, unless an
+        earlier core job has to wait for an engine sub-program that itself
+        depends on the last graph-input job; then it runs before that core
+        job (the main engine would idle there)."""
+        out = self.wiring["output"]
+        param = next(
+            (
+                t
+                for t in rest
+                if t.kind == "job"
+                and t.job.role == "PARAM"
+                and self.states[t.op].name[t.job.tensor] == out
+            ),
+            None,
+        )
+        if param is None or not first or not _FITTED_RULES["hoist_output_param"]:
+            return rest
+        last = first[-1].fid
+        for n, t in enumerate(rest):
+            if t is param:
+                break
+            if t.kind != "job" or t.job.role != "CORE":
+                continue
+            if any(
+                self.tasks[f].eng != MAIN and last in self._closure(self.tasks[f])
+                for f in self._closure(t)
+            ):
+                rest = [x for x in rest if x is not param]
+                rest.insert(n, param)
+                break
+        return rest
+
     def result(self) -> Stitched:
         main = self._main_segment()
         segments = [
@@ -1106,9 +1589,24 @@ class _Stitcher:
                         )
                 mine.append(dict(kind="init", name=c["name"], base=at, data=data))
                 at += n
-            synth = _synth_const(
-                o["op"], prog, o["onnx_inputs"], o["out"][1], sc, zp, at
-            )
+            if o.get("linear"):
+                # a constant-weight MatMul: weights and lanes are one blob
+                a, w = o["onnx_inputs"]
+                if w not in self.sc_ch:
+                    raise ValueError(f"no per-channel scales for weight {w!r}")
+                y = o["out"][1]
+                synth = linear_const(prog, sc[a], zp[a], self.sc_ch[w], sc[y], zp[y])
+            else:
+                synth = _synth_const(
+                    o["op"],
+                    prog,
+                    o["onnx_inputs"],
+                    o["out"][1],
+                    sc,
+                    zp,
+                    at,
+                    self.signed,
+                )
             if synth:
                 mine.append(dict(kind="synth", name=None, base=at, data=synth))
                 at += len(synth)
@@ -1193,6 +1691,8 @@ class _Stitcher:
                 self.next_scratch += size if size is not None else SCRATCH_UNIT
             else:
                 amap[a] = None
+        for a, (base, off) in prog.interior.items():
+            amap[a] = None if amap[base] is None else amap[base] + off
         st.amap = amap
 
         # PARAM numbering: inside an op its own offset order, across ops op order
@@ -1207,10 +1707,12 @@ class _Stitcher:
         for j in kept_jobs:
             by_src[MAIN, j.index] = self._new_task(eng=MAIN, op=oi, kind="job", job=j)
         mine: dict[int, list[_Fused]] = {e: [] for e in (0, 1, 3, 4)}
-        place = o["place"]
+        place = self.place[oi]
         for ld in prog.loaders:
             # LEARNED (RMSNorm): loaders alternate over the whole graph
-            seg = place.get("loader", LOADER_ENGINE_ORDER[self.n_loader % 2])
+            seg = place["loader"]
+            if seg is None:
+                seg = self.loader_order[self.n_loader % 2]
             self.n_loader += 1
             t = self._new_task(
                 eng=seg,
@@ -1219,7 +1721,7 @@ class _Stitcher:
                 src=ld,
                 len=ld.len,
                 off=loader_off[ld.seg, ld.index],
-                dst=amap[ld.dst],
+                dst=ld.dst if ld.region else amap[ld.dst],
             )
             by_src[ld.seg, ld.index] = t
             mine[seg].append(t)
@@ -1227,8 +1729,10 @@ class _Stitcher:
         for src in prog.etasks:
             if src.kind != "raw":
                 continue
-            key = "matrix" if src.seg in MATRIX_ENGINES else "transpose"
-            seg = place.get(key, src.seg)
+            if src.seg in MATRIX_ENGINES:
+                seg = place["matrix"][src.seg]
+            else:
+                seg = src.seg if place["transpose"] is None else place["transpose"]
             t = self._new_task(eng=seg, op=oi, kind="raw", src=src)
             by_src[src.seg, src.index] = t
             if seg == MAIN:
@@ -1315,19 +1819,18 @@ class _Stitcher:
         among its transitive dependencies.
 
         LEARNED (attention; RMSNorm agrees): the main engine does not repeat a
-        wait it already performed (equal or later signal); the other engines
-        emit every wait."""
+        wait it already performed (equal or later signal); the copy engines
+        emit every wait.
+
+        Checked on every standalone MatMul and every fused MatMul build: a
+        matrix engine does not repeat a wait either, except that its first
+        sub-program's waits do not count as performed. The loads of a group
+        that follows another group wait together, before the first of them."""
         tasks = self.tasks
 
         def need(t: _Fused) -> dict[int, int]:
-            seen, todo = set(), list(t.deps)
-            while todo:
-                f = todo.pop()
-                if f not in seen:
-                    seen.add(f)
-                    todo += tasks[f].deps
             req: dict[int, int] = {}
-            for f in seen:
+            for f in self._closure(t):
                 x = tasks[f]
                 if x.eng != t.eng:
                     req[x.eng] = max(req.get(x.eng, -1), x.pos)
@@ -1335,10 +1838,20 @@ class _Stitcher:
 
         sigset: dict[int, set] = {e: set() for e in range(5)}
         for e in range(5):
+            order = self.eng_tasks[e]
+            reqs = [need(t) for t in order]
+            head = None
+            for n, t in enumerate(order):
+                if t.unit_head:
+                    head = n
+                elif t.unit_member:
+                    for x, p in reqs[n].items():
+                        reqs[head][x] = max(reqs[head].get(x, -1), p)
+                    reqs[n] = {}
             waited: dict[int, int] = {}
-            for t in self.eng_tasks[e]:
-                req = need(t)
-                if e == MAIN:
+            for n, t in enumerate(order):
+                req = reqs[n]
+                if e == MAIN or (e in MATRIX_ENGINES and n):
                     req = {x: p for x, p in req.items() if p > waited.get(x, -1)}
                     waited.update(req)
                 t.req = req
@@ -1388,7 +1901,9 @@ class _Stitcher:
             else:
                 start = len(out)
                 out += [_rec(A2, 0, v) for v in t.waits]
-                for verb, r, v in _transpose_job(t.src.launch, st.amap):
+                for verb, r, v in _transpose_job(
+                    t.src.launch, st.amap, self.scratch_desc
+                ):
                     self._emit(verb, r, v)
                 label = f"op{t.op}:{st.op['op']}:transpose"
                 self.log.append(
@@ -1544,74 +2059,118 @@ class _Stitcher:
         return full
 
     def _moved_records(self, seg: int, t: _Fused) -> list[tuple[int, int, int]]:
-        """A standalone matrix or transpose sub-program at its fused addresses."""
-        src, amap = t.src, self.states[t.op].amap
-        if (seg in MATRIX_ENGINES) != (src.seg in MATRIX_ENGINES) or (
-            seg in COPY_ENGINES and seg != src.seg
-        ):
+        """A standalone matrix sub-program at its fused addresses."""
+        src, amap, o = t.src, self.states[t.op].amap, self.ops[t.op]
+        if seg not in MATRIX_ENGINES or src.seg not in MATRIX_ENGINES:
             raise NotImplementedError(
                 f"an engine-{src.seg} sub-program cannot run on engine {seg}: "
                 "the register layouts differ"
             )
+        writes = {_reg(w) for w in src.records if w[0] == A1}
+        words = {}
+        if MATRIX_OFF_POS in writes:
+            words = matrix_b_words(amap[src.launch[MATRIX_ADDR][1]])
         full = []
         for w in src.records:
             verb, r, v = w[0], _reg(w), _val(w)
             if verb == A1 and _is_scratch(v):
                 v = amap[v]
-            if (
-                seg in MATRIX_ENGINES
-                and verb == A1
-                and r in (MATRIX_OFF_POS, MATRIX_OFF_NEG)
-            ):
-                addr = amap[src.launch[MATRIX_ADDR][1]]
-                v = matrix_b_offset(addr)[r == MATRIX_OFF_NEG]
+            if verb == A1 and r in words:
+                v = words[r]
+            if verb == A1 and r == MATRIX_A_ZP and o["op"] == "MatMul":
+                # zero point of operand A; FITTED (``signed_output``): bit 21
+                # for a signed output
+                v = self.zp[o["onnx_inputs"][0]] & 0xFF
+                if o["out"][1] in self.signed and _FITTED_RULES["signed_output"]:
+                    v |= MATRIX_OUT_SIGNED
             full.append((verb, r, v))
         return full
 
+    def _copy_records(self, seg: int, t: _Fused) -> list[tuple[int, int, int]]:
+        """A standalone copy-engine transpose as its full launch state in the
+        engine's register order (the caller writes the difference to the
+        engine's running state)."""
+        src, amap = t.src, self.states[t.op].amap
+        if src.seg != seg:
+            raise NotImplementedError(
+                f"an engine-{src.seg} sub-program cannot run on engine {seg}: "
+                "the register layouts differ"
+            )
+        ctl, rank = LOADER_FIELDS[seg]["ctl"], self.copy_rank[seg]
+        items = []
+        for r, (verb, v) in src.launch.items():
+            if r != ctl:
+                v = amap[v] if verb == A1 and _is_scratch(v) else v
+                items.append((rank[("reg", r)], (verb, r, v)))
+        for k, w in zip(_order_keys(src.records, ctl), src.records):
+            if k[0] in ("ctl", "verb"):
+                items.append((rank[k], (w[0], _reg(w), _val(w))))
+        return [x for _, x in sorted(items, key=lambda it: it[0])]
+
+    def _matrix_segment(self, seg: int) -> list[bytes]:
+        """Matrix engines 0 and 1 share one register layout. The engine's
+        first group is written as in its standalone program; a later group as
+        the difference to the engine's running state (``a8`` slots and the
+        control register always). A staged compute stops before its launch;
+        the next group's last load launches both."""
+        recs: list[bytes] = []
+        state: dict[int, int] = {}
+        launch = 0
+        for gi, group in enumerate(self.mgroups[seg]):
+            for t in group:
+                recs += [_rec(A2, 0, v) for v in t.waits]
+                full = self._moved_records(seg, t)
+                if t.staged:
+                    end = max(
+                        n
+                        for n, x in enumerate(full)
+                        if x == (A1, MATRIX_CTL, MATRIX_STAGED_END)
+                    )
+                    full = full[: end + 1]
+                elif t.combined:
+                    full = [x for x in full if x[:2] != (A1, MATRIX_LAUNCH)]
+                    at = next(n for n, x in enumerate(full) if x[0] == A3)
+                    full.insert(at, (A1, MATRIX_LAUNCH, MATRIX_COMBINED))
+                    full = [
+                        (A1, MATRIX_CTL, MATRIX_STROBE_BOTH)
+                        if x == (A1, MATRIX_CTL, MATRIX_STROBE_LOAD)
+                        else x
+                        for x in full
+                    ]
+                for verb, r, v in full:
+                    if verb == A1 and r != MATRIX_CTL:
+                        if gi and state.get(r) == v:
+                            continue
+                        state[r] = v
+                    recs.append(_rec(verb, r, v))
+                if not t.staged:
+                    if launch in self.signo[seg]:
+                        recs.append(
+                            _rec(A2, 0, sync_signal(seg, self.signo[seg][launch]))
+                        )
+                    launch += 1
+        return recs
+
     def _engine_segment(self, seg: int) -> list[bytes]:
         recs = [_rec(A7, a7_head(self.n_io), 0)]
-        state: dict[int, int] = {}  # the engine's running a1 state
-        ctl = LOADER_FIELDS[seg]["ctl"] if seg in LOADER_FIELDS else MATRIX_CTL
-        owner = None
-        for t in self.eng_tasks[seg]:
-            recs += [_rec(A2, 0, v) for v in t.waits]
-            delta = True
-            if t.kind == "loader":
-                full = self._loader_records(seg, t)
-            elif seg in MATRIX_ENGINES:
-                # Matrix engines 0 and 1 share one register layout. An op's
-                # sub-programs keep their own order and deltas, which is only
-                # valid when the op has the engine to itself.
-                full = self._moved_records(seg, t)
-                own = [x.src.index for x in self.eng_tasks[seg] if x.op == t.op]
-                if owner not in (None, t.op) or own != list(range(len(own))):
-                    raise NotImplementedError(
-                        "two ops on one matrix engine: the register restore "
-                        "rules are unknown"
-                    )
-                owner, delta = t.op, False
-            else:
-                # A copy-engine sub-program is written as the difference to the
-                # engine's running state. One that was not first on its
-                # standalone engine is only usable when the registers it left
-                # unwritten already hold its launch values.
-                full = self._moved_records(seg, t)
-                amap, written = self.states[t.op].amap, {r for _, r, _ in full}
-                for r, (verb, v) in t.src.launch.items() if t.src.index else ():
-                    if verb == A1 and r != ctl and r not in written:
-                        v = amap[v] if _is_scratch(v) else v
-                        if state.get(r) != v:
-                            raise NotImplementedError(
-                                f"copy-engine sub-program: register {r:#06x} "
-                                "needs a restore (order unknown)"
-                            )
-            for verb, r, v in full:
-                if delta and verb == A1 and r != ctl:
-                    if state.get(r) == v:
-                        continue
-                    state[r] = v
-                recs.append(_rec(verb, r, v))
-            recs += self._signals_after(t)
+        if seg in MATRIX_ENGINES:
+            recs += self._matrix_segment(seg)
+        else:
+            state: dict[int, int] = {}  # the engine's running a1 state
+            ctl = LOADER_FIELDS[seg]["ctl"]
+            for t in self.eng_tasks[seg]:
+                recs += [_rec(A2, 0, v) for v in t.waits]
+                if t.kind == "loader":
+                    full = self._loader_records(seg, t)
+                else:
+                    full = self._copy_records(seg, t)
+                for verb, r, v in full:
+                    if verb == A1 and r != ctl:
+                        if state.get(r) == v:
+                            continue
+                        state[r] = v
+                    recs.append(_rec(verb, r, v))
+                recs += self._signals_after(t)
         recs.append(_rec(A2, 0, sync_signal(seg, self.n_final[seg])))
         if seg == 0:
             # segment 0's slot-table order is per-build noise: the first
@@ -1643,7 +2202,11 @@ def stitch(
                   "onnx_inputs": [fused names in ONNX input order],  # with consts
                   "consts": [{"name": fused name, "size": bytes, "values": [...]}],
                   "attrs": {"count": 64},              # ReduceMean
+                  "linear": True,                      # constant-weight MatMul
                   "place": {"matrix": e, "loader": e, "transpose": e}}, ...]}
+
+    A ``scales`` value is a float, or for the weight of a constant-weight
+    MatMul (``linear``) the list of its per-channel scales.
 
     ``scales`` and ``zero_points`` are keyed by fused tensor name; ``signed``
     names the tensors quantized to signed 8 bit (it sets a Softmax output's
@@ -1651,25 +2214,33 @@ def stitch(
     the caller chooses it (``inputs``). ``consts`` lists an op's initializer
     operands in its ``npu_params`` order; their bytes are copied from the
     standalone program, and ``values`` (optional) only checks that the
-    standalone build used the same constant. ``place`` pins an op's engine
-    sub-programs to engines (a LEARNED input: attention's placement cannot be
-    derived); without it the matrix and transpose sub-programs keep their
-    standalone engine and loaders alternate. ``output_param`` places the graph
+    standalone build used the same constant. ``place`` (optional, any subset
+    of its keys) pins an op's engine sub-programs to engines; ``matrix`` is
+    one engine, or for an op that runs on both matrix engines a mapping
+    ``{standalone engine: fused engine}``. Without it the placement comes
+    from rules FITTED to five native graphs (``_derive_placement``): a graph
+    with one matrix op keeps its standalone engines. Only the native builds'
+    placements were verified. ``output_param`` places the graph
     output's PARAM job before the first core job of that op, or (``"late"``)
-    before the DEQUANT job; like the slot order it is not predicted, so the
-    caller chooses it (default: where the last op's standalone program has
-    it). ``gate_corpus`` adds standalone
+    before the DEQUANT job (default: the fitted ``hoist_output_param`` rule,
+    which RMSNorm at 576 does not follow). ``gate_corpus`` adds standalone
     programs used only to infer the register order, the liveness gates and
     loader templates."""
     return _Stitcher(wiring, scales, zero_points, signed, gate_corpus).result()
 
 
-def _transpose_job(launch: Mapping, amap: Mapping) -> list[tuple[int, int, int]]:
-    """Records of the LEARNED main-engine transpose job (``MAIN_TRANSPOSE_JOB``)
-    for the standalone copy-engine transpose whose launch state is ``launch``.
-    The record order is the native fused attention build's."""
+def _transpose_job(
+    launch: Mapping, amap: Mapping, desc: int
+) -> list[tuple[int, int, int]]:
+    """Records of the main-engine transpose job (``MAIN_TRANSPOSE_JOB``) for
+    the standalone copy-engine transpose whose launch state is ``launch``.
+    ``desc`` is the main engine's scratch-source descriptor. The record order
+    is the native fused builds' (the caller drops unchanged writes)."""
     job = MAIN_TRANSPOSE_JOB
     const = job["constants"]
+    # the same port block sits at another base on each engine
+    src_shift = REG_SRC_A - LOADER_FIELDS[3]["off"]
+    dst_shift = REG_DST - LOADER_FIELDS[3]["dst"]
 
     def got(r):
         return launch.get(r, (A1, 0))
@@ -1684,8 +2255,8 @@ def _transpose_job(launch: Mapping, amap: Mapping) -> list[tuple[int, int, int]]
         return res
 
     first, last, shift = job["permutation"]
-    out = [(A1, 0x0280, const[0x0280]), (A1, 0x0290, const[0x0290])]
-    out += moved(*job["source"])
+    out = [(A1, 0x0280, const[0x0280]), (A1, job["descriptor"], desc)]
+    out += moved(*job["source"], src_shift)
     out += [
         (A1, REG_CTL, job["select"]),
         (A1, 0x0C10, const[0x0C10]),
@@ -1693,7 +2264,7 @@ def _transpose_job(launch: Mapping, amap: Mapping) -> list[tuple[int, int, int]]
     ]
     out += [(A1, r + shift, got(r)[1]) for r in range(first, last + 1, 0x10)]
     out.append((A1, REG_CTL, 1))
-    out += moved(*job["destination"])
+    out += moved(*job["destination"], dst_shift)
     out += [
         (A1, REG_CTL, 0x100000),
         (A1, REG_JOBTYPE, got(job["job_type_from"])[1]),
@@ -2157,6 +2728,35 @@ def compare_models(got: onnx.ModelProto, want: onnx.ModelProto) -> list[str]:
     return diffs
 
 
+# ``compare_models`` entries that follow from the order of segment 0's slot
+# table alone: another order compresses to another length, which moves the
+# streams behind it and the blob tail. ``with_slot_order`` removes them.
+LAYOUT_ONLY = ("segment stream layout", "blob tail bytes")
+
+
+def with_slot_order(model: onnx.ModelProto, like: onnx.ModelProto) -> onnx.ModelProto:
+    """``model`` with segment 0's slot table in the order ``like`` has it (the
+    order is per-build noise). Returned unchanged when the two tables are not
+    the same set of records."""
+    mc, omc = (bytes(mre.mcode_initializer(m).raw_data) for m in (model, like))
+    a, b = (records(suc.decode_segments(x)[0]) for x in (mc, omc))
+    lo, hi = slot_table(b)
+    if len(a) != len(b) or sorted(a[lo:hi]) != sorted(b[lo:hi]):
+        return model
+    fields = parse_blob(mc)
+    fields["streams"][0] = suc.encode(b"".join(a[:lo] + b[lo:hi] + a[hi:]))
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    init = mre.mcode_initializer(out)
+    init.raw_data = build_blob(fields)
+    del init.dims[:]
+    init.dims.append(len(init.raw_data))
+    for v in out.graph.value_info:
+        if v.name == init.name:
+            v.type.tensor_type.shape.dim[0].dim_value = len(init.raw_data)
+    return out
+
+
 # ---- committed graphs ------------------------------------------------------------
 @lru_cache(maxsize=None)
 def load_index(path: str = FIXTURE_INDEX) -> dict:
@@ -2202,6 +2802,14 @@ def fixture_case(graph: str, calibration: str, sources: str | None = None):
     return wiring, cal["scales"], cal["zero_points"], cal["signed"], oracle
 
 
+def fixture_corpus(graph: str, calibration: str) -> list[Program]:
+    """The extra standalone programs a committed graph is stitched with
+    (``gate_corpus``): attn16 needs a copy-engine 3 loader template, which
+    neither of its own MatMul programs has."""
+    names = load_index()["graphs"][graph].get("gate_corpus", [])
+    return [fixture_program(c, calibration) for c in names]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
@@ -2212,10 +2820,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     for graph in args.graph or sorted(load_index()["graphs"]):
         for cal in sorted(load_index()["graphs"][graph]["calibrations"]):
             wiring, sc, zp, signed, oracle = fixture_case(graph, cal)
-            st = stitch(wiring, sc, zp, signed)
+            st = stitch(wiring, sc, zp, signed, fixture_corpus(graph, cal))
             diffs = compare_models(stitched_model(st), oracle)
             counts = [len(s) // REC for s in st.segments]
-            print(f"{graph} {cal}: records {counts}, differences {len(diffs)}")
+            # segment 0's slot table is a per-build permutation, and with it
+            # the compressed length of segment 0 and the blob layout behind it
+            layout = [d for d in diffs if d in LAYOUT_ONLY]
+            diffs = [d for d in diffs if d not in LAYOUT_ONLY]
+            note = f" (layout only: {', '.join(layout)})" if layout else ""
+            print(f"{graph} {cal}: records {counts}, differences {len(diffs)}{note}")
             bad += bool(diffs)
     return 1 if bad else 0
 
