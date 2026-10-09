@@ -1,0 +1,1176 @@
+{
+ "components": {
+  "sigmoid": {
+   "op": "Sigmoid",
+   "graph": "(float[1,64] x) => (float[1,64] y)",
+   "source": "llm-ops/sigmoid/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_sigmoid_pm1.axmodel.gz",
+    "pm4": "op_sigmoid_pm4.axmodel.gz",
+    "asym": "op_sigmoid_asym.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.007837736047804356,
+      "y": 0.002866127295419574
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.03135094419121742,
+      "y": 0.003850757610052824
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 0
+     },
+     "signed": []
+    },
+    "asym": {
+     "scales": {
+      "x": 0.01567547209560871,
+      "y": 0.0037352312356233597
+     },
+     "zero_points": {
+      "x": 64,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "mul": {
+   "op": "Mul",
+   "graph": "(float[1,64] a, float[1,64] b) => (float[1,64] y)",
+   "source": "llm-ops/mul/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_mul_pm1.axmodel.gz",
+    "pm4": "op_mul_pm4.axmodel.gz",
+    "asym": "op_mul_asym.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "a": 0.007837736047804356,
+      "b": 0.007812942378222942,
+      "y": 0.007572716102004051
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 128,
+      "y": 125
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "a": 0.03135094419121742,
+      "b": 0.03125176951289177,
+      "y": 0.12116345763206482
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 128,
+      "y": 125
+     },
+     "signed": []
+    },
+    "asym": {
+     "scales": {
+      "a": 0.01567547209560871,
+      "b": 0.015625882893800735,
+      "y": 0.04428038001060486
+     },
+     "zero_points": {
+      "a": 64,
+      "b": 64,
+      "y": 65
+     },
+     "signed": []
+    }
+   }
+  },
+  "sqrt": {
+   "op": "Sqrt",
+   "graph": "(float[1,64] x) => (float[1,64] y)",
+   "source": "llm-ops/sqrt/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_sqrt_pm1.axmodel.gz",
+    "pm4": "op_sqrt_pm4.axmodel.gz",
+    "asym": "op_sqrt_asym.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.003919710870832205,
+      "y": 0.003920639865100384
+     },
+     "zero_points": {
+      "x": 0,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.01567855104804039,
+      "y": 0.007841206155717373
+     },
+     "zero_points": {
+      "x": 0,
+      "y": 0
+     },
+     "signed": []
+    },
+    "asym": {
+     "scales": {
+      "x": 0.01175981666892767,
+      "y": 0.006790944840759039
+     },
+     "zero_points": {
+      "x": 0,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "add": {
+   "op": "Add",
+   "graph": "(float[1,64] a, float[1,64] b) => (float[1,64] y)",
+   "source": "llm-ops/add/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_add_pm1.axmodel.gz",
+    "pm4": "op_add_pm4.axmodel.gz",
+    "asym": "op_add_asym.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "a": 0.007837736047804356,
+      "b": 0.007812942378222942,
+      "y": 0.015215504914522171
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 128,
+      "y": 130
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "a": 0.03135094419121742,
+      "b": 0.03125176951289177,
+      "y": 0.060862019658088684
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 128,
+      "y": 130
+     },
+     "signed": []
+    },
+    "asym": {
+     "scales": {
+      "a": 0.01567547209560871,
+      "b": 0.015625882893800735,
+      "y": 0.03043101169168949
+     },
+     "zero_points": {
+      "a": 64,
+      "b": 64,
+      "y": 65
+     },
+     "signed": []
+    }
+   }
+  },
+  "reducemean": {
+   "op": "ReduceMean",
+   "graph": "(float[1,64] x) => (float[1,1] y)",
+   "source": "llm-ops/reducemean/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_reducemean_pm1.axmodel.gz",
+    "pm4": "op_reducemean_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.007837736047804356,
+      "y": 0.0009371469495818019
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 85
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.03135094419121742,
+      "y": 0.0037485877983272076
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 85
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_mulxx": {
+   "op": "Mul",
+   "graph": "(float[1,64] x) => (float[1,64] y)",
+   "source": "llm-stitch/c_mulxx/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_mulxx_pm1.axmodel.gz",
+    "pm4": "op_c_mulxx_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.007837736047804356,
+      "y": 0.0039185890927910805
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.03135094419121742,
+      "y": 0.06269742548465729
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_addc": {
+   "op": "Add",
+   "graph": "(float[1,1] x) => (float[1,1] y)",
+   "source": "llm-stitch/c_addc/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_addc_pm1.axmodel.gz",
+    "pm4": "op_c_addc_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.003679681569337845,
+      "eps": 3.921568492160077e-08,
+      "y": 0.0036797206848859787
+     },
+     "zero_points": {
+      "x": 0,
+      "eps": 0,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.014680533669888973,
+      "eps": 3.921568492160077e-08,
+      "y": 0.014680572785437107
+     },
+     "zero_points": {
+      "x": 0,
+      "eps": 0,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_sqrt11": {
+   "op": "Sqrt",
+   "graph": "(float[1,1] x) => (float[1,1] y)",
+   "source": "llm-stitch/c_sqrt11/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_sqrt11_pm1.axmodel.gz",
+    "pm4": "op_c_sqrt11_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.003679681569337845,
+      "y": 0.0037987004034221172
+     },
+     "zero_points": {
+      "x": 0,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.014680533669888973,
+      "y": 0.007587537169456482
+     },
+     "zero_points": {
+      "x": 0,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_divb": {
+   "op": "Div",
+   "graph": "(float[1,64] a, float[1,1] b) => (float[1,64] y)",
+   "source": "llm-stitch/c_divb/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_divb_pm1.axmodel.gz",
+    "pm4": "op_c_divb_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "a": 0.007837736047804356,
+      "b": 0.005402523558586836,
+      "y": 0.01263172272592783
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 0,
+      "y": 127
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "a": 0.03135094419121742,
+      "b": 0.014006870798766613,
+      "y": 0.034570056945085526
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 0,
+      "y": 127
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_mulc": {
+   "op": "Mul",
+   "graph": "(float[1,64] x) => (float[1,64] y)",
+   "source": "llm-stitch/c_mulc/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_mulc_pm1.axmodel.gz",
+    "pm4": "op_c_mulc_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.007837736047804356,
+      "gain": 0.005873233079910278,
+      "y": 0.011427252553403378
+     },
+     "zero_points": {
+      "x": 128,
+      "gain": 0,
+      "y": 128
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.03135094419121742,
+      "gain": 0.005873233079910278,
+      "y": 0.04570901021361351
+     },
+     "zero_points": {
+      "x": 128,
+      "gain": 0,
+      "y": 128
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_matmul_qk": {
+   "op": "MatMul",
+   "graph": "(float[8,64] q, float[64,8] kt) => (float[8,8] y)",
+   "source": "llm-stitch/c_matmul_qk/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_matmul_qk_pm1.axmodel.gz",
+    "pm4": "op_c_matmul_qk_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "q": 0.007843086495995522,
+      "kt": 0.00784189160913229,
+      "y": 0.06065557152032852
+     },
+     "zero_points": {
+      "q": 0,
+      "kt": 0,
+      "y": 138
+     },
+     "signed": [
+      "kt",
+      "q"
+     ]
+    },
+    "pm4": {
+     "scales": {
+      "q": 0.031372345983982086,
+      "kt": 0.03136756643652916,
+      "y": 0.9704891443252563
+     },
+     "zero_points": {
+      "q": 0,
+      "kt": 0,
+      "y": 138
+     },
+     "signed": [
+      "kt",
+      "q"
+     ]
+    }
+   }
+  },
+  "c_softmax88": {
+   "op": "Softmax",
+   "graph": "(float[8,8] x) => (float[8,8] y)",
+   "source": "llm-stitch/c_softmax88/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_softmax88_pm1.axmodel.gz",
+    "pm4": "op_c_softmax88_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "x": 0.007837736047804356,
+      "y": 0.0014501073164865375
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "scales": {
+      "x": 0.03135094419121742,
+      "y": 0.0037060172762721777
+     },
+     "zero_points": {
+      "x": 128,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "c_matmul_pv": {
+   "op": "MatMul",
+   "graph": "(float[8,8] p, float[8,64] v) => (float[8,64] y)",
+   "source": "llm-stitch/c_matmul_pv/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "files": {
+    "pm1": "op_c_matmul_pv_pm1.axmodel.gz",
+    "pm4": "op_c_matmul_pv_pm4.axmodel.gz"
+   },
+   "calibrations": {
+    "pm1": {
+     "scales": {
+      "p": 0.00783922616392374,
+      "v": 0.007843086495995522,
+      "y": 0.030100887641310692
+     },
+     "zero_points": {
+      "p": 0,
+      "v": 0,
+      "y": 122
+     },
+     "signed": [
+      "p",
+      "v"
+     ]
+    },
+    "pm4": {
+     "scales": {
+      "p": 0.00783922616392374,
+      "v": 0.031372345983982086,
+      "y": 0.12040355056524277
+     },
+     "zero_points": {
+      "p": 0,
+      "v": 0,
+      "y": 122
+     },
+     "signed": [
+      "p",
+      "v"
+     ]
+    }
+   }
+  }
+ },
+ "graphs": {
+  "silu": {
+   "graph": "y = x * Sigmoid(x), x [1,64]",
+   "source": "llm-fused/silu/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "graph_inputs": [
+    "x"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "Sigmoid",
+     "component": "sigmoid",
+     "in": {
+      "x": "x"
+     },
+     "out": [
+      "y",
+      "s"
+     ]
+    },
+    {
+     "op": "Mul",
+     "component": "mul",
+     "in": {
+      "a": "x",
+      "b": "s"
+     },
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_silu_pm1.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.007837736047804356,
+      "s": 0.002866127295419574,
+      "y": 0.00391783332452178
+     },
+     "zero_points": {
+      "x": 128,
+      "s": 0,
+      "y": 69
+     },
+     "signed": []
+    },
+    "pm4": {
+     "oracle": "fused_silu_pm4.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.03135094419121742,
+      "s": 0.003850757610052824,
+      "y": 0.01647968590259552
+     },
+     "zero_points": {
+      "x": 128,
+      "s": 0,
+      "y": 17
+     },
+     "signed": []
+    }
+   }
+  },
+  "sqrt_mul": {
+   "graph": "y = x * Sqrt(x), x [1,64]",
+   "source": "llm-stitch/sqrt_mul/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "graph_inputs": [
+    "x"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "Sqrt",
+     "component": "sqrt",
+     "in": {
+      "x": "x"
+     },
+     "out": [
+      "y",
+      "r"
+     ]
+    },
+    {
+     "op": "Mul",
+     "component": "mul",
+     "in": {
+      "a": "x",
+      "b": "r"
+     },
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_sqrt_mul_pm1.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.003919710870832205,
+      "r": 0.003920639865100384,
+      "y": 0.003918782342225313
+     },
+     "zero_points": {
+      "x": 0,
+      "r": 0,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "oracle": "fused_sqrt_mul_pm4.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.01567855104804039,
+      "r": 0.007841206155717373,
+      "y": 0.03134937956929207
+     },
+     "zero_points": {
+      "x": 0,
+      "r": 0,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "sig_add": {
+   "graph": "y = x + Sigmoid(x), x [1,64]",
+   "source": "llm-stitch/sig_add/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "graph_inputs": [
+    "x"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "Sigmoid",
+     "component": "sigmoid",
+     "in": {
+      "x": "x"
+     },
+     "out": [
+      "y",
+      "s"
+     ]
+    },
+    {
+     "op": "Add",
+     "component": "add",
+     "in": {
+      "a": "x",
+      "b": "s"
+     },
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_sig_add_pm1.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.007837736047804356,
+      "s": 0.002866127295419574,
+      "y": 0.009648897685110569
+     },
+     "zero_points": {
+      "x": 128,
+      "s": 0,
+      "y": 76
+     },
+     "signed": []
+    },
+    "pm4": {
+     "oracle": "fused_sig_add_pm4.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.03135094419121742,
+      "s": 0.003850757610052824,
+      "y": 0.0351310633122921
+     },
+     "zero_points": {
+      "x": 128,
+      "s": 0,
+      "y": 113
+     },
+     "signed": []
+    }
+   }
+  },
+  "mul_sig": {
+   "graph": "y = Sigmoid(a * b), a and b [1,64]",
+   "source": "llm-stitch/mul_sig/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "graph_inputs": [
+    "a",
+    "b"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "Mul",
+     "component": "mul",
+     "in": {
+      "a": "a",
+      "b": "b"
+     },
+     "out": [
+      "y",
+      "m"
+     ]
+    },
+    {
+     "op": "Sigmoid",
+     "component": "sigmoid",
+     "in": {
+      "x": "m"
+     },
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_mul_sig_pm1.axmodel.gz",
+     "inputs": [
+      "a",
+      "b"
+     ],
+     "scales": {
+      "a": 0.007837736047804356,
+      "b": 0.007812942378222942,
+      "m": 0.007572716102004051,
+      "y": 0.002853143261745572
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 128,
+      "m": 125,
+      "y": 0
+     },
+     "signed": []
+    },
+    "pm4": {
+     "oracle": "fused_mul_sig_pm4.axmodel.gz",
+     "inputs": [
+      "a",
+      "b"
+     ],
+     "scales": {
+      "a": 0.03135094419121742,
+      "b": 0.03125176951289177,
+      "m": 0.12116345763206482,
+      "y": 0.003921567928045988
+     },
+     "zero_points": {
+      "a": 128,
+      "b": 128,
+      "m": 125,
+      "y": 0
+     },
+     "signed": []
+    }
+   }
+  },
+  "rmsnorm": {
+   "graph": "y = x / Sqrt(ReduceMean(x * x, -1) + eps) * gain, x [1,64]",
+   "source": "llm-fused/rmsnorm/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "graph_inputs": [
+    "x"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "Mul",
+     "component": "c_mulxx",
+     "in": {
+      "x": "x"
+     },
+     "onnx_inputs": [
+      "x",
+      "x"
+     ],
+     "out": [
+      "y",
+      "sq"
+     ]
+    },
+    {
+     "op": "ReduceMean",
+     "component": "reducemean",
+     "in": {
+      "x": "sq"
+     },
+     "out": [
+      "y",
+      "ms"
+     ],
+     "attrs": {
+      "count": 64
+     }
+    },
+    {
+     "op": "Add",
+     "component": "c_addc",
+     "in": {
+      "x": "ms"
+     },
+     "onnx_inputs": [
+      "ms",
+      "eps"
+     ],
+     "consts": [
+      {
+       "name": "eps",
+       "size": 1
+      }
+     ],
+     "out": [
+      "y",
+      "me"
+     ]
+    },
+    {
+     "op": "Sqrt",
+     "component": "c_sqrt11",
+     "in": {
+      "x": "me"
+     },
+     "out": [
+      "y",
+      "rt"
+     ]
+    },
+    {
+     "op": "Div",
+     "component": "c_divb",
+     "in": {
+      "a": "x",
+      "b": "rt"
+     },
+     "onnx_inputs": [
+      "x",
+      "rt"
+     ],
+     "out": [
+      "y",
+      "n"
+     ]
+    },
+    {
+     "op": "Mul",
+     "component": "c_mulc",
+     "in": {
+      "x": "n"
+     },
+     "onnx_inputs": [
+      "n",
+      "gain"
+     ],
+     "consts": [
+      {
+       "name": "gain",
+       "size": 64
+      }
+     ],
+     "out": [
+      "y",
+      "y"
+     ]
+    }
+   ],
+   "constants": {
+    "eps": [
+     1e-05
+    ],
+    "gain": [
+     1.3349816799163818,
+     1.0965540409088135,
+     0.7888632416725159,
+     0.5429515838623047,
+     1.4736543893814087,
+     1.0964716672897339,
+     1.2902631759643555,
+     1.41033935546875,
+     1.1881544589996338,
+     0.6899914741516113,
+     1.4814789295196533,
+     0.7847400307655334,
+     1.1292731761932373,
+     1.0810364484786987,
+     1.0999122858047485,
+     1.0352481603622437,
+     1.4957771301269531,
+     1.0019460916519165,
+     1.2710225582122803,
+     0.9941617846488953,
+     1.4976744651794434,
+     1.4786219596862793,
+     0.8935680389404297,
+     0.8219252824783325,
+     1.3621807098388672,
+     1.299324870109558,
+     1.191430687904358,
+     0.9085178375244141,
+     0.8897651433944702,
+     0.6316484212875366,
+     1.1254974603652954,
+     0.5824013948440552,
+     0.7745729684829712,
+     1.1561170816421509,
+     0.514676034450531,
+     1.3345321416854858,
+     0.5723990797996521,
+     1.024120807647705,
+     1.0465505123138428,
+     0.7272469401359558,
+     1.455978274345398,
+     0.8409638404846191,
+     1.0047074556350708,
+     1.367383599281311,
+     1.156952977180481,
+     0.8847224116325378,
+     0.5962724089622498,
+     1.4558056592941284,
+     1.0895671844482422,
+     1.082162857055664,
+     1.0971453189849854,
+     0.6488739252090454,
+     1.0600485801696777,
+     1.0631675720214844,
+     1.0809881687164307,
+     0.6849489808082581,
+     1.2096189260482788,
+     0.5700206756591797,
+     0.82486492395401,
+     0.6068554520606995,
+     1.2480286359786987,
+     1.0015740394592285,
+     0.9663081169128418,
+     0.5736933946609497
+    ]
+   },
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_rmsnorm_pm1.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.007837736047804356,
+      "sq": 0.0039185890927910805,
+      "ms": 0.0016122700180858374,
+      "eps": 3.921568492160077e-08,
+      "me": 0.001612309250049293,
+      "rt": 0.0025145141407847404,
+      "n": 0.014778119511902332,
+      "gain": 0.005873233079910278,
+      "y": 0.02056775614619255
+     },
+     "zero_points": {
+      "x": 128,
+      "sq": 0,
+      "ms": 0,
+      "eps": 0,
+      "me": 0,
+      "rt": 0,
+      "n": 127,
+      "gain": 0,
+      "y": 127
+     },
+     "signed": []
+    },
+    "pm4": {
+     "oracle": "fused_rmsnorm_pm4.axmodel.gz",
+     "inputs": [
+      "x"
+     ],
+     "scales": {
+      "x": 0.03135094419121742,
+      "sq": 0.06269742548465729,
+      "ms": 0.025796320289373398,
+      "eps": 3.921568492160077e-08,
+      "me": 0.02579635940492153,
+      "rt": 0.010057942010462284,
+      "n": 0.01477836724370718,
+      "gain": 0.005873233079910278,
+      "y": 0.02056807465851307
+     },
+     "zero_points": {
+      "x": 128,
+      "sq": 0,
+      "ms": 0,
+      "eps": 0,
+      "me": 0,
+      "rt": 0,
+      "n": 127,
+      "gain": 0,
+      "y": 127
+     },
+     "signed": []
+    }
+   }
+  },
+  "attention": {
+   "graph": "y = Softmax(q @ kt, -1) @ v, q [8,64], kt [64,8], v [8,64]",
+   "source": "llm-fused/attn/<calibration>: Pulsar2 7.0-lite, AX650, MinMax",
+   "graph_inputs": [
+    "q",
+    "kt",
+    "v"
+   ],
+   "output": "y",
+   "ops": [
+    {
+     "op": "MatMul",
+     "component": "c_matmul_qk",
+     "in": {
+      "q": "q",
+      "kt": "kt"
+     },
+     "onnx_inputs": [
+      "q",
+      "kt"
+     ],
+     "out": [
+      "y",
+      "s"
+     ],
+     "place": {
+      "matrix": 0,
+      "loader": 3,
+      "transpose": 3
+     }
+    },
+    {
+     "op": "Softmax",
+     "component": "c_softmax88",
+     "in": {
+      "x": "s"
+     },
+     "out": [
+      "y",
+      "p"
+     ]
+    },
+    {
+     "op": "MatMul",
+     "component": "c_matmul_pv",
+     "in": {
+      "p": "p",
+      "v": "v"
+     },
+     "onnx_inputs": [
+      "p",
+      "v"
+     ],
+     "out": [
+      "y",
+      "y"
+     ],
+     "place": {
+      "matrix": 1,
+      "loader": 4,
+      "transpose": 2
+     }
+    }
+   ],
+   "calibrations": {
+    "pm1": {
+     "oracle": "fused_attention_pm1.axmodel.gz",
+     "inputs": [
+      "v",
+      "q",
+      "kt"
+     ],
+     "scales": {
+      "q": 0.007843086495995522,
+      "kt": 0.00784189160913229,
+      "s": 0.06065557152032852,
+      "p": 0.007775607518851757,
+      "v": 0.007842647843062878,
+      "y": 0.007624095305800438
+     },
+     "zero_points": {
+      "q": 0,
+      "kt": 0,
+      "s": 138,
+      "p": 0,
+      "v": 0,
+      "y": 129
+     },
+     "signed": [
+      "kt",
+      "p",
+      "q",
+      "v"
+     ]
+    },
+    "pm4": {
+     "oracle": "fused_attention_pm4.axmodel.gz",
+     "inputs": [
+      "kt",
+      "q",
+      "v"
+     ],
+     "scales": {
+      "q": 0.031372345983982086,
+      "kt": 0.03136756643652916,
+      "s": 0.9704891443252563,
+      "p": 0.007843137718737125,
+      "v": 0.03137059137225151,
+      "y": 0.0313580147922039
+     },
+     "zero_points": {
+      "q": 0,
+      "kt": 0,
+      "s": 138,
+      "p": 0,
+      "v": 0,
+      "y": 127
+     },
+     "signed": [
+      "kt",
+      "p",
+      "q",
+      "v"
+     ]
+    }
+   }
+  }
+ }
+}

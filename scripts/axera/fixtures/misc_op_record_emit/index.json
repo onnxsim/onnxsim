@@ -927,5 +927,47 @@
    "x": 128,
    "y": 0
   }
+ },
+ "Neg:1x64": {
+  "file": "misc_op_record_emit/neg_1x64_pm4.axmodel.gz",
+  "op": "Neg",
+  "program": "large",
+  "programs": {
+   "small": "Neg:1x64:small"
+  },
+  "scales": {
+   "x": 0.03135094419121742,
+   "y": 0.03135094419121742
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/neg/pm4: pulsar2 7.0-lite, MinMax, 16 samples of U[-4,4], default_rng(0)",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "Neg:1x64:small": {
+  "file": "misc_op_record_emit/neg_1x64_pm1.axmodel.gz",
+  "op": "Neg",
+  "program": "small",
+  "programs": {
+   "large": "Neg:1x64"
+  },
+  "scales": {
+   "x": 0.007837736047804356,
+   "y": 0.007837736047804356
+  },
+  "shape": [
+   1,
+   64
+  ],
+  "source": "llm-ops/neg/pm1: pulsar2 7.0-lite, MinMax, 16 samples of U[-1,1], default_rng(0)",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
  }
 }
