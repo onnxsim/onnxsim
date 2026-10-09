@@ -197,21 +197,32 @@ def _as_tensor(t: TensorLike) -> tuple[int, np.ndarray]:
     return dtype, a.reshape(shape)
 
 
-def encode_tensors(tensors: Sequence[TensorLike]) -> bytes:
+def encode_tensors_parts(tensors: Sequence[TensorLike]) -> list:
+    """The tensor list as a sequence of buffers: small `bytes` headers, and each payload
+    as a memoryview of the array's own memory (no copy when the array is already
+    C-contiguous and little-endian)."""
     if len(tensors) > MAX_TENSORS:
         raise ProtocolError("too many tensors")
-    out = [_u32(len(tensors))]
+    out: list = [_u32(len(tensors))]
     for t in tensors:
         dtype, a = _as_tensor(t)
         if a.ndim > MAX_RANK:
             raise ProtocolError("tensor rank exceeds limit")
         if a.nbytes > MAX_TENSOR_BYTES:
             raise ProtocolError("tensor too large")
-        out.append(_u32(dtype) + _u32(a.ndim))
-        out.extend(_u64(d) for d in a.shape)
-        out.append(_u64(a.size))
-        out.append(a.tobytes())
-    return b"".join(out)
+        out.append(
+            _u32(dtype)
+            + _u32(a.ndim)
+            + b"".join(_u64(d) for d in a.shape)
+            + _u64(a.size)
+        )
+        if a.nbytes:
+            out.append(memoryview(a.reshape(-1)).cast("B"))
+    return out
+
+
+def encode_tensors(tensors: Sequence[TensorLike]) -> bytes:
+    return b"".join(encode_tensors_parts(tensors))
 
 
 def _message(kind: int, body: bytes) -> bytes:
@@ -220,7 +231,7 @@ def _message(kind: int, body: bytes) -> bytes:
     return _u32(MAGIC) + struct.pack(">HH", VERSION, kind) + _u64(len(body)) + body
 
 
-def encode_request_payload(
+def encode_request_payload_parts(
     op: str,
     inputs: Sequence[TensorLike] = (),
     *,
@@ -229,8 +240,8 @@ def encode_request_payload(
     artifact: bytes = b"",
     profiling: int = PROFILING_OFF,
     request_id: int = 0,
-) -> bytes:
-    """The request without the 16-byte transport header (what a DORA message carries)."""
+) -> list:
+    """encode_request_payload() as a sequence of buffers (see encode_tensors_parts)."""
     op_bytes = op.encode()
     if not op_bytes or len(op_bytes) > MAX_OP_BYTES:
         raise ProtocolError(
@@ -240,24 +251,62 @@ def encode_request_payload(
         raise ProtocolError("artifact request too large")
     if profiling not in (PROFILING_OFF, PROFILING_SUMMARY, PROFILING_DETAILED):
         raise ProtocolError("invalid profiling level")
-    return b"".join(
-        (
-            _u64(request_id),
-            _string(op_bytes),
-            _string(artifact_id),
-            _u64(len(model)),
-            bytes(model),
-            _u64(len(artifact)),
-            bytes(artifact),
-            _u32(profiling),
-            encode_tensors(inputs),
-        )
-    )
+    return [
+        _u64(request_id),
+        _string(op_bytes),
+        _string(artifact_id),
+        _u64(len(model)),
+        bytes(model),
+        _u64(len(artifact)),
+        bytes(artifact),
+        _u32(profiling),
+        *encode_tensors_parts(inputs),
+    ]
+
+
+def encode_request_payload(
+    op: str, inputs: Sequence[TensorLike] = (), **fields
+) -> bytes:
+    """The request without the 16-byte transport header (what a DORA message carries)."""
+    return b"".join(encode_request_payload_parts(op, inputs, **fields))
 
 
 def encode_request(op: str, inputs: Sequence[TensorLike] = (), **fields) -> bytes:
     """A complete RUN message (header + payload)."""
     return _message(KIND_RUN, encode_request_payload(op, inputs, **fields))
+
+
+# Buffers at least this large are written to the socket from their own memory;
+# smaller ones are gathered into one write.
+_SEND_DIRECT_BYTES = 64 * 1024
+
+
+def encode_request_parts(op: str, inputs: Sequence[TensorLike] = (), **fields) -> list:
+    """encode_request() as a sequence of buffers whose concatenation is the same
+    message: the header, then the payload with every tensor's data as a view of
+    the array (see encode_tensors_parts)."""
+    parts = encode_request_payload_parts(op, inputs, **fields)
+    total = sum(len(p) for p in parts)
+    if total > MAX_MESSAGE_BYTES:
+        raise ProtocolError("message too large")
+    return [_u32(MAGIC) + struct.pack(">HH", VERSION, KIND_RUN) + _u64(total), *parts]
+
+
+def send_parts(sock: socket.socket, parts: Sequence) -> None:
+    """Write buffers in order without joining the large ones: a tensor payload goes
+    to the socket straight from the array. (Joining copies every payload three times
+    on the way, and an llm_build layer call carries two full KV caches.)"""
+    small: list = []
+    for p in parts:
+        if len(p) < _SEND_DIRECT_BYTES:
+            small.append(p)
+            continue
+        if small:
+            sock.sendall(b"".join(small))
+            small = []
+        sock.sendall(p)
+    if small:
+        sock.sendall(b"".join(small))
 
 
 def encode_response(response: Response) -> bytes:
@@ -464,7 +513,7 @@ class Client:
         answer raises RemoteError; without it the Response has ok=False and `error` set."""
         request_id = self._next_id
         self._next_id += 1
-        message = encode_request(
+        parts = encode_request_parts(
             op,
             inputs,
             artifact_id=artifact_id,
@@ -474,7 +523,7 @@ class Client:
             request_id=request_id,
         )
         with self.connect() as sock:
-            sock.sendall(message)
+            send_parts(sock, parts)
             response = receive_response(sock)
         if response.ok and response.request_id != request_id:
             raise ProtocolError(
