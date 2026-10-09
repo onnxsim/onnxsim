@@ -35,8 +35,13 @@ import numpy as np
 import onnx
 from onnx import ModelProto, NodeProto, TensorProto, numpy_helper, parser, printer
 
+from onnxsim.versioning_manifest import (
+    MANIFEST_VERSION,
+    finite_or_none,
+    validate_manifest,
+)
+
 INIT_MARKER = "# onnxsim-init "
-MANIFEST_VERSION = 1
 
 
 class ReproducibilityError(RuntimeError):
@@ -567,10 +572,10 @@ def load_manifest(path: str) -> dict:
         return {"version": MANIFEST_VERSION, "steps": []}
     with open(path, encoding="utf-8") as f:
         manifest = json.load(f)
-    if manifest.get("version") != MANIFEST_VERSION:
-        raise ValueError(
-            f"{path}: unsupported manifest version {manifest.get('version')}"
-        )
+    try:
+        validate_manifest(manifest)
+    except ValueError as e:
+        raise ValueError(f"{path}: {e}") from None
     return manifest
 
 
@@ -610,8 +615,8 @@ def record_step(
         "reports": [
             {
                 "case": r.case,
-                "max_abs_diff": r.max_abs_diff,
-                "max_rel_diff": r.max_rel_diff,
+                "max_abs_diff": finite_or_none(r.max_abs_diff),
+                "max_rel_diff": finite_or_none(r.max_rel_diff),
                 "ok": r.ok,
                 "status": r.status,
                 "skipped": list(r.skipped),
@@ -623,6 +628,7 @@ def record_step(
     if culprit is not None:
         entry["culprit"] = culprit
     manifest["steps"].append(entry)
+    validate_manifest(manifest)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
         f.write("\n")

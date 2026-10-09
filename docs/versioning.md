@@ -284,6 +284,16 @@ culprit against the diff in `model.txt` before acting on it.
   (for example `onnxruntime 1.29.0`), `test_set`, `cases`, `verdict`, a `reports`
   list with one entry per case, and `culprit` when the verdict is `fail`.
 
+The format is version 1. Its JSON Schema is
+[`docs/schemas/versioning-manifest.v1.schema.json`](schemas/versioning-manifest.v1.schema.json),
+and the code checks the same rules whenever it reads or writes the manifest, so an
+invalid file is refused with the location of the first problem. Non-finite
+differences are stored as `null`, since JSON has no `NaN` or `Infinity`.
+
+Version 1 is not released yet, so its fields can still change. Once it is released,
+any change a reader must understand bumps the version, and the old version stays
+readable.
+
 Steps are only appended. Never edit them by hand. Each `base_graph` matches the
 previous step's `output_graph`, so the steps form a chain from the original.
 

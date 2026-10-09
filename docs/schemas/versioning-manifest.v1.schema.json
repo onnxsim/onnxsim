@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/onnxsim/onnxsim/docs/schemas/versioning-manifest.v1.schema.json",
+  "title": "onnxsim versioning manifest, version 1",
+  "description": "manifest.json of a versioning project (onnxsim.versioning_project). Written by init, verify and build; read by status and verify.",
+  "type": "object",
+  "required": [
+    "version",
+    "steps"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "base": {
+      "$ref": "#/$defs/base"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "builds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/build"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "file",
+        "file_digest",
+        "graph"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "original .onnx path, relative to the project directory"
+        },
+        "file_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "graph": {
+          "$ref": "#/$defs/sha256",
+          "description": "graph hash of model.txt at init"
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": [
+        "label",
+        "command",
+        "base_graph",
+        "output_graph",
+        "executor",
+        "test_set",
+        "cases",
+        "verdict",
+        "reports"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "base_graph": {
+          "$ref": "#/$defs/sha256"
+        },
+        "output_graph": {
+          "$ref": "#/$defs/sha256"
+        },
+        "executor": {
+          "type": "string"
+        },
+        "test_set": {
+          "$ref": "#/$defs/sha256"
+        },
+        "cases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/case"
+          }
+        },
+        "verdict": {
+          "enum": [
+            "pass",
+            "partial",
+            "fail"
+          ]
+        },
+        "reports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/report"
+          }
+        },
+        "culprit": {
+          "$ref": "#/$defs/culprit"
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "required": [
+        "name",
+        "kind"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "generated",
+            "supplied",
+            "onnx_test_data"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "name",
+            "kind",
+            "seed",
+            "specs",
+            "digests"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "generated"
+            },
+            "seed": {
+              "type": "integer"
+            },
+            "specs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/spec"
+              }
+            },
+            "digests": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": [
+            "name",
+            "kind",
+            "path",
+            "digests"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "supplied"
+            },
+            "path": {
+              "type": "string"
+            },
+            "digests": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": [
+            "name",
+            "kind",
+            "directory",
+            "test_set"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "onnx_test_data"
+            },
+            "directory": {
+              "type": "string"
+            },
+            "test_set": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "spec": {
+      "type": "object",
+      "required": [
+        "name",
+        "dtype",
+        "shape",
+        "low",
+        "high"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "dtype": {
+          "type": "string"
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "low": {
+          "type": "number"
+        },
+        "high": {
+          "type": "number"
+        }
+      }
+    },
+    "report": {
+      "type": "object",
+      "required": [
+        "case",
+        "max_abs_diff",
+        "max_rel_diff",
+        "ok",
+        "status",
+        "skipped",
+        "failed_nodes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "case": {
+          "type": "string"
+        },
+        "max_abs_diff": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "null when not finite"
+        },
+        "max_rel_diff": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "null when not finite"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "partial",
+            "fail"
+          ]
+        },
+        "skipped": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failed_nodes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "culprit": {
+      "type": "object",
+      "required": [
+        "fusion",
+        "nodes",
+        "blocks",
+        "initializers",
+        "evaluations"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fusion": {
+          "type": "string"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "initializers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evaluations": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "required": [
+        "output",
+        "file_digest",
+        "source_graph",
+        "simplify",
+        "simplify_checked",
+        "onnxsim_version",
+        "executor"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "type": "string"
+        },
+        "file_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_graph": {
+          "$ref": "#/$defs/sha256"
+        },
+        "simplify": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "simplify keyword options; null when simplify was not run"
+        },
+        "simplify_checked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "onnxsim_version": {
+          "type": "string"
+        },
+        "executor": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

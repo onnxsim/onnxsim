@@ -43,6 +43,7 @@ from onnxsim.versioning import (
     record_step,
     save_snapshot,
 )
+from onnxsim.versioning_manifest import validate_manifest
 
 MODEL_FILE = "model.txt"
 MANIFEST_FILE = "manifest.json"
@@ -81,6 +82,7 @@ def init_project(original: str, directory: str) -> dict:
         },
         "steps": [],
     }
+    validate_manifest(manifest)
     _write_json(_manifest_path(directory), manifest)
     return manifest
 
@@ -289,5 +291,6 @@ def build_output(
     with open(path, encoding="utf-8") as f:
         manifest = json.load(f)
     manifest.setdefault("builds", []).append(entry)
+    validate_manifest(manifest)
     _write_json(path, manifest)
     return entry
