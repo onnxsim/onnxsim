@@ -13,6 +13,11 @@
 // Loaded models are kept between requests (LRU, --max-loaded) unless
 // --no-cache is given; `io_info` describes a model's tensors, `unload` drops
 // it, and `run` is the path form for paths longer than the op field allows.
+//
+// `run_resident` / `reset_state` keep chosen inputs of a cached model in its
+// device buffers between requests (an LLM layer's KV cache): an input sent
+// empty keeps its contents, an output row can be written into an input on the
+// worker, and an output can be left out of the response.
 // See the "AXCL worker" section of README.md.
 #include "remote_transport.h"
 
@@ -27,6 +32,7 @@
 #include <iostream>
 #include <iterator>
 #include <list>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -158,9 +164,26 @@ struct LoadedModel {
   // Identity of the file the model was loaded from; a changed file is reloaded.
   int64_t mtime_ns = 0;
   uint64_t file_size = 0;
+  // Resident state (`run_resident` / `reset_state`): non-zero while the input
+  // device buffers hold contents a client may keep using, and then the id that
+  // client has to quote. It lives and dies with this entry: a freshly loaded
+  // model (first use, eviction, changed file, unload, device failure) has none,
+  // and an old-form run, which overwrites every input, clears it.
+  uint64_t state_id = 0;
+  // --row-copy host only: the worker's own copy of each input while state_id
+  // is set, so a row can be patched in and the whole input uploaded again.
+  std::vector<std::vector<uint8_t>> shadow;
 };
 
 static bool g_use_cache = true;
+// How `run_resident` writes an output row into a resident input: on the card
+// (device-to-device copy to an offset inside the input buffer), or through the
+// worker's memory (--row-copy host: download the row, patch the shadow copy,
+// upload the whole input; uses whole-buffer copies only).
+static bool g_row_copy_on_device = true;
+// Seeded from the clock in main(), so an id handed out before a restart is
+// never valid again.
+static uint64_t g_next_state_id = 1;
 static size_t g_max_loaded = 64;
 // Most recently used first.
 static std::list<LoadedModel> g_models;
@@ -181,6 +204,7 @@ static void free_model(LoadedModel& m) {
   for (void* p : m.inputs) if (p) axclrtFree(p);
   for (void* p : m.outputs) if (p) axclrtFree(p);
   m.inputs.clear(); m.outputs.clear();
+  m.state_id = 0; m.shadow.clear();
   if (m.io) axclrtEngineDestroyIO(m.io);
   if (m.info) axclrtEngineDestroyIOInfo(m.info);
   if (m.model) axclrtEngineUnload(m.model);
@@ -298,12 +322,90 @@ static LoadedModel* acquire_cached(const std::string& path, bool& loaded,
   return &g_models.front();
 }
 
+// ---- resident state --------------------------------------------------------
+//
+// The control of a `run_resident` request: UTF-8 text in the request's
+// `artifact` bytes, one directive per line (no JSON: the worker has no parser
+// and needs none).
+//
+//   state <id>             the resident state this request continues; without
+//                          it the request establishes a new one
+//   write <out> <in> <slot> after execution, copy output <out> (one row) into
+//                          input <in> at byte offset <slot> * bytes(<out>)
+//   omit <out>             do not return output <out> (it comes back empty)
+struct RowWrite { uint32_t out = 0, in = 0; uint64_t slot = 0; };
+struct ResidentControl {
+  bool has_state = false;
+  uint64_t state = 0;
+  std::vector<RowWrite> writes;
+  std::vector<uint32_t> omit;
+};
+
+constexpr size_t kMaxResidentControlBytes = 4096;
+static const char kStateLost[] = "resident state lost";
+
+static bool parse_resident_control(const std::vector<uint8_t>& bytes, ResidentControl& control,
+                                   std::string& error) {
+  if (bytes.size() > kMaxResidentControlBytes) { error = "AXCL resident control too large"; return false; }
+  std::istringstream lines(std::string(bytes.begin(), bytes.end()));
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream fields(line);
+    std::string key, rest;
+    if (!(fields >> key)) continue;  // blank line
+    bool ok = false;
+    if (key == "state") {
+      ok = !control.has_state && static_cast<bool>(fields >> control.state) && control.state != 0;
+      control.has_state = true;
+    } else if (key == "write") {
+      RowWrite w;
+      ok = static_cast<bool>(fields >> w.out >> w.in >> w.slot);
+      control.writes.push_back(w);
+    } else if (key == "omit") {
+      uint32_t out = 0;
+      ok = static_cast<bool>(fields >> out);
+      control.omit.push_back(out);
+    }
+    if (!ok || (fields >> rest)) {
+      error = "AXCL resident control: bad directive: " + line.substr(0, 64);
+      return false;
+    }
+  }
+  return true;
+}
+
+// Zero-fills every input buffer and starts a new resident state.
+static bool reset_state(LoadedModel& m, std::string& error, bool& device_failed) {
+  device_failed = false;
+  m.state_id = 0;
+  for (size_t i = 0; i < m.inputs.size(); ++i) {
+    if (axclrtMemset(m.inputs[i], 0, m.in[i].bytes)) {
+      error = "AXCL input clear failed";
+      device_failed = true;
+      return false;
+    }
+  }
+  if (!g_row_copy_on_device) {
+    m.shadow.resize(m.inputs.size());
+    for (size_t i = 0; i < m.inputs.size(); ++i)
+      m.shadow[i].assign(static_cast<size_t>(m.in[i].bytes), 0);
+  }
+  m.state_id = g_next_state_id++;
+  return true;
+}
+
 // Runs one request against a loaded model. Returns false (response.error set)
 // on failure; `device_failed` says the failure came from the card rather than
 // from a malformed request, so a cached model should not be kept.
+//
+// `resident` is null for the original request forms: every input is uploaded,
+// every output returned, and whatever resident state the model had is gone.
+// With it (`run_resident`) an input sent with no elements keeps the contents of
+// its device buffer. Nothing is uploaded before the whole request has been
+// checked, so a refused request leaves the resident state as it was.
 static bool run_loaded(LoadedModel& m, const Request& request, Response& response,
                        const std::chrono::steady_clock::time_point& started,
-                       bool& device_failed) {
+                       bool& device_failed, const ResidentControl* resident = nullptr) {
   device_failed = false;
   auto add_profile = [&](const char* name, uint64_t begin, uint64_t duration,
                          const char* detail) {
@@ -314,13 +416,18 @@ static bool run_loaded(LoadedModel& m, const Request& request, Response& respons
   auto fail = [&](const std::string& message, bool device) {
     response.ok = false; response.error = message; response.outputs.clear();
     device_failed = device;
+    if (device) m.state_id = 0;
     return false;
   };
   const uint32_t n_in = static_cast<uint32_t>(m.in.size());
   const uint32_t n_out = static_cast<uint32_t>(m.out.size());
   if (n_in != request.inputs.size()) return fail("AXCL input count mismatch", false);
 
-  const uint64_t upload_begin = elapsed_us(started);
+  // ---- check the request ----
+  std::vector<bool> keep(n_in, false);   // input stays as it is on the card
+  std::vector<bool> omit(n_out, false);  // output is not returned
+  std::vector<const void*> sources(n_in, nullptr);
+  bool any_kept = false;
   for (uint32_t i = 0; i < n_in; ++i) {
     // Float32 keeps its historical home in `data`; every other dtype travels
     // as its little-endian payload in `raw_data`.
@@ -329,22 +436,51 @@ static bool run_loaded(LoadedModel& m, const Request& request, Response& respons
     if (expected == 0 || in.dtype != expected)
       return fail("AXCL input " + std::to_string(i) + " dtype mismatch: model wants ONNX dtype " +
                   std::to_string(expected) + ", request sent " + std::to_string(in.dtype), false);
-    const void* src = in.dtype == 1 ? static_cast<const void*>(in.data.data())
-                                    : static_cast<const void*>(in.raw_data.data());
+    sources[i] = in.dtype == 1 ? static_cast<const void*>(in.data.data())
+                               : static_cast<const void*>(in.raw_data.data());
     const uint64_t src_bytes = in.dtype == 1 ? in.data.size() * sizeof(float) : in.raw_data.size();
+    if (resident && src_bytes == 0 && m.in[i].bytes != 0) {
+      keep[i] = any_kept = true;
+      continue;
+    }
     if (m.in[i].bytes != src_bytes)
       return fail("AXCL input " + std::to_string(i) + " must have the model's exact size", false);
-    if (axclrtMemcpy(m.inputs[i], src, m.in[i].bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
-      return fail("AXCL input upload failed", true);
   }
-  if (request.profiling == ProfilingLevel::Detailed) {
-    add_profile("axcl_upload", upload_begin, elapsed_us(started) - upload_begin,
-                "host-to-device inputs");
+  if (resident) {
+    for (uint32_t out : resident->omit) {
+      if (out >= n_out) return fail("AXCL resident control: omit names output " + std::to_string(out), false);
+      omit[out] = true;
+    }
+    for (const RowWrite& w : resident->writes) {
+      if (w.out >= n_out || w.in >= n_in)
+        return fail("AXCL resident control: write names a tensor the model does not have", false);
+      const IoSpec& row = m.out[w.out];
+      const IoSpec& into = m.in[w.in];
+      if (row.bytes == 0 || row.axcl_dtype != into.axcl_dtype || into.bytes % row.bytes != 0 ||
+          w.slot >= into.bytes / row.bytes)
+        return fail("AXCL resident control: output " + std::to_string(w.out) + " is not a row of input " +
+                    std::to_string(w.in) + " at slot " + std::to_string(w.slot), false);
+    }
+    // The state check comes last: only a well-formed request is told to re-upload.
+    if (resident->has_state ? resident->state != m.state_id : any_kept) {
+      return fail(std::string(kStateLost) + ": " + m.key +
+                  (resident->has_state ? (m.state_id ? " holds another client's state"
+                                                     : " was loaded or run in full since")
+                                       : " was sent an empty input without a state id") +
+                  "; send every input in full", false);
+    }
   }
   response.outputs.resize(n_out);
   for (uint32_t i = 0; i < n_out; ++i) {
     Tensor& out = response.outputs[i];
     out.dtype = m.out[i].onnx_dtype;
+    if (omit[i]) {
+      // Left on the card: an empty tensor holds its place (dtype 0 is not a
+      // transport dtype, so an engine type without one is sent as float32).
+      if (out.dtype == 0 || dtype_bytes(out.dtype) == 0) out.dtype = 1;
+      out.shape = {0};
+      continue;
+    }
     if (out.dtype == 0 || dtype_bytes(out.dtype) == 0)
       return fail("AXCL output " + std::to_string(i) + " has an unsupported dtype", false);
     out.shape = m.out[i].shape;
@@ -355,12 +491,62 @@ static bool run_loaded(LoadedModel& m, const Request& request, Response& respons
     if (out.dtype == 1) out.data.resize(static_cast<size_t>(elements));
     else out.raw_data.resize(static_cast<size_t>(m.out[i].bytes));
   }
+
+  // ---- upload ----
+  // From here the input buffers change. An old-form request, or one that
+  // establishes a state, ends whatever state there was; the new id is only
+  // assigned once the run has succeeded.
+  const bool continues = resident && resident->has_state;
+  if (!continues) { m.state_id = 0; m.shadow.clear(); }
+  const bool shadowed = resident && !g_row_copy_on_device;
+  if (shadowed && !continues) m.shadow.assign(n_in, std::vector<uint8_t>());
+  const uint64_t upload_begin = elapsed_us(started);
+  for (uint32_t i = 0; i < n_in; ++i) {
+    if (keep[i]) continue;
+    if (axclrtMemcpy(m.inputs[i], sources[i], m.in[i].bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
+      return fail("AXCL input upload failed", true);
+    if (shadowed) {
+      const uint8_t* bytes = static_cast<const uint8_t*>(sources[i]);
+      m.shadow[i].assign(bytes, bytes + m.in[i].bytes);
+    }
+  }
+  if (request.profiling == ProfilingLevel::Detailed) {
+    add_profile("axcl_upload", upload_begin, elapsed_us(started) - upload_begin,
+                resident ? "host-to-device inputs (resident ones stay)" : "host-to-device inputs");
+  }
   const uint64_t execute_begin = elapsed_us(started);
   if (axclrtEngineExecute(m.model, m.context, 0, m.io)) return fail("AXCL execute failed", true);
   add_profile("axcl_execute", execute_begin,
               elapsed_us(started) - execute_begin, "AXCL engine execution");
+
+  // ---- row write-back ----
+  if (resident && !resident->writes.empty()) {
+    const uint64_t copy_begin = elapsed_us(started);
+    for (const RowWrite& w : resident->writes) {
+      const uint64_t row = m.out[w.out].bytes;
+      const uint64_t offset = w.slot * row;
+      if (g_row_copy_on_device) {
+        // Both ends are device buffers of this model; the destination is `offset`
+        // bytes into the input's buffer.
+        void* dst = static_cast<uint8_t*>(m.inputs[w.in]) + offset;
+        if (axclrtMemcpy(dst, m.outputs[w.out], row, AXCL_MEMCPY_DEVICE_TO_DEVICE))
+          return fail("AXCL row copy failed", true);
+      } else {
+        std::vector<uint8_t>& copy = m.shadow[w.in];
+        if (axclrtMemcpy(copy.data() + offset, m.outputs[w.out], row, AXCL_MEMCPY_DEVICE_TO_HOST) ||
+            axclrtMemcpy(m.inputs[w.in], copy.data(), m.in[w.in].bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
+          return fail("AXCL row copy failed", true);
+      }
+    }
+    if (request.profiling == ProfilingLevel::Detailed) {
+      add_profile("axcl_row_copy", copy_begin, elapsed_us(started) - copy_begin,
+                  g_row_copy_on_device ? "output rows into resident inputs, device-to-device"
+                                       : "output rows into resident inputs, through the worker");
+    }
+  }
   const uint64_t download_begin = elapsed_us(started);
   for (uint32_t i = 0; i < n_out; ++i) {
+    if (omit[i]) continue;
     Tensor& out = response.outputs[i];
     void* dst = out.dtype == 1 ? static_cast<void*>(out.data.data())
                                : static_cast<void*>(out.raw_data.data());
@@ -370,6 +556,10 @@ static bool run_loaded(LoadedModel& m, const Request& request, Response& respons
   if (request.profiling == ProfilingLevel::Detailed) {
     add_profile("axcl_download", download_begin,
                 elapsed_us(started) - download_begin, "device-to-host outputs");
+  }
+  if (resident) {
+    if (!continues) m.state_id = g_next_state_id++;
+    response.manifest = "{\"schema_version\":1,\"state_id\":" + std::to_string(m.state_id) + "}";
   }
   response.ok = true;
   return true;
@@ -411,6 +601,37 @@ static Response execute_axmodel(const Request& request) {
                         const std::chrono::steady_clock::time_point& started,
                         bool& device_failed) {
                       run_loaded(m, request, response, started, device_failed);
+                    });
+}
+
+// `run_resident` and `reset_state` on the model at `path`. Resident state is a
+// property of a cached model, so with --no-cache there is never any to use.
+static Response execute_resident(const Request& request, const std::string& path) {
+  Response refused;
+  refused.request_id = request.request_id;
+  if (!g_use_cache) {
+    refused.error = std::string(kStateLost) + ": this worker runs with --no-cache and keeps no model"
+                    " loaded; use the full-upload request forms";
+    return refused;
+  }
+  if (request.op == "reset_state") {
+    return with_model(request, path,
+                      [&](LoadedModel& m, Response& response,
+                          const std::chrono::steady_clock::time_point&, bool& device_failed) {
+                        if (!reset_state(m, response.error, device_failed)) return;
+                        response.manifest = "{\"schema_version\":1,\"state_id\":" +
+                                            std::to_string(m.state_id) + "}";
+                        response.artifact_id = request.artifact_id;
+                        response.ok = true;
+                      });
+  }
+  ResidentControl control;
+  if (!parse_resident_control(request.artifact, control, refused.error)) return refused;
+  return with_model(request, path,
+                    [&](LoadedModel& m, Response& response,
+                        const std::chrono::steady_clock::time_point& started,
+                        bool& device_failed) {
+                      run_loaded(m, request, response, started, device_failed, &control);
                     });
 }
 
@@ -509,13 +730,17 @@ static std::string capabilities_manifest() {
              "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\","
              "\"runner_id\":\"axcl-worker\",\"ready\":true,"
              "\"graph_execution\":false,"
-             "\"supported_ops\":[\"load_compiled\",\"run_compiled\",\"run\",\"io_info\",\"unload\"],"
+             "\"supported_ops\":[\"load_compiled\",\"run_compiled\",\"run\",\"io_info\",\"unload\","
+             "\"run_resident\",\"reset_state\"],"
              "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\",\"DOUBLE\","
              "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\",\"UINT32\",\"INT64\",\"UINT64\"],"
              "\"model_cache\":") +
          (g_use_cache ? "true" : "false") +
          ",\"max_loaded\":" + std::to_string(g_use_cache ? g_max_loaded : 0) +
          ",\"loaded\":" + std::to_string(g_models.size()) +
+         // Resident inputs need a model that stays loaded.
+         ",\"resident_state\":" + (g_use_cache ? "true" : "false") +
+         ",\"row_copy\":\"" + (g_row_copy_on_device ? "device" : "host") + "\"" +
          ",\"profiling\":true}";
 }
 
@@ -528,13 +753,16 @@ static Response execute_request(const Request& request) {
     response.manifest = capabilities_manifest();
     return response;
   }
-  if (request.op == "io_info" || request.op == "unload" || request.op == "run") {
+  if (request.op == "io_info" || request.op == "unload" || request.op == "run" ||
+      request.op == "run_resident" || request.op == "reset_state") {
     Response response;
     response.request_id = request.request_id;
     std::string path;
     if (!resolve_target(request, request.op == "unload", path, response.error))
       return response;
     if (request.op == "io_info") return io_info(request, path);
+    if (request.op == "run_resident" || request.op == "reset_state")
+      return execute_resident(request, path);
     if (request.op == "run") {
       // Same as sending the path as the op, without the op field's 128-byte limit.
       Request by_path = request;
@@ -587,16 +815,27 @@ int main(int argc, char** argv) {
       if (g_max_loaded == 0) { std::cerr << "--max-loaded must be at least 1 (use --no-cache)\n"; return 2; }
     }
     else if (std::string(argv[i]) == "--no-cache") g_use_cache = false;
+    else if (std::string(argv[i]) == "--row-copy" && i + 1 < argc) {
+      const std::string how = argv[++i];
+      if (how != "device" && how != "host") { std::cerr << "--row-copy takes device or host\n"; return 2; }
+      g_row_copy_on_device = how == "device";
+    }
     else if (std::string(argv[i]) == "--help") {
       std::cout << "usage: onnx-remote-axcl-worker [--port PORT]"
-                   " [--cache-dir DIR] [--max-loaded N] [--no-cache]\n"
+                   " [--cache-dir DIR] [--max-loaded N] [--no-cache] [--row-copy device|host]\n"
                    "  --max-loaded N  models kept loaded on the card, least recently used"
                    " evicted first (default 64)\n"
-                   "  --no-cache      load and unload the model on every request\n";
+                   "  --no-cache      load and unload the model on every request"
+                   " (no resident state)\n"
+                   "  --row-copy HOW  run_resident's row write-back: device (default,"
+                   " device-to-device)\n"
+                   "                  or host (through the worker's memory)\n";
       return 0;
     }
     else { std::cerr << "unknown argument: " << argv[i] << '\n'; return 2; }
   }
+  g_next_state_id = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count()) | 1u;
   std::signal(SIGPIPE, SIG_IGN);
   // No SA_RESTART: a blocked accept() returns EINTR so the loop can leave and
   // the loaded models are released before the process ends.

@@ -6,7 +6,9 @@
 //
 // It declares only what that file uses, with signatures written from the uses
 // in scripts/axera/vm/axcl_batch_runner.c (which is built against the real
-// SDK). There are no definitions: nothing can link against it, and the real
+// SDK; AXCL_MEMCPY_DEVICE_TO_DEVICE is used there) and, for axclrtMemset, in
+// scripts/axera/tools/bench_shape_group.c. There are no definitions: nothing
+// can link against it, and the real
 // build (-DONNX_REMOTE_AXCL=ON) never looks here -- it finds axcl.h through
 // AXCL_INCLUDE_DIR.
 #pragma once
@@ -29,7 +31,8 @@ typedef enum { AXCL_VNPU_DISABLE = 0 } axclrtEngineVNpuKind;
 typedef enum { AXCL_MEM_MALLOC_NORMAL_ONLY = 1 } axclrtMemMallocPolicy;
 typedef enum {
   AXCL_MEMCPY_HOST_TO_DEVICE = 1,
-  AXCL_MEMCPY_DEVICE_TO_HOST = 2
+  AXCL_MEMCPY_DEVICE_TO_HOST = 2,
+  AXCL_MEMCPY_DEVICE_TO_DEVICE = 3
 } axclrtMemcpyKind;
 typedef enum { AXCL_DATA_TYPE_NONE = 0 } axclrtEngineDataType;
 
@@ -49,6 +52,7 @@ axclError axclrtSetDevice(int32_t device);
 axclError axclrtMalloc(void** device_ptr, size_t size, axclrtMemMallocPolicy policy);
 axclError axclrtFree(void* device_ptr);
 axclError axclrtMemcpy(void* dst, const void* src, size_t count, axclrtMemcpyKind kind);
+axclError axclrtMemset(void* device_ptr, uint8_t value, size_t count);
 
 axclError axclrtEngineInit(axclrtEngineVNpuKind kind);
 axclError axclrtEngineFinalize(void);

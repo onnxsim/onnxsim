@@ -501,6 +501,15 @@ class FakeAxclWorker:
     is BFLOAT16 and `indices` UINT32. A tensor sent under any other dtype is refused, as
     remote_axcl_worker.cpp does. (On an AX8850 a default bf16 build reports every 16-bit
     tensor as BFLOAT16; sending bf16 bits under a FLOAT16 label gave infinities.)
+
+    `run_resident` / `reset_state` follow remote_axcl_worker.cpp: per model a state id and
+    the "device" input buffers (in the wire format, so fp16 for the caches); an input sent
+    empty keeps its buffer, a row write copies an output's bytes into an input at
+    slot * row bytes, an omitted output comes back empty, an old-form run or `drop()`
+    (an eviction) ends the state, and a request that refers to a state the model does not
+    hold is answered "resident state lost".
+
+    `traffic` records (op, tensor payload bytes received, tensor payload bytes sent).
     """
 
     def __init__(
@@ -508,9 +517,14 @@ class FakeAxclWorker:
         backend: loop.NumpyBackend,
         directory: str = "/models",
         files: loop.ModelFiles = FILES,
+        resident: bool = True,
     ):
         self.backend, self.spec = backend, backend.spec
         self.requests: list = []
+        self.traffic: list = []
+        self.resident = resident
+        self.state: dict = {}  # path -> (state id, {input name: device buffer})
+        self.next_state = 1000
         self.models = {path: i for i, path in enumerate(files.layer_paths(directory))}
         self.models[files.post_path(directory)] = None
         self.listener = socket.socket()
@@ -522,6 +536,13 @@ class FakeAxclWorker:
 
     def close(self):
         self.listener.close()
+
+    def drop(self, path=None):
+        """What an eviction, a reload or an `unload` does to resident state."""
+        if path is None:
+            self.state.clear()
+        else:
+            self.state.pop(path, None)
 
     @staticmethod
     def _dtype(name: str) -> int:
@@ -562,37 +583,14 @@ class FakeAxclWorker:
             }
         )
 
-    def _execute(self, request: rc.Request) -> rc.Response:
-        response = rc.Response(request_id=request.request_id)
-        if request.op == "capabilities":
-            response.manifest = json.dumps({"protocol": "onnx-remote-v5"})
-            return response
-        path = (
-            request.model.decode() if request.op in ("io_info", "run") else request.op
-        )
-        if path not in self.models:
-            response.ok, response.error = False, "AXCL model setup failed: " + path
-            return response
-        if request.op == "io_info":
-            response.manifest = self._io_info(path)
-            return response
-        index = self.models[path]
+    def _run_device(self, index, buffers: dict) -> dict:
+        """Execute on "device" buffers (wire format); outputs in the wire format too."""
         ins, outs = self._specs(index)
-        if len(request.inputs) != len(ins):
-            response.ok, response.error = False, "AXCL input count mismatch"
-            return response
         feeds = {}
-        for i, (array, dtype, (name, (np_dtype, shape))) in enumerate(
-            zip(request.inputs, request.dtypes, ins.items())
-        ):
-            if dtype != self._dtype(name):
-                response.ok = False
-                response.error = f"AXCL input {i} dtype mismatch: model wants ONNX dtype {self._dtype(name)}, request sent {dtype}"
-                return response
-            raw = np.frombuffer(array.tobytes(), np_dtype)
-            if (
-                dtype == rc.FLOAT16
-            ):  # the engine holds IEEE halves; the numpy layers take bf16
+        for name, (np_dtype, shape) in ins.items():
+            raw = np.frombuffer(buffers[name].tobytes(), np_dtype)
+            if self._dtype(name) == rc.FLOAT16:
+                # the engine holds IEEE halves; the numpy layers take bf16
                 raw = loop._fp16_to_bf16(raw)
             feeds[name] = raw.reshape(shape)
         result = (
@@ -600,12 +598,95 @@ class FakeAxclWorker:
             if index is None
             else self.backend.run_layer(index, feeds)
         )
-        response.outputs = [
-            loop._bf16_to_fp16(result[name]).reshape(result[name].shape)
+        return {
+            name: loop._bf16_to_fp16(result[name]).reshape(result[name].shape)
             if self._dtype(name) == rc.FLOAT16
             else result[name]
             for name in outs
-        ]
+        }
+
+    def _execute(self, request: rc.Request) -> rc.Response:
+        response = rc.Response(request_id=request.request_id)
+
+        def fail(message):
+            response.ok, response.error = False, message
+            return response
+
+        if request.op == "capabilities":
+            response.manifest = json.dumps(
+                {"protocol": "onnx-remote-v5", "resident_state": self.resident}
+            )
+            return response
+        by_model = ("io_info", "run", "run_resident", "reset_state")
+        path = request.model.decode() if request.op in by_model else request.op
+        if path not in self.models:
+            return fail("AXCL model setup failed: " + path)
+        if request.op == "io_info":
+            response.manifest = self._io_info(path)
+            return response
+        index = self.models[path]
+        ins, outs = self._specs(index)
+        if request.op == "reset_state":
+            self.state[path] = (
+                self.next_state,
+                {n: np.zeros(shape, dt) for n, (dt, shape) in ins.items()},
+            )
+            self.next_state += 1
+            response.manifest = json.dumps({"state_id": self.state[path][0]})
+            return response
+        resident = request.op == "run_resident"
+        if len(request.inputs) != len(ins):
+            return fail("AXCL input count mismatch")
+        uploads, kept = {}, []
+        for i, (array, dtype, (name, (np_dtype, shape))) in enumerate(
+            zip(request.inputs, request.dtypes, ins.items())
+        ):
+            if dtype != self._dtype(name):
+                return fail(
+                    f"AXCL input {i} dtype mismatch: model wants ONNX dtype {self._dtype(name)}, request sent {dtype}"
+                )
+            if resident and array.size == 0:
+                kept.append(name)
+                continue
+            if array.nbytes != int(np.prod(shape)) * np.dtype(np_dtype).itemsize:
+                return fail(f"AXCL input {i} must have the model's exact size")
+            uploads[name] = np.frombuffer(array.tobytes(), np_dtype).reshape(shape)
+        state, writes, omit = None, [], []
+        if resident:
+            state, writes, omit = rc.decode_resident_control(request.artifact)
+            in_names, out_names = list(ins), list(outs)
+            for o, i, slot in writes:
+                row = int(np.prod(outs[out_names[o]][1]))
+                if slot >= int(np.prod(ins[in_names[i]][1])) // row:
+                    return fail(
+                        f"AXCL resident control: output {o} is not a row of input {i} at slot {slot}"
+                    )
+            held = self.state.get(path, (0, None))[0]
+            if (state != held) if state is not None else bool(kept):
+                return fail(f"resident state lost: {path}; send every input in full")
+        if state is None:
+            self.state.pop(path, None)  # an old-form run, or a new state below
+            buffers = uploads
+        else:
+            buffers = self.state[path][1]
+            buffers.update(uploads)
+        result = self._run_device(index, buffers)
+        if resident:
+            for o, i, slot in writes:
+                row = result[out_names[o]].tobytes()
+                target = buffers[in_names[i]] = buffers[in_names[i]].copy()
+                view = target.reshape(-1).view(np.uint8)
+                view[slot * len(row) : (slot + 1) * len(row)] = np.frombuffer(
+                    row, np.uint8
+                )
+            if state is None:
+                self.state[path] = (self.next_state, dict(buffers))
+                self.next_state += 1
+            response.manifest = json.dumps({"state_id": self.state[path][0]})
+            for o in omit:
+                name = out_names[o]
+                result[name] = np.zeros((0,), result[name].dtype)
+        response.outputs = [result[name] for name in outs]
         response.dtypes = [self._dtype(name) for name in outs]
         return response
 
@@ -618,7 +699,15 @@ class FakeAxclWorker:
             with connection:
                 request = rc.receive_request(connection)
                 self.requests.append((request.op, list(request.dtypes)))
-                connection.sendall(rc.encode_response(self._execute(request)))
+                response = self._execute(request)
+                self.traffic.append(
+                    (
+                        request.op,
+                        sum(a.nbytes for a in request.inputs),
+                        sum(np.asarray(a).nbytes for a in response.outputs),
+                    )
+                )
+                connection.sendall(rc.encode_response(response))
 
 
 def test_rpc_backend_packs_from_io_info(model, spec):
@@ -631,7 +720,8 @@ def test_rpc_backend_packs_from_io_info(model, spec):
         assert info["inputs"][0]["bytes"] == CACHE_LEN * KV_DIM * 2
 
         # file names given (as from a local listing), sizes from the worker's io_info
-        backend = loop.RpcBackend(client, "/models", files=FILES)
+        # resident=False: the original request form, every tensor in every call
+        backend = loop.RpcBackend(client, "/models", files=FILES, resident=False)
         assert backend.spec == spec
         backend.preload()
         got = loop.decode(
@@ -951,6 +1041,18 @@ def test_cli_decodes_against_a_worker(arch, tmp_path, capsys):
         assert f"cache {CACHE_LEN} rows" in out and f"KV width {spec.kv_dim}" in out
         assert "identical to the float32 reference: True" in out
         assert "prefill (prompt, one token per step): %d tokens" % len(PROMPT) in out
+        # the worker advertises resident_state, so the caches stayed on it ...
+        assert "KV caches: resident on the worker" in out
+        resident_ops = {op for op, _ in worker.requests}
+        assert "run_resident" in resident_ops and "reset_state" in resident_ops
+        assert not any(op.endswith("_together.axmodel") for op in resident_ops)
+        # ... unless told otherwise; same tokens either way
+        del worker.requests[:]
+        assert run_llm_rpc.main([*common, "--prompt-ids", ids, "--no-resident-kv"]) == 0
+        out = capsys.readouterr().out
+        assert f"tokens {model.greedy(PROMPT, NEW_TOKENS)}" in out
+        assert "KV caches: sent in full with every layer call" in out
+        assert not {"run_resident", "reset_state"} & {op for op, _ in worker.requests}
         # names from a listing of a local copy of the directory
         for file_name in [*files.layer_names(), files.post_name, "build.log"]:
             (tmp_path / file_name).touch()
@@ -962,6 +1064,315 @@ def test_cli_decodes_against_a_worker(arch, tmp_path, capsys):
             run_llm_rpc.main([*common[:-1], str(CACHE_LEN), "--prompt-ids", ids])
         with pytest.raises(SystemExit, match="--prompt-ids"):
             run_llm_rpc.main([*common, "--prompt", "hi"])
+    finally:
+        worker.close()
+
+
+# ---- KV caches resident on the worker ---------------------------------------------------------
+
+
+def _layer_call_bytes(spec: loop.IOSpec, resident: bool) -> tuple:
+    """(sent, received) tensor payload bytes of one layer call."""
+    small = 4 + 2 * spec.hidden + 2 * (spec.cache_len + 1)  # indices, input, mask
+    caches = 2 * spec.cache_len * spec.kv_dim * 2
+    rows = 2 * spec.kv_dim * 2
+    if resident:
+        return small, 2 * spec.hidden
+    return small + caches, 2 * spec.hidden + rows
+
+
+def _stepwise(host, backend, before_step=None) -> list:
+    """decode() spelled out, with a hook before every fed token."""
+    host.reset()
+    logits, out = None, []
+    for i, token in enumerate(PROMPT):
+        if before_step:
+            before_step(host.pos)
+        logits, _ = host.step(token, backend, want_logits=i == len(PROMPT) - 1)
+    for i in range(NEW_TOKENS):
+        out.append(loop.argmax_bf16(logits))
+        if i == NEW_TOKENS - 1:
+            break
+        if before_step:
+            before_step(host.pos)
+        logits, _ = host.step(out[-1], backend)
+    return out
+
+
+def _resident_matches_full_upload(model, spec, files, directory):
+    worker = FakeAxclWorker(loop.NumpyBackend(model, spec), directory, files)
+    try:
+        client = rc.Client("127.0.0.1", worker.port, io_timeout=30)
+        want = model.greedy(PROMPT, NEW_TOKENS)
+        fed = len(PROMPT) + NEW_TOKENS - 1
+
+        full = loop.RpcBackend(client, directory, files=files, resident=False)
+        full_host = loop.Host.from_model(model, spec)
+        assert loop.decode(PROMPT, NEW_TOKENS, full, host=full_host) == want
+        assert full_host.host_rows == fed and full_host.K[:, 0, :fed].any()
+
+        # the default: on, because the worker's capabilities say so
+        backend = loop.RpcBackend(client, directory, files=files)
+        assert backend.resident and backend.spec == spec
+        host = loop.Host.from_model(model, spec)
+        del worker.requests[:], worker.traffic[:]
+        assert loop.decode(PROMPT, NEW_TOKENS, backend, host=host) == want
+        ops = [op for op, _ in worker.requests]
+        assert ops.count("reset_state") == LAYERS  # once, at position 0
+        assert ops.count("run_resident") == fed * LAYERS
+        assert not any(op.endswith("_together.axmodel") for op in ops)
+        assert host.recoveries == 0 and backend.resident_losses == 0
+        assert [backend.held_rows(i) for i in range(LAYERS)] == [fed] * LAYERS
+        # the host got no K/V rows: its arrays are not the caches any more
+        assert host.host_rows == 0 and not host.K.any() and not host.V.any()
+
+        # bytes per layer call: indices + input + mask out, the hidden state back
+        sent, received = _layer_call_bytes(spec, resident=True)
+        full_sent, full_received = _layer_call_bytes(spec, resident=False)
+        calls = [t for t in worker.traffic if t[0] == "run_resident"]
+        assert set(calls) == {("run_resident", sent, received)}
+        post = (2 * spec.hidden, 2 * spec.vocab)
+        assert backend.bytes_sent == fed * LAYERS * sent + NEW_TOKENS * post[0]
+        assert backend.bytes_received == fed * LAYERS * received + NEW_TOKENS * post[1]
+        assert full.bytes_sent == fed * LAYERS * full_sent + NEW_TOKENS * post[0]
+        assert (
+            full.bytes_received == fed * LAYERS * full_received + NEW_TOKENS * post[1]
+        )
+        assert full_sent - sent == 2 * spec.cache_len * spec.kv_dim * 2
+
+        # rows on request: the host's copy is then the full-upload path's, bit for bit
+        mirrored = loop.Host.from_model(model, spec)
+        mirrored.mirror_kv = True
+        assert loop.decode(PROMPT, NEW_TOKENS, backend, host=mirrored) == want
+        assert mirrored.host_rows == fed
+        assert (mirrored.K == full_host.K).all() and (mirrored.V == full_host.V).all()
+        # and the worker's buffers hold the same rows, in the device's format (fp16 here)
+        _, buffers = worker.state[files.layer_paths(directory)[LAYERS - 1]]
+        assert (
+            loop._fp16_to_bf16(buffers["K_cache"]).reshape(full_host.K[-1].shape)
+            == full_host.K[-1]
+        ).all()
+    finally:
+        worker.close()
+
+
+def test_resident_decode_matches_full_upload(model, spec):
+    _resident_matches_full_upload(model, spec, FILES, "/models")
+
+
+def test_resident_decode_matches_full_upload_architectures(arch):
+    _, _, model = arch
+    spec = loop.IOSpec.from_model(model, CACHE_LEN)
+    files = loop.ModelFiles(model.model_type, 128, LAYERS)
+    _resident_matches_full_upload(model, spec, files, "/root/m/out")
+
+
+def test_resident_state_lost_falls_back_to_full_upload(model, spec):
+    worker = FakeAxclWorker(loop.NumpyBackend(model, spec))
+    paths = FILES.layer_paths("/models")
+    try:
+        client = rc.Client("127.0.0.1", worker.port, io_timeout=30)
+        want = model.greedy(PROMPT, NEW_TOKENS)
+        lost_at = 3
+
+        def evict_once(pos):
+            if pos == lost_at:
+                worker.drop(paths[1])  # layer 1 evicted; layer 0 still holds its state
+
+        # no host copy of the rows: the tokens so far are fed again in full, then the
+        # caches go up once and the decode is resident again
+        backend = loop.RpcBackend(client, "/models", files=FILES)
+        host = loop.Host.from_model(model, spec)
+        del worker.traffic[:]
+        assert _stepwise(host, backend, evict_once) == want
+        assert (
+            host.recoveries == 1 and backend.resident_losses == 1 and backend.resident
+        )
+        replayed = [t for t in worker.traffic if t[0].endswith("_together.axmodel")]
+        assert len(replayed) == lost_at * LAYERS
+        uploads = [
+            t
+            for t in worker.traffic
+            if t[0] == "run_resident"
+            and t[1] == _layer_call_bytes(spec, resident=False)[0]
+        ]
+        assert (
+            len(uploads) == LAYERS
+        )  # every layer once, at the token that hit the loss
+        fed = len(PROMPT) + NEW_TOKENS - 1
+        assert [backend.held_rows(i) for i in range(LAYERS)] == [fed] * LAYERS
+
+        # with the rows mirrored on the host nothing is recomputed, only uploaded
+        backend = loop.RpcBackend(client, "/models", files=FILES)
+        host = loop.Host.from_model(model, spec)
+        host.mirror_kv = True
+        del worker.traffic[:]
+        assert _stepwise(host, backend, evict_once) == want
+        assert host.recoveries == 1 and backend.resident
+        assert not any(t[0].endswith("_together.axmodel") for t in worker.traffic)
+
+        # a worker that loses the state before every token: resident mode is given up
+        # after max_resident_losses and the rest runs with full uploads, same tokens
+        thrash = loop.RpcBackend(client, "/models", files=FILES, max_resident_losses=2)
+        host = loop.Host.from_model(model, spec)
+        assert _stepwise(host, thrash, lambda pos: worker.drop()) == want
+        assert not thrash.resident and thrash.resident_losses == 2
+        assert host.host_rows == host.pos  # the host owns the caches again
+
+        # two hosts on one backend: the second conversation's reset is noticed by the first
+        backend = loop.RpcBackend(client, "/models", files=FILES)
+        first, second = (loop.Host.from_model(model, spec) for _ in range(2))
+        for token in PROMPT[:2]:
+            first.step(token, backend, want_logits=False)
+        for token in PROMPT[:2]:
+            second.step(token, backend, want_logits=False)  # also two rows per layer
+        a, _ = first.step(PROMPT[2], backend)
+        assert first.recoveries == 1
+        reference = loop.Host.from_model(model, spec)
+        full = loop.RpcBackend(client, "/models", files=FILES, resident=False)
+        for token in PROMPT[:3]:
+            b, _ = reference.step(token, full)
+        assert (a == b).all()
+    finally:
+        worker.close()
+
+
+def test_resident_request_form_and_old_form(model, spec):
+    worker = FakeAxclWorker(loop.NumpyBackend(model, spec))
+    path = FILES.layer_paths("/models")[0]
+    try:
+        client = rc.Client("127.0.0.1", worker.port, io_timeout=30)
+        other = rc.Client("127.0.0.1", worker.port, io_timeout=30)
+        assert client.capabilities()["resident_state"] is True
+        rng = np.random.default_rng(5)
+        # caches as the device holds them (fp16), the first two rows in use
+        caches = np.zeros((2, 1, CACHE_LEN, KV_DIM), "<f2")
+        caches[:, :, :2] = rng.standard_normal((2, 1, 2, KV_DIM)) * 0.5
+        hidden = rng.standard_normal((1, 1, HIDDEN)).astype("<f2")
+        pos = 2
+        mask = loop.Host(model.E, spec).build_mask(pos)
+        f16, bf16 = rc.FLOAT16, rc.BFLOAT16
+        small = [
+            np.array([[pos]], "<u4"),
+            rc.Tensor(f16, hidden),
+            rc.Tensor(bf16, mask),
+        ]
+        full = [rc.Tensor(f16, caches[0]), rc.Tensor(f16, caches[1]), *small]
+        kept = [rc.keep(f16), rc.keep(f16), *small]
+
+        old = client.request(path, full)  # the original form: path as the op
+        assert [o.shape for o in old.outputs] == [
+            (1, 1, KV_DIM),
+            (1, 1, KV_DIM),
+            (1, 1, HIDDEN),
+        ]
+        assert old.manifest == "" and path not in worker.state
+
+        # establishing a state: every input in full, no state id; rows written, K/V omitted
+        writes = [(0, 0, pos), (1, 1, pos)]
+        seeded = client.run_resident(path, full, writes=writes, omit=[0, 1])
+        state = rc.resident_state_id(seeded)
+        assert [o.size for o in seeded.outputs] == [0, 0, HIDDEN]
+        assert seeded.dtypes == [f16, f16, f16]
+        assert seeded.outputs[2].tobytes() == old.outputs[2].tobytes()
+        device = worker.state[path][1]
+        assert device["K_cache"][0, pos].tobytes() == old.outputs[0].tobytes()
+        assert device["V_cache"][0, pos].tobytes() == old.outputs[1].tobytes()
+        assert device["K_cache"][0, :pos].tobytes() == caches[0][0, :pos].tobytes()
+        assert not device["K_cache"][0, pos + 1 :].any()
+
+        # continuing it: nothing sent for the caches; the rows on request
+        small[0] = np.array([[pos + 1]], "<u4")
+        small[2] = rc.Tensor(bf16, loop.Host(model.E, spec).build_mask(pos + 1))
+        kept = [rc.keep(f16), rc.keep(f16), *small]
+        again = client.run_resident(
+            path, kept, state=state, writes=[(0, 0, pos + 1), (1, 1, pos + 1)]
+        )
+        assert rc.resident_state_id(again) == state
+        assert [o.size for o in again.outputs] == [KV_DIM, KV_DIM, HIDDEN]
+        expected = caches.copy()
+        expected[0, 0, pos] = old.outputs[0][0, 0]
+        expected[1, 0, pos] = old.outputs[1][0, 0]
+        check = client.request(
+            path, [rc.Tensor(f16, expected[0]), rc.Tensor(f16, expected[1]), *small]
+        )
+        for got, want in zip(again.outputs, check.outputs):
+            assert got.tobytes() == want.tobytes()
+
+        # that old-form run overwrote the model's inputs: the state is gone, and said so
+        with pytest.raises(rc.ResidentStateLost, match="resident state lost"):
+            client.run_resident(path, kept, state=state)
+        assert issubclass(rc.ResidentStateLost, rc.RemoteError)
+        with pytest.raises(rc.ResidentStateLost):  # a kept input needs a state id
+            client.run_resident(path, kept)
+
+        # reset: zero-filled buffers and a fresh id; another client's reset takes it over
+        mine = client.reset_state(path)
+        assert not worker.state[path][1]["K_cache"].any()
+        first = [np.array([[0]], "<u4"), small[1], rc.Tensor(bf16, mask)]
+        client.run_resident(path, [rc.keep(f16), rc.keep(f16), *first], state=mine)
+        theirs = other.reset_state(path)
+        assert theirs != mine
+        with pytest.raises(rc.ResidentStateLost):
+            client.run_resident(path, [rc.keep(f16), rc.keep(f16), *first], state=mine)
+        other.run_resident(path, [rc.keep(f16), rc.keep(f16), *first], state=theirs)
+
+        # an eviction (or unload, or a changed file) drops it too
+        worker.drop(path)
+        with pytest.raises(rc.ResidentStateLost):
+            other.run_resident(path, [rc.keep(f16), rc.keep(f16), *first], state=theirs)
+        # a malformed request is an ordinary error, not a lost state
+        state = client.reset_state(path)
+        with pytest.raises(rc.RemoteError, match="not a row of input") as error:
+            client.run_resident(
+                path,
+                [rc.keep(f16), rc.keep(f16), *first],
+                state=state,
+                writes=[(0, 0, CACHE_LEN)],
+            )
+        assert not isinstance(error.value, rc.ResidentStateLost)
+
+        # the control text
+        control = rc.encode_resident_control(7, [(0, 0, 3), (1, 1, 3)], [0, 1])
+        assert control == b"state 7\nwrite 0 0 3\nwrite 1 1 3\nomit 0\nomit 1\n"
+        assert rc.decode_resident_control(control) == (
+            7,
+            [(0, 0, 3), (1, 1, 3)],
+            [0, 1],
+        )
+        assert rc.decode_resident_control(b"") == (None, [], [])
+        with pytest.raises(rc.ProtocolError, match="bad resident control"):
+            rc.decode_resident_control(b"write 0 0\n")
+        # the wire format did not change: an empty tensor is an ordinary tensor
+        payload = rc.encode_request_payload(
+            "run_resident", kept, model=path.encode(), artifact=control
+        )
+        decoded = rc.decode_request_payload(payload)
+        assert decoded.artifact == control and decoded.inputs[0].size == 0
+        assert decoded.dtypes[:2] == [f16, f16]
+    finally:
+        worker.close()
+
+
+def test_diagnostics_set_the_caches_explicitly(model, spec):
+    # compare_layers gives every call the reference's cache: full uploads, on a backend
+    # that otherwise keeps the caches on the worker; a decode afterwards starts clean
+    worker = FakeAxclWorker(loop.NumpyBackend(model, spec))
+    try:
+        client = rc.Client("127.0.0.1", worker.port, io_timeout=30)
+        backend = loop.RpcBackend(client, "/models", files=FILES)
+        host = loop.Host.from_model(model, spec)
+        want = model.greedy(PROMPT, NEW_TOKENS)
+        assert loop.decode(PROMPT, NEW_TOKENS, backend, host=host) == want
+        del worker.requests[:]
+        layers = loop.compare_layers(PROMPT, backend, model, verbose=False)
+        assert max(layers[k].max() for k in ("output", "V", "K_rot")) < 0.02
+        ops = [op for op, _ in worker.requests]
+        assert "run_resident" not in ops and len(ops) == len(PROMPT) * LAYERS
+        assert backend.held_rows(0) is None and not worker.state
+        free = loop.compare_decode(PROMPT, NEW_TOKENS, backend, model, verbose=False)
+        assert free["tokens"] == want and free["first_divergence"] is None
+        assert backend.resident and backend.resident_losses == 0
     finally:
         worker.close()
 
