@@ -1474,3 +1474,28 @@ def test_chat_templates(tmp_path):
                 assert jinja(template, "hi", system_text, thinking) == by_hand(
                     template, "hi", system_text, thinking
                 ), (template, system_text, thinking)
+
+
+def test_sharded_checkpoint_loads_like_a_single_file(checkpoint, model, tmp_path):
+    # Larger checkpoints ship as model-0000i-of-0000n.safetensors plus an index.
+    tensors = ref.read_safetensors(os.path.join(checkpoint, "model.safetensors"))
+    names = sorted(tensors)
+    half = len(names) // 2
+    shards = {
+        "model-00001-of-00002.safetensors": names[:half],
+        "model-00002-of-00002.safetensors": names[half:],
+    }
+    for filename, members in shards.items():
+        write_safetensors(
+            str(tmp_path / filename), {name: tensors[name] for name in members}
+        )
+    weight_map = {name: f for f, members in shards.items() for name in members}
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump({"metadata": {}, "weight_map": weight_map}, f)
+    with open(os.path.join(checkpoint, "config.json")) as src:
+        (tmp_path / "config.json").write_text(src.read())
+    sharded = ref.Model.load(str(tmp_path))
+    prompt = [1, 5, 9, 3]
+    assert sharded.greedy(prompt, 8) == model.greedy(prompt, 8)
+    with pytest.raises(FileNotFoundError):
+        ref.open_checkpoint_weights(str(tmp_path / "missing"))

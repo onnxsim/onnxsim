@@ -113,6 +113,48 @@ class SafeTensors:
         return widen(self.raw(name), self.kind(name))
 
 
+class _ShardedWeights:
+    """The same interface over several .safetensors files (a checkpoint split
+    into ``model-0000i-of-0000n.safetensors`` shards)."""
+
+    def __init__(self, shards: list):
+        self._shards = shards
+        self._where = {name: st for st in shards for name in st.keys()}
+
+    def __contains__(self, name):
+        return name in self._where
+
+    def keys(self):
+        return self._where.keys()
+
+    def kind(self, name):
+        return self._where[name].kind(name)
+
+    def raw(self, name):
+        return self._where[name].raw(name)
+
+    def f32(self, name):
+        return self._where[name].f32(name)
+
+
+def open_checkpoint_weights(checkpoint_dir: str):
+    """The checkpoint's weights, memory-mapped: ``model.safetensors``, or the
+    shards named by ``model.safetensors.index.json``."""
+    single = os.path.join(checkpoint_dir, "model.safetensors")
+    if os.path.exists(single):
+        return SafeTensors(single)
+    index = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        raise FileNotFoundError(
+            f"{checkpoint_dir}: neither model.safetensors nor model.safetensors.index.json"
+        )
+    with open(index) as f:
+        files = sorted(set(json.load(f)["weight_map"].values()))
+    return _ShardedWeights(
+        [SafeTensors(os.path.join(checkpoint_dir, name)) for name in files]
+    )
+
+
 class _DictWeights:
     """The same interface over a plain {name: float32 array} dict."""
 
@@ -279,7 +321,7 @@ class Model:
             cfg = json.load(f)
         m = cls(
             cfg,
-            SafeTensors(os.path.join(checkpoint_dir, "model.safetensors")),
+            open_checkpoint_weights(checkpoint_dir),
             cache_bytes,
         )
         # generation_config.json may list more stop tokens than config.json (qwen3: <|im_end|>, <|endoftext|>).

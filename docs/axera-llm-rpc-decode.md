@@ -391,6 +391,21 @@ prompt "What is the capital of France?":
 - 224 ms per fed token (213.7 ms in the 28 layer calls, 10.5 ms in the post model), 4.5
   tokens/s for prefill and decode alike.
 
+### Qwen3-1.7B on the device
+
+Unquantized checkpoint from the Hub (hidden 2048, 28 layers; weights in two safetensors
+shards, which the reference now reads through `model.safetensors.index.json`). Compiled
+with `pulsar2 llm_build --prefill_len 128 --kv_cache_len 255` in 29 minutes: 28 layers + post,
+1.8 GB. The VM's disk cannot hold it, so the worker reads it from the VM's shared folder.
+Run over RPC with resident K/V caches, `--chat`, thinking off:
+
+- "What is the capital of France?": `The capital of France is Paris.<|im_end|>`, identical to
+  the float32 reference; hidden-state error 4% after layer 1, about 10% from layer 17 on.
+- "Write one sentence about the ocean.": a fluent 28-token sentence ending at the end-of-turn
+  token (run without the reference).
+- 170 ms per decoded token (5.9 tokens/s): 150 ms in the 28 layer calls, 12 ms in the post
+  model. The 29 models load in 34 s and use 1.9 GB of the card's 7 GB.
+
 ### llama-160m on the device
 
 Compiled the same way (12 layers + post, 124 s, 151 MB). The checkpoint has no tokenizer,
