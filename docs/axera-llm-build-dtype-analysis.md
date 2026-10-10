@@ -10,6 +10,9 @@
 - The decode and prefill subgraphs share a single weight table. We found no
   duplicated copies.
 
+Everything here was derived on a tiny 256-hidden model. Real checkpoints differ
+in four places, listed under [On real models](#on-real-models).
+
 `scripts/axera/llm_build_dtype_analysis.py` holds byte-exact encoders and
 decoders for all six types. `tests/test_axera_llm_build_dtype_analysis.py`
 checks them against ~136 KB of committed slices of our builds, with no Docker,
@@ -59,17 +62,23 @@ With `intermediate_size=2048` the figures are s8 1.167, s4 0.601 and bf16
 ### Details that apply to more than one type
 
 - **Scale.** There is one float32 scale per output row and no k-groups. It is
-  positive when the row's largest-magnitude weight is negative.
+  positive when the row's largest-magnitude weight is negative. (The Qwen3-0.6B
+  s4 build uses another rule, see [On real models](#on-real-models).)
 - **s4 accuracy.** The s4 quantizer matches every code in both builds.
 - **s8 accuracy.** The s8 quantizer misses 3 of 557,056 codes, and 10 of
   1,736,704 in the wide build. Every miss has `w/s` within 4e-6 of a .5 tie,
   and each time the compiler's code is one higher than ours. Its ratio
   arithmetic differs from float32 `w/s` in the last few ulps, and we have
   not identified how.
-- **Column blocks (s8 and s4).** When `cin > 544`, each 32-row block is split
-  into 544-wide column blocks. The first column block takes the remainder:
-  2048 gives 416+544×3, and 4096 gives 288+544×7, matching the s8 split
-  recorded in the README. Each column block is encoded like a whole matrix
+- **Column blocks (s8 and s4).** Each 32-row block is split by columns. The
+  first column block holds up to 576 columns (16 chunks of 36) and every later
+  one exactly 544, with as few 544-wide blocks as leave the first at most 576
+  wide: `n = max(0, ceil((cin - 576) / 544))`, widths `cin - 544 n` then `n`
+  times 544. So 2048 gives 416+544×3, and 4096 gives 288+544×7, matching the
+  s8 split recorded in the README. The real models add 576 (one block), 1024
+  (480+544), 1536 (448+544×2) and 3072 (352+544×5). An earlier version of
+  this doc said "split once `cin > 544`"; that fits everything except 576,
+  where it would give 32+544. Each column block is encoded like a whole matrix
   of its width, with its own tail. That tail repeats the full row's scale
   and carries the row sum over only its own columns. Float types are never
   split (bf16 at `cin=2048` is one block).
@@ -112,10 +121,38 @@ against our builds.
 | H3 | ~40% of the bytes are duplicated decode/prefill copies | **Not reproduced.** Both subgraphs name the same `npu_params` (`const_data_key`). Every weight block appears exactly once, and non-overlap is checked in the test. Everything outside the weights is 2.6% (s8), 4.9% (s4) or 0.8% (float) of the table. llm_build actively deduplicates identical blocks. |
 | H4 | 36 unexplained metadata bytes per 72-byte unit | **Refuted.** In s8 a 72-byte unit is row `r`'s two planes followed by row `r+16`'s two planes, so the "metadata" half is another row's weights. The test decodes it as row 16. |
 
+## On real models
+
+Found later on the s4 builds of SmolLM2-135M (hidden 576) and Qwen3-0.6B
+(hidden 1024), and used by `scripts/axera/llm_int4_requant.py`. Details and the
+byte map of a whole layer file are in `docs/axera-llm-int4-requant.md`.
+
+- **Quantizer.** SmolLM2's build uses the rule above. 3,535 of its
+  106,168,320 s4 codes differ from `quantize_int`: each is an exact .5 tie
+  that the compiler rounded down, and its tie rule is not identified.
+  **Qwen3's build uses a different rule**: `s = max|w| / 7`, always positive,
+  `q = rint(w / s)` (half to even), codes in [-7, 7]. That matches all
+  440,401,920 codes, and every scale bit for bit. We do not know what selects
+  the rule. `llm_int4_requant.quantize_plain` has both.
+- **Column blocks.** `cin = 576` is a single block; `column_blocks()` was
+  corrected (see above).
+- **Row blocks.** SmolLM2's `q_proj`, `k_proj` and `v_proj` are stored in
+  blocks of **64 rows**, not 32. A 72-byte unit holds chunk `c` of rows `2k`,
+  `2k+1`, `2k+32`, `2k+33`; the tail is 64 row sums, 256 zero bytes, 64
+  scales. Its other four Linears, and all seven on Qwen3, use 32 rows. The
+  encoders in `llm_build_dtype_analysis.py` cover 32 rows only;
+  `llm_int4_requant.py` covers both.
+- **Post model.** It is s8 whatever `--weight_type` says: the `npu_params` of
+  the s4 and s8 builds' post models are byte-identical, on both models.
+  `lm_head` is stored in the s8 layout above. On Qwen3 its quantizer is
+  `s = max|w| / 127`, `q = rint(w / s)`.
+- **Embedding.** It is in no compiled file. The host looks it up from the
+  checkpoint.
+
 ## Not covered
 
-- Real checkpoints and hidden sizes above 256. Column blocks are confirmed at
-  `cin = 2048` here and at 4096 for s8 in the README.
+- Hidden sizes whose `cin mod 544` is between 1 and 31: the column-block rule
+  has not been tested there.
+- What selects the quantizer rule and the 64-row blocks.
 - Activation dtypes other than `--hidden_state_type bf16`.
-- The embedding and `post` models.
 - Any on-device run. This task did no device work.

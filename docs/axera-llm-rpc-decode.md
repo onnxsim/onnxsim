@@ -458,6 +458,12 @@ prompts.
 One or two prompts per model. Nothing here measures accuracy; the SmolLM2 `s4` and
 `fp8_e4m3` rows are a single divergence at a near-tie, the Qwen3 `s4` rows are not.
 
+The `s4` weights can be improved without recompiling: `scripts/axera/llm_int4_requant.py`
+rewrites the int4 codes inside the compiled layer files with activation-aware (GPTQ) ones.
+On eight Qwen3-0.6B prompts on the device plain `s4` was wrong or degenerate on all eight
+and the patched model gave one wrong answer; it is still below `s8`. See
+`docs/axera-llm-int4-requant.md`.
+
 The worker binary used for these runs is the one built in the VM against the real AXCL SDK,
 before resident KV caches existed: every number above is the full-upload path's.
 

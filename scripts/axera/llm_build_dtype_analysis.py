@@ -25,6 +25,14 @@ block the byte layout is as follows:
 Byte-identical 32-row blocks are stored only once (``dedup_blocks``). The
 decode and prefill subgraphs share a single ``npu_params``.
 
+Everything above was derived on the tiny 256-hidden model. Three things differ
+on real models and are handled in ``llm_int4_requant.py`` (see
+``docs/axera-llm-int4-requant.md``): the Qwen3-0.6B s4 build uses another
+quantizer (``scale = max|w| / 7``, round half to even, codes in [-7, 7]);
+SmolLM2-135M's q/k/v are stored in blocks of 64 rows, not 32; and the ``post``
+model is s8 whatever ``--weight_type`` says. ``column_blocks`` below already
+has the rule that fits the real widths.
+
 Usage::
 
     python llm_build_dtype_analysis.py CHECKPOINT_DIR OUT_DIR:WEIGHT_TYPE ...
@@ -47,7 +55,8 @@ IMAGE = "pulsar2:7.0-lite"  # every build in the doc used this image
 ROW_BLOCK = 32
 CHUNK = 18  # bytes of one nibble plane per 36-column chunk
 CHUNK_COLS = 2 * CHUNK
-COL_BLOCK = 544  # s8/s4 column-block width once cin > 544
+COL_BLOCK = 544  # s8/s4 width of every column block after the first
+FIRST_COL_BLOCK = 576  # the first column block holds up to 16 chunks of 36
 WEIGHT_TYPES = ("s4", "s8", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2")
 FLOAT_TYPES = ("fp16", "bf16", "fp8_e4m3", "fp8_e5m2")
 PROJECTIONS = (
@@ -182,15 +191,23 @@ def _int_tail(q: np.ndarray, scale: np.ndarray, sum_stride: int) -> bytes:
 def column_blocks(cin: int) -> list[int]:
     """Widths of the column blocks an s8/s4 weight is split into.
 
-    The blocks are ``COL_BLOCK`` wide, except the first, which takes the
-    remainder: 2048 gives 416, 544, 544, 544, and 4096 gives 288 then seven
-    544s (the README's "The LLM layout at 4096 hidden"). ``cin <= 544`` is a
-    single block. Each block is laid out as though it were a whole matrix of
-    its own width, with its own tail. The tail repeats the full row's scale,
-    and its row sums cover only that block's columns. Float types are never
-    split."""
-    n, first = divmod(cin, COL_BLOCK)
-    return ([first] if first else []) + [COL_BLOCK] * n
+    The first block holds up to ``FIRST_COL_BLOCK`` (576, i.e. 16 chunks of
+    36) columns and every later block exactly ``COL_BLOCK`` (544). There are
+    as few 544-wide blocks as leave the first one at most 576 wide, so the
+    first block takes the remainder: 576 is a single block, 1024 gives 480,
+    544, 1536 gives 448, 544, 544, 2048 gives 416, 544, 544, 544, 3072 gives
+    352 then five 544s, and 4096 gives 288 then seven 544s (the README's "The
+    LLM layout at 4096 hidden"). Observed at exactly those widths plus the
+    single blocks 256 and 512. ``cin = 576`` (SmolLM2-135M) is the only one
+    that separates this rule from "split once ``cin > 544``", which was the
+    rule here before and would give 32, 544. No width with ``cin % 544`` in
+    1..31 has been built.
+
+    Each block is laid out as though it were a whole matrix of its own width,
+    with its own tail. The tail repeats the full row's scale, and its row sums
+    cover only that block's columns. Float types are never split."""
+    n = max(0, -(-(cin - FIRST_COL_BLOCK) // COL_BLOCK))
+    return [cin - n * COL_BLOCK] + [COL_BLOCK] * n
 
 
 def _int_offsets(weight_type: str, width: int) -> tuple[np.ndarray, np.ndarray]:
