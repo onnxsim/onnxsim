@@ -39,11 +39,18 @@ Backends (anything with `run_layer` / `run_post`):
   DeviceBackend  two user callables, load(path) / run(handle, arrays)
   RpcBackend     an onnx-remote AXCL worker; tensors are packed from its `io_info`
 
+Resident KV caches: with a worker that advertises `resident_state`, RpcBackend
+keeps each layer's K_cache / V_cache in the worker's device buffers. A decode
+step then sends `indices`, `input` and `mask` and gets `output` back; the
+worker writes the token's K/V rows into the caches itself. `Host.K` / `Host.V`
+are then not kept up to date (see `Host`).
+
 See docs/axera-llm-rpc-decode.md.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -79,6 +86,18 @@ _ONNX_ITEMSIZE = {
 # Additive mask value for "do not attend". -65536.0 is exactly representable
 # in bf16 (bits 0xC780). 0.0 (bits 0x0000) means "attend".
 MASK_NEG = -65536.0
+
+
+class ResidentStateLost(RuntimeError):
+    """The worker does not hold the K/V caches the host expected it to hold. `Host.step`
+    answers it by rebuilding the caches and uploading them in full."""
+
+
+def _is_state_lost(error: BaseException) -> bool:
+    # onnx_remote_client.ResidentStateLost, without importing the client here.
+    return isinstance(error, ResidentStateLost) or str(error).startswith(
+        "resident state lost"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -617,13 +636,45 @@ class RpcBackend:
     Without `spec`, the sizes are taken from the worker's `io_info` of the
     first layer and of the post model.
 
-    The K/V caches are the bulk of every layer call (2 x S x D bf16, re-sent
-    in full for each layer of each token: the protocol has no persistent
-    tensors). This class adds no copy of them: the host's cache array is
-    handed to the client as it is, and the client writes it to the socket
-    from its own memory.
+    The K/V caches are the bulk of a full layer call (2 x S x D bf16). Two
+    ways to run a layer:
 
-    `layer_seconds` / `post_seconds` accumulate the wall time of the worker calls.
+    - `run_layer(i, feeds)`: the original request form. Both caches are sent
+      in full and the token's K/V rows come back. This class adds no copy of
+      them: the host's cache array is handed to the client as it is, and the
+      client writes it to the socket from its own memory.
+    - `run_layer_resident(i, feeds, conversation)`: the caches stay in the
+      worker's device buffers (`run_resident`, see the README's AXCL worker
+      section). `feeds` holds `indices`, `input` and `mask`; the worker
+      writes the K/V rows into slot `indices` of its caches and returns only
+      `output` (plus the rows with `want_kv=True`). Passing `K_cache` and
+      `V_cache` in `feeds` as well uploads them and establishes the state
+      anew. `resident` says whether this form is in use: by default it is
+      when the worker's `capabilities` advertise `resident_state`;
+      `resident=False` turns it off.
+
+    The backend tracks, per layer, the worker's state id and how many cache
+    rows the worker holds; `run_layer_resident` raises `ResidentStateLost`
+    when that is not exactly the rows before `indices`, when the request
+    comes from another conversation than the one that filled the caches
+    (`reset_state()` / `new_conversation()` return the token), or when the
+    worker reports the state gone (model evicted, reloaded, unloaded, run in
+    full, or reset by another client). `Host.step` recovers from it. After
+    `max_resident_losses` (3) losses with fewer than 16 tokens' worth of clean
+    resident calls in between, the backend stops using the resident form (a
+    worker that cannot keep all the layers loaded would lose it on every
+    token, and each recovery costs a replay). `run_layer` on a layer ends the
+    worker's state for that layer, which is how the diagnostics set a cache
+    explicitly.
+
+    A row written on the worker never leaves the device's format: with an
+    fp16 hidden state (`--hidden_state_type fp16`) it stays an IEEE half,
+    where the full-upload path stores it on the host as bf16 (fewer mantissa
+    bits) and converts it back on every call.
+
+    `layer_seconds` / `post_seconds` accumulate the wall time of the worker
+    calls; `bytes_sent` / `bytes_received` the tensor payload bytes of the
+    layer and post calls (without message framing).
     """
 
     def __init__(
@@ -637,11 +688,22 @@ class RpcBackend:
         files: Optional[ModelFiles] = None,
         num_layers: Optional[int] = None,
         prefixes: Sequence[str] = (),
+        resident: Optional[bool] = None,
+        max_resident_losses: int = 3,
     ):
         self.client = client
         self._info: dict = {}
         self.calls = 0
         self.layer_seconds = self.post_seconds = 0.0
+        self.bytes_sent = self.bytes_received = 0
+        if resident is None:
+            resident = self._worker_keeps_state()
+        self.resident = bool(resident)
+        self.resident_losses = 0
+        self.max_resident_losses = max_resident_losses
+        self._clean_calls = 0  # resident calls without an upload since the last loss
+        self._held: dict = {}  # layer index -> [worker state id, cache rows held]
+        self._conversation = 0
         if layer_paths is None or post_path is None:
             if files is None:
                 if num_layers is None and spec is not None:
@@ -669,6 +731,13 @@ class RpcBackend:
                 f"{len(self.layer_paths)} layer paths for {spec.num_layers} layers"
             )
 
+    def _worker_keeps_state(self) -> bool:
+        """True when the worker's capabilities advertise resident inputs."""
+        try:
+            return bool(self.client.capabilities().get("resident_state"))
+        except Exception:  # a client without capabilities(), or an older worker
+            return False
+
     def _exists(self, path: str) -> bool:
         """True when the worker can open `path` (it stays loaded in the worker's cache)."""
         try:
@@ -694,22 +763,17 @@ class RpcBackend:
         named = _by_name(engine, names, what)
         return [next(n for n, x in named.items() if x is e) for e in engine]
 
-    def _call(
-        self,
-        path: str,
-        feeds: dict,
-        want_in: dict,
-        in_names,
-        want_out: dict,
-        out_names,
-        what: str,
-    ) -> dict:
-        _check(feeds, want_in, what + " feeds")
+    def _pack(self, path: str, feeds: dict, want_in: dict, in_names, what: str) -> list:
+        """(ONNX dtype, array or None) per engine input, in engine order; None for a
+        tensor `feeds` does not hold."""
         info = self.info(path)
         tensors = []
         for e, name in zip(
             info["inputs"], self._order(info["inputs"], in_names, what + " inputs")
         ):
+            if name not in feeds:
+                tensors.append((e["dtype"], None))
+                continue
             a = np.ascontiguousarray(feeds[name], dtype=want_in[name][0])
             if (
                 _ONNX_ITEMSIZE.get(e["dtype"]) != a.dtype.itemsize
@@ -724,21 +788,154 @@ class RpcBackend:
                 # bf16 pattern has to become an IEEE half, not just be relabelled.
                 a = _bf16_to_fp16(a)
             tensors.append((e["dtype"], a.reshape(e["shape"])))
-        outs = self.client.run_path(path, tensors)
-        self.calls += 1
+            self.bytes_sent += a.nbytes
+        return tensors
+
+    def _unpack(self, path: str, outs, want_out: dict, out_names, what: str) -> dict:
+        """Our name -> bf16/uint array for every output the worker returned in full; an
+        output that came back empty (left on the worker) is absent."""
+        info = self.info(path)
         order = self._order(info["outputs"], out_names, what + " outputs")
+        outs = list(outs)
+        if len(outs) != len(order):
+            raise ValueError(
+                f"{what}: engine returned {len(outs)} tensors, expected {len(order)} {tuple(order)}"
+            )
+        present = [i for i, o in enumerate(outs) if np.asarray(o).size]
+        self.bytes_received += sum(np.asarray(outs[i]).nbytes for i in present)
         # float32 would be widened by _unpack; here every output is a raw 16-bit pattern.
         raws = [
-            _fp16_to_bf16(o).tobytes()
-            if e["dtype"] == _ONNX_FLOAT16
-            else np.ascontiguousarray(o).tobytes()
-            for o, e in zip(outs, info["outputs"])
+            _fp16_to_bf16(outs[i]).tobytes()
+            if info["outputs"][i]["dtype"] == _ONNX_FLOAT16
+            else np.ascontiguousarray(outs[i]).tobytes()
+            for i in present
         ]
-        return DeviceBackend._unpack(raws, want_out, order, what + " outputs")
+        names = [order[i] for i in present]
+        return DeviceBackend._unpack(
+            raws, {n: want_out[n] for n in names}, names, what + " outputs"
+        )
+
+    def _call(
+        self,
+        path: str,
+        feeds: dict,
+        want_in: dict,
+        in_names,
+        want_out: dict,
+        out_names,
+        what: str,
+    ) -> dict:
+        _check(feeds, want_in, what + " feeds")
+        tensors = self._pack(path, feeds, want_in, in_names, what)
+        outs = self.client.run_path(path, tensors)
+        self.calls += 1
+        return self._unpack(path, outs, want_out, out_names, what)
+
+    # ---- resident K/V caches ----
+    def new_conversation(self) -> int:
+        """Forget what the worker holds and return the token of a new conversation,
+        to pass to `run_layer_resident`. Nothing is sent: the next resident call of each
+        layer has to bring that layer's caches."""
+        self._held.clear()
+        self._conversation += 1
+        return self._conversation
+
+    def reset_state(self) -> int:
+        """Start a conversation with empty caches: every layer's input buffers are
+        zero-filled on the worker (`reset_state`), nothing is uploaded. Returns the
+        conversation token."""
+        token = self.new_conversation()
+        for index, path in enumerate(self.layer_paths):
+            self._held[index] = [int(self.client.reset_state(path)), 0]
+        return token
+
+    def held_rows(self, layer_index: int) -> Optional[int]:
+        """Cache rows the worker holds for a layer (None: no resident state known)."""
+        held = self._held.get(layer_index)
+        return None if held is None else held[1]
+
+    def _lost(self, layer_index: int, why) -> ResidentStateLost:
+        self._held.pop(layer_index, None)
+        self.resident_losses += 1
+        self._clean_calls = 0
+        if self.resident_losses >= self.max_resident_losses:
+            self.resident = False
+        return ResidentStateLost(f"layer {layer_index}: {why}")
+
+    def run_layer_resident(
+        self, layer_index: int, feeds: dict, conversation: int, want_kv: bool = False
+    ) -> dict:
+        """One layer call with the caches on the worker. `feeds`: indices, input, mask,
+        and optionally K_cache + V_cache to upload them (which establishes the worker's
+        state from the host's copy). Returns `output`, and the token's K_cache_out /
+        V_cache_out rows when `want_kv`. Raises ResidentStateLost when the worker does
+        not hold exactly the rows before `indices` of this conversation."""
+        s, what = self.spec, f"layer {layer_index}"
+        path = self.layer_paths[layer_index]
+        t0 = time.perf_counter()
+        upload = "K_cache" in feeds or "V_cache" in feeds
+        want = dict(s.layer_inputs)
+        if not upload:
+            del want["K_cache"], want["V_cache"]
+        _check(feeds, want, what + " feeds")
+        pos = int(np.asarray(feeds["indices"]).reshape(-1)[0])
+        if conversation != self._conversation:
+            raise self._lost(
+                layer_index, "the worker's caches belong to another conversation"
+            )
+        state = None
+        if not upload:
+            held = self._held.get(layer_index)
+            if held is None or held[1] != pos:
+                raise self._lost(
+                    layer_index,
+                    f"position {pos} needs rows 0..{pos - 1} on the worker, it holds "
+                    + ("no state" if held is None else f"{held[1]} rows"),
+                )
+            state = held[0]
+        info = self.info(path)
+        in_order = self._order(info["inputs"], LAYER_INPUT_ORDER, what + " inputs")
+        out_order = self._order(info["outputs"], LAYER_OUTPUT_ORDER, what + " outputs")
+        writes = [
+            (out_order.index(o), in_order.index(i), pos)
+            for o, i in (("K_cache_out", "K_cache"), ("V_cache_out", "V_cache"))
+        ]
+        omit = [] if want_kv else [w[0] for w in writes]
+        tensors = self._pack(path, feeds, s.layer_inputs, LAYER_INPUT_ORDER, what)
+        # An input the host does not send goes as a tensor with no elements, under the
+        # dtype the worker reported: it keeps the device buffer, in the device's format.
+        tensors = [
+            (dtype, np.zeros((0,), "u%d" % _ONNX_ITEMSIZE[dtype]) if a is None else a)
+            for dtype, a in tensors
+        ]
+        try:
+            response = self.client.run_resident(
+                path, tensors, state=state, writes=writes, omit=omit
+            )
+        except Exception as error:
+            if _is_state_lost(error):
+                raise self._lost(layer_index, error) from error
+            raise
+        self.calls += 1
+        if not upload:
+            self._clean_calls += 1
+            if self._clean_calls >= 16 * len(self.layer_paths):
+                self.resident_losses = 0
+        self._held[layer_index] = [
+            int(json.loads(response.manifest)["state_id"]),
+            pos + 1,
+        ]
+        out = self._unpack(
+            path, response.outputs, s.layer_outputs, LAYER_OUTPUT_ORDER, what
+        )
+        self.layer_seconds += time.perf_counter() - t0
+        return out
 
     def run_layer(self, layer_index, feeds):
         s = self.spec
         t0 = time.perf_counter()
+        # A full run overwrites the layer's input buffers: its resident state is gone.
+        self._held.pop(layer_index, None)
         out = self._call(
             self.layer_paths[layer_index],
             feeds,
@@ -798,10 +995,23 @@ class Host:
     one token id or several.
 
     `step_seconds` gets one (total, post) pair of wall times per fed token.
+
+    With a backend in resident mode (`backend.resident`, see RpcBackend) the
+    caches live on the worker: a step sends no K/V and gets none back, so `K`
+    and `V` here are NOT kept up to date (`host_rows` says how many leading
+    rows they hold; without resident mode that is always `pos`). Set
+    `mirror_kv = True` to have every token's rows returned as well and keep
+    `K` / `V` complete, for diagnostics. When the backend reports the
+    worker's state lost, the step rebuilds the caches (from `K` / `V` if they
+    are complete, otherwise by feeding the tokens so far again through
+    full-upload calls), uploads them in full and carries on; `recoveries`
+    counts that.
     """
 
-    def __init__(self, embed: np.ndarray, spec: IOSpec, eos=None):
+    def __init__(self, embed: np.ndarray, spec: IOSpec, eos=None, mirror_kv=False):
         self.spec = spec
+        self.mirror_kv = mirror_kv
+        self.recoveries = 0
         self.eos_ids = _eos_ids(eos)
         self.eos = eos if isinstance(eos, int) else min(self.eos_ids, default=None)
         # [vocab, hidden] uint16; exact for a bf16 checkpoint
@@ -830,6 +1040,9 @@ class Host:
         self.V = np.zeros((s.num_layers, 1, s.cache_len, s.kv_dim), "<u2")
         self.pos = 0
         self.step_seconds: list = []
+        self.host_rows = 0  # leading rows of K / V the host holds
+        self.fed: list = []  # (token, mask value) of every step so far
+        self._conversation = None  # the resident backend's token for these caches
 
     def build_mask(self, pos: int, mask_value: float = MASK_NEG) -> np.ndarray:
         """Additive mask for the token at position `pos`: cache rows 0..pos-1
@@ -854,6 +1067,57 @@ class Host:
             "mask": mask,
         }
 
+    def _layers_full(self, backend, x, pos: int, mask, hid: Optional[list] = None):
+        """All layers of one token with the caches sent in full; the rows go into K / V."""
+        s = self.spec
+        for li in range(s.num_layers):
+            out = backend.run_layer(li, self.layer_feeds(li, x, pos, mask))
+            _check(out, s.layer_outputs, f"layer {li} outputs")
+            # The layer returns only this token's rows; the host owns the cache.
+            self.K[li, 0, pos, :] = out["K_cache_out"][0, 0]
+            self.V[li, 0, pos, :] = out["V_cache_out"][0, 0]
+            x = out["output"]
+            if hid is not None:
+                hid.append(x.reshape(s.hidden).copy())
+        return x
+
+    def _layers_resident(
+        self, backend, x, pos: int, mask, hid: list, upload: bool = False
+    ):
+        """All layers of one token with the caches on the worker. `upload` sends the
+        host's K / V along (they must be complete), which re-establishes the worker's."""
+        s = self.spec
+        want = dict(s.layer_outputs)
+        if not self.mirror_kv:
+            del want["K_cache_out"], want["V_cache_out"]
+        for li in range(s.num_layers):
+            feeds = self.layer_feeds(li, x, pos, mask)
+            if not upload:
+                del feeds["K_cache"], feeds["V_cache"]
+            out = backend.run_layer_resident(
+                li, feeds, self._conversation, want_kv=self.mirror_kv
+            )
+            _check(out, want, f"layer {li} outputs")
+            if self.mirror_kv:
+                self.K[li, 0, pos, :] = out["K_cache_out"][0, 0]
+                self.V[li, 0, pos, :] = out["V_cache_out"][0, 0]
+            x = out["output"]
+            hid.append(x.reshape(s.hidden).copy())
+        return x
+
+    def _replay(self, backend) -> None:
+        """Make K / V complete again (rows 0..pos-1) by feeding the tokens so far through
+        full-upload layer calls. Costs what those steps cost without resident caches."""
+        s = self.spec
+        self.K[:] = 0
+        self.V[:] = 0
+        for p, (token, mask_value) in enumerate(self.fed[: self.pos]):
+            x = np.array(self.embed_bf16[int(token)], dtype="<u2").reshape(
+                1, 1, s.hidden
+            )
+            self._layers_full(backend, x, p, self.build_mask(p, mask_value))
+        self.host_rows = self.pos
+
     def step(
         self,
         token: int,
@@ -871,17 +1135,45 @@ class Host:
                 f"position {pos} exceeds the compiled context ({s.cache_len} tokens, positions 0..{s.cache_len - 1})"
             )
         # one row, copied out of the table (which may be a file mapping)
-        x = np.array(self.embed_bf16[int(token)], dtype="<u2").reshape(1, 1, s.hidden)
+        x0 = np.array(self.embed_bf16[int(token)], dtype="<u2").reshape(1, 1, s.hidden)
         mask = self.build_mask(pos, mask_value)
-        hid = [x.reshape(s.hidden).copy()]
-        for li in range(s.num_layers):
-            out = backend.run_layer(li, self.layer_feeds(li, x, pos, mask))
-            _check(out, s.layer_outputs, f"layer {li} outputs")
-            # The layer returns only this token's rows; the host owns the cache.
-            self.K[li, 0, pos, :] = out["K_cache_out"][0, 0]
-            self.V[li, 0, pos, :] = out["V_cache_out"][0, 0]
-            x = out["output"]
-            hid.append(x.reshape(s.hidden).copy())
+        del self.fed[pos:]
+        self.fed.append((int(token), mask_value))
+        hid = [x0.reshape(s.hidden).copy()]
+        x = None
+        if getattr(backend, "resident", False):
+            try:
+                if pos == 0:  # a new conversation: empty caches on the worker
+                    self._conversation = backend.reset_state()
+                x = self._layers_resident(backend, x0, pos, mask, hid)
+            except Exception as error:
+                if not _is_state_lost(error):
+                    raise
+                # The worker's caches are gone or are not ours (the layers before the
+                # failing one already wrote this token's rows; all are redone).
+                self.recoveries += 1
+                del hid[1:]
+                if self.host_rows < pos:
+                    self._replay(backend)
+                if getattr(backend, "resident", False):
+                    try:
+                        self._conversation = backend.new_conversation()
+                        x = self._layers_resident(
+                            backend, x0, pos, mask, hid, upload=True
+                        )
+                    except Exception as again:
+                        if not _is_state_lost(again):
+                            raise
+                        # not even a full upload leaves state behind (--no-cache)
+                        backend.resident = False
+                        del hid[1:]
+            if x is not None and self.mirror_kv and self.host_rows == pos:
+                self.host_rows = pos + 1
+        if x is None:  # caches sent in full (no resident mode, or it was given up)
+            if self.host_rows < pos:
+                self._replay(backend)
+            x = self._layers_full(backend, x0, pos, mask, hid)
+            self.host_rows = pos + 1
         self.pos = pos + 1
         logits = None
         t1 = time.perf_counter()

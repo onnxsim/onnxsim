@@ -13,7 +13,7 @@ worker features that let it run over the onnx-remote RPC.
 | `scripts/axera/llm_reference.py` | numpy float32 reference of the same checkpoint, config-driven, with its own memory-mapped safetensors reader |
 | `scripts/axera/run_llm_rpc.py` | CLI: decode a prompt (text, chat template or token ids) against a running worker |
 | `tools/onnx-remote/python/onnx_remote_client.py` | numpy-only client for the onnx-remote v5 wire protocol |
-| `tools/onnx-remote/remote_axcl_worker.cpp` | the worker: model cache, `io_info`, `unload` |
+| `tools/onnx-remote/remote_axcl_worker.cpp` | the worker: model cache, `io_info`, `unload`, resident inputs (`run_resident`, `reset_state`) |
 | `tests/test_axera_llm_layer_loop.py` | offline tests (no device, no real checkpoint) |
 
 ## Layer I/O
@@ -86,7 +86,8 @@ A backend is anything with `run_layer(i, feeds)` and `run_post(feeds)`:
   `load(path) -> handle` and `run(handle, arrays) -> arrays`, with an optional
   LRU of handles.
 - `RpcBackend(client, model_dir)`: an onnx-remote AXCL worker. Paths are the
-  worker's.
+  worker's. When the worker advertises `resident_state` it keeps the caches
+  on the worker (next section); `Host.K` / `Host.V` are then not the caches.
 
 `compare_layers()` is teacher-forced: every layer call gets the reference's
 hidden state and cache, so an error at (token, layer) is that call's own.
@@ -105,21 +106,100 @@ with wide gaps are the ones to use for a token-identity check.
 
 ### What crosses the wire per token
 
-Every layer call sends that layer's two caches in full, 2 x S x D bf16
-values, whatever the position: the protocol has no tensor that stays on the
-worker. Per token that is L x 2 x S x D x 2 bytes: 5.9 MB for SmolLM2-135M,
-29 MB for Qwen3-0.6B, 9.4 MB for llama-160m. The protocol is unchanged; what
-was removed is host-side copying. The host's cache array for a layer goes to
-the client as it is (no conversion: it is already little-endian uint16), and
-the client now writes each large tensor to the socket from the array's own
-memory (`encode_request_parts()` / `send_parts()`) where it used to join the
-whole message into one buffer, which copied every payload three times. On a
-local socket pair that takes one Qwen3 layer request from 0.30 ms to 0.06 ms
-of host time (0.04 to 0.03 ms at SmolLM2's size); the bytes on the wire are
-identical. The embedding table of a BF16 checkpoint is likewise used as
-stored, from the file mapping, one row copied per token. Sending only the
-`pos` rows that are in use, or keeping the caches on the worker, would need a
-protocol or worker change and is not done.
+The original request form has no tensor that stays on the worker: every layer
+call sends that layer's two caches in full, 2 x S x D bf16 values, whatever
+the position, and gets the token's K and V rows back so the host can store
+them. With **resident KV caches** the caches live in the worker's device
+buffers, which a cached model keeps allocated anyway. A layer call then sends
+`indices`, `input` and `mask`, the worker copies `K_cache_out` / `V_cache_out`
+into row `indices` of `K_cache` / `V_cache` itself, and only `output` comes
+back.
+
+Tensor payload per fed token (all L layer calls plus one post call; message
+framing adds about 0.3 kB per call), computed from the shapes:
+
+| build | | sent, host to worker | received |
+| --- | --- | --- | --- |
+| SmolLM2-135M (L 30, S 255, D 192, H 576) | caches in full | 5,926,392 bytes (197,508 per layer call) | 155,904 |
+| | resident | 51,192 bytes (1,668 per layer call) | 132,864 |
+| Qwen3-0.6B (L 28, S 255, D 1024, H 1024) | caches in full | 29,319,280 bytes (1,047,044 per layer call) | 475,904 |
+| | resident | 73,840 bytes (2,564 per layer call) | 361,216 |
+
+Per layer call that is 4 + 2H + 2(S+1) bytes instead of 4·S·D more, and 2H
+bytes back instead of 2H + 4D. What is left of "received" is almost all the
+post model's logits (2V: 98,304 and 303,872 bytes). The same bytes that no
+longer cross the network also no longer cross from the worker to the card.
+
+**Device timings** (per decoded token):
+
+| build | caches in full (measured) | resident |
+| --- | --- | --- |
+| SmolLM2-135M | 118 ms per token (8.5 tokens/s) | 76 ms per token (13.2 tokens/s) |
+| Qwen3-0.6B | 215 ms per token (4.7 tokens/s; 205.7 ms in layer calls) | 98 ms per token (10.2 tokens/s; 89.9 ms in layer calls) |
+
+Measured on an AX8850 (AXCL V3.6.5, LXD VM, 2026-10-10) with this worker built against the
+real SDK, both columns in the same session with the same binary; decode steps only. In both
+modes the tokens are identical to the float32 reference (SmolLM2: 32 new tokens; Qwen3 with
+the chat template: 28). The row write-back is the device-to-device copy at an offset, which
+the runtime accepts. Also run: an fp16 hidden-state build in resident mode (identical, 13.3
+tokens/s), the `--row-copy host` fallback (identical), and the older request forms against
+the same binary. One prompt per model; these are not steady-state throughput figures.
+
+How it works, end to end (the protocol is in the "AXCL worker" section of
+`tools/onnx-remote/README.md`):
+
+- **Protocol.** `run_resident` is `run` plus a text control in the request's
+  `artifact` bytes. An input sent with no elements keeps its device buffer
+  (the Hexagon worker's idiom for recurrent state); `write <out> <in> <slot>`
+  copies an output into an input at `slot` x the output's byte size after
+  execution; `omit <out>` leaves an output on the worker; `state <id>` names
+  the state the request continues. `reset_state` zero-fills a model's inputs
+  and returns a new id. The v5 wire format and the old request forms are
+  unchanged.
+- **Worker.** The caches are the cached model's own input buffers. The row
+  copy is a device-to-device `axclrtMemcpy` into the input buffer at the
+  row's offset (`--row-copy host` goes through the worker's memory instead,
+  with whole-buffer copies only). Whatever ends the cache entry, or
+  overwrites its inputs, ends the state, and the next request that refers to
+  it is refused with `resident state lost` rather than run.
+- **Loop.** `RpcBackend` uses the resident form when the worker's
+  capabilities advertise `resident_state` (`resident=False`, or
+  `run_llm_rpc.py --no-resident-kv`, keeps the original form). `Host.step`
+  resets the worker's caches at position 0 and afterwards sends no K/V. The
+  backend tracks the state id and the number of rows the worker holds per
+  layer, and which conversation they belong to.
+- **Lost state.** When the worker (or the backend's own bookkeeping) reports
+  the state lost, the step rebuilds the caches and uploads them in full once:
+  from the host's copy if it is complete, otherwise by feeding the tokens so
+  far again through full-upload calls, which costs what those tokens cost
+  without resident caches. After three losses without 16 clean tokens in
+  between (a worker whose `--max-loaded` is below the layer count loses a
+  layer on every token) the backend stops using the resident form.
+- **Diagnostics.** `compare_layers()` sets every call's cache explicitly, so
+  it always uses the full-upload form (which also ends the worker's state for
+  that layer). To see the rows during a resident decode, set
+  `Host.mirror_kv = True` (`--mirror-kv`): the rows are returned as well as
+  written on the worker (2 x 2D more bytes per layer call), `Host.K` /
+  `Host.V` stay complete, and a lost state is re-uploaded without replay.
+- **fp16 hidden state.** A row written on the worker never leaves the
+  device's format, so it needs no conversion; the kept inputs are sent as
+  empty tensors under the dtype the worker reported. This is also a small
+  numerical difference to the full-upload path on an fp16 build: there the
+  host stores each returned row as bf16 (7 fraction bits against the 10 of the
+  IEEE half the device produced) and converts it back on every call, so the
+  device attends over rounded rows; resident rows stay exact. On a bf16
+  build both paths hold the same bits. A replay after a lost state rebuilds
+  the rows through the full-upload path.
+
+Independently of all that, the host side adds no copies: a cache that is
+sent goes to the client as it is (no conversion: it is already little-endian
+uint16), and the client writes each large tensor to the socket from the
+array's own memory (`encode_request_parts()` / `send_parts()`) where it used
+to join the whole message into one buffer, which copied every payload three
+times. On a local socket pair that takes one full Qwen3 layer request from
+0.30 ms to 0.06 ms of host time (0.04 to 0.03 ms at SmolLM2's size). The
+embedding table of a BF16 checkpoint is likewise used as stored, from the
+file mapping, one row copied per token.
 
 ## Supported architectures
 
@@ -259,7 +339,13 @@ mask at zero, or writing the cache rows one slot off, changes them; the same
 decode through `RpcBackend` over a socket, against an in-process worker that
 answers `io_info` and enforces the dtype labels, gives the same tokens; and
 the Python client round-trips every transport dtype through the C++ reference
-worker. The same holds for a qwen3-style checkpoint (grouped-query, q_norm
+worker. With the caches resident on that worker (it implements
+`run_resident` / `reset_state` with the real worker's semantics) the tokens
+are the full-upload path's for the tiny llama and qwen3 configs, the bytes
+per layer call are exactly the table's formula, an evicted layer mid-decode
+is recovered (by replay, or by upload alone when the rows are mirrored), a
+worker that loses the state before every token ends in full-upload mode, and
+the old request forms answer as before. The same holds for a qwen3-style checkpoint (grouped-query, q_norm
 and k_norm, `head_dim` 16 with hidden 32 and 4 heads, tied, theta 1e6) and a
 llama-style one with one KV head for four heads, float32 storage and its own
 `lm_head`; for both, sizes and file names are taken from files with the
@@ -357,6 +443,18 @@ prompts.
 One or two prompts per model. Nothing here measures accuracy; the SmolLM2 `s4` and
 `fp8_e4m3` rows are a single divergence at a near-tie, the Qwen3 `s4` rows are not.
 
-The worker binary used for these runs is the one built in the VM against the real AXCL SDK;
-this change does not touch `remote_axcl_worker.cpp`. On a host without the SDK the worker can
-only be syntax-checked against `tools/onnx-remote/test/axcl_stub/axcl.h`.
+The worker binary used for these runs is the one built in the VM against the real AXCL SDK,
+before resident KV caches existed: every number above is the full-upload path's.
+
+### Resident KV caches: what was and was not run
+
+`remote_axcl_worker.cpp` with `run_resident` / `reset_state` was syntax-checked against the
+stub header and against the AXCL SDK's headers, and linked against a scratch fake AXCL (not
+in the tree: host memory as device memory, outputs a hash of all input bytes). Against that
+binary the Python client ran 36 resident calls with SmolLM2-135M's layer shapes, bit-identical
+to the full-upload form in both `--row-copy` modes, every lost-state case, and a `Host` /
+`RpcBackend` decode with one layer unloaded mid-way. **Nothing of it has run on the card**:
+the device-to-device copy into an offset of an input buffer, the timings and the token
+identity on real layers are still to be checked there (`run_llm_rpc.py` with and without
+`--no-resident-kv` on the same prompt; `--row-copy host` on the worker if the offset copy is
+refused).

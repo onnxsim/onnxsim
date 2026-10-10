@@ -636,10 +636,12 @@ stateless runner can skip the load operation and continue sending bytes with
 each `run_compiled` request.
 
 The worker answers `capabilities` as a non-graph compiled-artifact runner
-(`load_compiled`, `run_compiled`, `run`, `io_info`, `unload`), so ROS2/DORA
+(`load_compiled`, `run_compiled`, `run`, `io_info`, `unload`, `run_resident`,
+`reset_state`), so ROS2/DORA
 discovery can verify it and capability-gated dispatch can reject it when graph
-execution is required. The manifest also carries `model_cache`, `max_loaded`
-and the current `loaded` count.
+execution is required. The manifest also carries `model_cache`, `max_loaded`,
+the current `loaded` count, `resident_state` (whether `run_resident` can be
+used: true unless `--no-cache`) and `row_copy` (`device` or `host`).
 
 ### Model cache
 
@@ -664,7 +666,7 @@ execute and a download. That is what makes a host-side LLM decode loop usable
 - A model whose upload, execute or download fails is dropped, so the next
   request loads it afresh. Request errors (input count, dtype, size) keep it.
 - `--no-cache` restores the original behaviour: load, run and unload on every
-  request.
+  request. No resident state exists then (see below).
 - SIGINT/SIGTERM unload everything and finalize the runtime before exiting.
 
 With `Summary` or `Detailed` profiling a request that had to load the model
@@ -703,14 +705,118 @@ with an empty artifact ID, by a path sent as UTF-8 text in the request's
 - `run` runs the model at the path in `model`. It is the path-as-op request
   form for paths longer than the op field's 128 bytes.
 
+### Resident inputs: `run_resident` and `reset_state`
+
+A cached model's device buffers stay allocated between requests, so an input
+can simply stay where it is. That is what an LLM decode loop wants for a
+layer's KV cache: each call changes one row of a `[1, cache_len, kv_dim]`
+tensor, and the original request form uploads the whole of it every time.
+`run_resident` expresses three things per request, without changing the v5
+wire format:
+
+| | how it is said |
+| --- | --- |
+| input `i` stays as it is on the card, nothing is sent for it | the tensor for input `i` has no elements (shape `[0]`), under the input's dtype |
+| after execution, output `j` is copied into input `i` at byte offset `slot` x (byte size of output `j`) | control line `write j i slot` |
+| output `j` is not returned | control line `omit j`; it comes back as a tensor with no elements |
+
+The model is named as for `run` (artifact ID, or a path in the `model` bytes).
+The control is UTF-8 text in the request's `artifact` bytes, one directive per
+line, at most 4096 bytes:
+
+```
+state 1791538852693001
+write 0 0 17
+write 1 1 17
+omit 0
+omit 1
+```
+
+`state <id>` names the resident state the request continues. The response's
+manifest is `{"schema_version": 1, "state_id": <id>}`.
+
+- `reset_state` (same naming of the model) loads the model if needed,
+  zero-fills every input buffer on the card and returns a new state id: the
+  start of a conversation, with nothing uploaded.
+- `run_resident` without a `state` line establishes a state from the request:
+  every input has to be sent in full, and the response carries the new id.
+- `run_resident` with `state <id>` uploads the inputs that are sent, keeps the
+  empty ones, and answers with the same id.
+- A `write` needs an output and an input of the same engine dtype, the
+  input's size a multiple of the output's, and `slot` inside it. The copy
+  happens after execution and before the outputs are downloaded, so a row can
+  be both written and returned.
+- The whole request is checked before anything is uploaded: a refused request
+  (count, dtype, size, a bad directive) leaves the state as it was.
+
+**Lost state.** The state belongs to the cache entry. It ends when the entry
+does (eviction by `--max-loaded` or by a failed load's retry, a changed or
+missing file, `unload`, a device failure, a worker restart), when the model
+is run through any of the original request forms (which overwrite every
+input), and when another `reset_state` or stateless `run_resident` replaces
+it. A request whose `state` is not the entry's current one, or that sends an
+empty input without a `state`, is refused with an error that starts with
+`resident state lost` and never runs on whatever the buffers hold; the client
+then sends every input in full. State ids start from the clock at worker
+start, so an id from before a restart cannot match. With `--no-cache` no
+model stays loaded: both ops are refused with the same error, and the
+capabilities say `"resident_state": false`.
+
+**Two clients.** There is one state per model entry and the worker serves one
+request at a time. Two clients that use different models do not interact. Two
+clients that use the same model each invalidate the other's state when they
+reset or re-establish it: each then gets `resident state lost` and uploads
+again. They never read each other's cache, but they make no progress faster
+than the full-upload form, so give each conversation its own copy of the
+model files (the cache key is the path).
+
+**Where the row copy runs.** By default (`--row-copy device`) it is one
+`axclrtMemcpy(input + offset, output, row, AXCL_MEMCPY_DEVICE_TO_DEVICE)` per
+`write`: the row never comes to the worker's memory. The whole-buffer form of
+that call is what `scripts/axera/vm/axcl_batch_runner.c` and the resident
+training runners use on the card; a destination that points *into* a device
+buffer has not been run on a card yet (see "what was checked" below).
+`--row-copy host` avoids it: the worker keeps its own copy of each input,
+downloads the row, patches the copy and uploads the whole input again. That
+uses whole-buffer copies only and still saves the network transfer, but not
+the upload from the worker to the card.
+
+**Why this form.** The Hexagon worker already keeps recurrent state on the
+device, and its idiom is reused where it fits: an input sent empty means "the
+value the device holds", and the output that is left on the device comes back
+empty. Its state pairs are fixed by the compiled program (`program.txt`), with
+the whole output looped into the whole input, so nothing else needs saying.
+Here the request has to name an output, an input and a slot, and has to say
+which state it believes the worker holds, so those travel as a small explicit
+control. It is text rather than JSON because the worker has no JSON parser,
+and it rides in `artifact` because that field is otherwise unused by a run
+that names a model already on the worker. Old clients never send
+`run_resident` and old request forms are answered exactly as before (the only
+change they see is internal: inputs are now all checked before the first is
+uploaded).
+
+With `Detailed` profiling a `run_resident` request adds an `axcl_row_copy`
+event between `axcl_execute` and `axcl_download`.
+
 `tools/onnx-remote/python/onnx_remote_client.py` is a numpy-only Python client
 for the wire protocol (`Client.run`, `run_path`, `io_info`, `unload`,
-`load_compiled`, `run_compiled`, `capabilities`); it works against every
-worker here.
+`load_compiled`, `run_compiled`, `capabilities`, `reset_state`,
+`run_resident` with `keep(dtype)` for an input that is not sent); it works
+against every worker here.
 
 `remote_axcl_worker.cpp` can be syntax-checked without the SDK against the
 declarations in `test/axcl_stub/axcl.h` (the command is in that header). The
 stub has no definitions and is not on the real build's include path.
+
+What was checked for `run_resident` / `reset_state`, and what was not: the
+worker compiles with `-Wall -Wextra` against the stub and against the AXCL
+SDK's own headers (syntax only). Linked against a scratch fake AXCL (host
+memory as device memory, outputs a hash of all input bytes), it was driven by
+the Python client: 36 resident calls on three models with SmolLM2-135M's layer
+shapes matched the full-upload form bit for bit in both `--row-copy` modes,
+and every lost-state case above was produced (eviction, changed file,
+`unload`, old-form run, another client's reset, `--no-cache`). It has **not**
+been built against the real runtime or run on a card.
 
 ## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
 

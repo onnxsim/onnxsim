@@ -35,6 +35,11 @@ ids (`config.json` and `generation_config.json`).
 The worker must be up (`onnx-remote-axcl-worker --port P`, see
 tools/onnx-remote/README.md); this script starts nothing and touches no
 device API itself. See docs/axera-llm-rpc-decode.md.
+
+When the worker advertises `resident_state`, each layer's KV caches stay in
+the worker's device buffers and a layer call carries only `indices`, `input`
+and `mask`; `--no-resident-kv` sends the caches in full with every call, as
+before. `--compare-layers` always sets the caches explicitly.
 """
 
 from __future__ import annotations
@@ -311,6 +316,19 @@ def main(argv=None) -> int:
         action="store_true",
         help="teacher-forced per-layer check of the prompt tokens against the reference, instead of decoding",
     )
+    ap.add_argument(
+        "--no-resident-kv",
+        action="store_true",
+        help="send both KV caches with every layer call and take the rows back (the original "
+        "request form) even when the worker can keep the caches in its device buffers",
+    )
+    ap.add_argument(
+        "--mirror-kv",
+        action="store_true",
+        help="with resident KV caches: also have every token's K/V rows returned, so the host's "
+        "copy of the caches stays complete (diagnostics; a lost worker state is then re-uploaded "
+        "instead of recomputed)",
+    )
     args = ap.parse_args(argv)
 
     model = ref.Model.load(args.checkpoint)
@@ -352,11 +370,32 @@ def main(argv=None) -> int:
     print("prompt ids", ids)
 
     client = onnx_remote_client.Client(args.host, args.port)
-    print("worker", client.capabilities())
+    capabilities = client.capabilities()
+    print("worker", capabilities)
     t0 = time.time()
     layer_paths, post_path, how = find_files(args, model, client)
     print("model files %s: %s ... %s" % (how, layer_paths[0], post_path))
-    backend = loop.RpcBackend(client, layer_paths=layer_paths, post_path=post_path)
+    backend = loop.RpcBackend(
+        client,
+        layer_paths=layer_paths,
+        post_path=post_path,
+        resident=False
+        if args.no_resident_kv
+        else bool(capabilities.get("resident_state")),
+    )
+    print(
+        "KV caches: %s"
+        % (
+            "resident on the worker (a layer call sends indices, input and mask)"
+            if backend.resident
+            else "sent in full with every layer call"
+            + (
+                ""
+                if args.no_resident_kv
+                else " (the worker does not advertise resident_state)"
+            )
+        )
+    )
     spec = (
         backend.spec
     )  # sizes from the worker's io_info of layer 0 and of the post model
@@ -371,6 +410,7 @@ def main(argv=None) -> int:
     print("%d models loaded on the worker in %.2f s" % (model.L + 1, time.time() - t0))
 
     host = loop.Host.from_model(model, spec)
+    host.mirror_kv = args.mirror_kv
     if args.compare_layers:
         result = loop.compare_layers(ids, backend, model)
         worst = float(result["output"].max())
@@ -419,6 +459,16 @@ def main(argv=None) -> int:
             model.L,
         )
     )
+    fed_tokens = max(len(host.step_seconds), 1)
+    print(
+        "tensor payload per fed token: %.0f bytes sent, %.0f received (layer and post calls)"
+        % (backend.bytes_sent / fed_tokens, backend.bytes_received / fed_tokens)
+    )
+    if host.recoveries or backend.resident_losses:
+        print(
+            "resident KV state was lost %d time(s) and rebuilt; resident mode is %s"
+            % (host.recoveries, "still on" if backend.resident else "off now")
+        )
     for text in timing_summary(host.step_seconds, len(ids)):
         print(text)
     if reference is not None:

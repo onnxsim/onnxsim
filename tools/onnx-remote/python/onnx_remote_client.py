@@ -34,6 +34,22 @@ the one its numpy dtype implies (only the element size has to match), and
 
 ``decode_request`` / ``encode_response`` are the worker's half of the
 protocol; they exist so tests can stand up a fake worker in Python.
+
+Resident inputs (AXCL worker, ``run_resident`` / ``reset_state``): a model's
+inputs can stay in the worker's device buffers between requests, e.g. an LLM
+layer's KV cache. The wire format is unchanged. ``run_resident`` names its
+model like ``run`` does and carries a short text control in the ``artifact``
+bytes (``encode_resident_control``); an input sent with no elements
+(``keep(dtype)``) keeps the buffer's contents, and an output listed under
+``omit`` comes back with no elements:
+
+    state = client.reset_state(path)                 # zero-filled inputs, new state id
+    r = client.run_resident(path, [keep(BFLOAT16), keep(BFLOAT16), idx, x, mask],
+                            state=state, writes=[(0, 0, pos), (1, 1, pos)], omit=[0, 1])
+
+A worker that no longer holds that state answers "resident state lost ...",
+raised as ``ResidentStateLost``; send every input in full (no ``state``) to
+establish a new one. See the "AXCL worker" section of the README.
 """
 
 from __future__ import annotations
@@ -108,6 +124,14 @@ class RemoteError(RuntimeError):
     """The worker answered with an ERROR message (its text is the exception text)."""
 
 
+class ResidentStateLost(RemoteError):
+    """The worker does not hold the resident state a `run_resident` request referred to
+    (model evicted, reloaded, unloaded, run in full, or reset by another client)."""
+
+
+RESIDENT_STATE_LOST = "resident state lost"
+
+
 class ProtocolError(RuntimeError):
     """The peer's bytes are not a valid v5 message, or a request breaks a transport limit."""
 
@@ -155,6 +179,51 @@ class Response:
 
 
 TensorLike = Union[np.ndarray, Tensor, tuple]
+
+
+def keep(dtype: int) -> Tensor:
+    """A `run_resident` input that is not sent: a tensor of `dtype` with no elements,
+    which tells the worker to keep that input's device buffer as it is."""
+    return Tensor(dtype, np.zeros((0,), NUMPY_DTYPE[dtype]))
+
+
+def encode_resident_control(
+    state: Optional[int] = None, writes: Sequence = (), omit: Sequence[int] = ()
+) -> bytes:
+    """The text control of a `run_resident` request (its `artifact` bytes), one
+    directive per line:
+
+        state <id>               the resident state this request continues
+        write <out> <in> <slot>  after execution, output <out> is copied into input <in>
+                                 at byte offset <slot> * (byte size of output <out>)
+        omit <out>               output <out> is not returned (it comes back empty)
+    """
+    lines = [] if state is None else [f"state {int(state)}"]
+    lines += [f"write {int(o)} {int(i)} {int(slot)}" for o, i, slot in writes]
+    lines += [f"omit {int(o)}" for o in omit]
+    return "".join(line + "\n" for line in lines).encode()
+
+
+def decode_resident_control(control: bytes) -> tuple:
+    """The worker's side: (state id or None, [(out, in, slot), ...], [omitted outputs])."""
+    state, writes, omit = None, [], []
+    for line in control.decode().splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            numbers = [int(f) for f in fields[1:]]
+            if fields[0] == "state" and len(numbers) == 1 and state is None:
+                state = numbers[0]
+            elif fields[0] == "write" and len(numbers) == 3:
+                writes.append(tuple(numbers))
+            elif fields[0] == "omit" and len(numbers) == 1:
+                omit.append(numbers[0])
+            else:
+                raise ValueError(line)
+        except ValueError:
+            raise ProtocolError(f"bad resident control directive: {line[:64]}")
+    return state, writes, omit
 
 
 # ---- encoding ----------------------------------------------------------------
@@ -530,6 +599,8 @@ class Client:
                 f"response is for request {response.request_id}, sent {request_id}"
             )
         if check and not response.ok:
+            if response.error.startswith(RESIDENT_STATE_LOST):
+                raise ResidentStateLost(response.error)
             raise RemoteError(response.error)
         return response
 
@@ -576,3 +647,54 @@ class Client:
             "unload", artifact_id=artifact_id, model=(path or "").encode()
         )
         return json.loads(response.manifest)
+
+    # AXCL worker: inputs that stay in the worker's device buffers between requests.
+    def reset_state(self, path: Optional[str] = None, *, artifact_id: str = "") -> int:
+        """Zero-fill every input buffer of one model (loading it if needed) and start a
+        new resident state. Returns the state id to pass to `run_resident`."""
+        if (path is None) == (not artifact_id):
+            raise ValueError("reset_state needs exactly one of path / artifact_id")
+        response = self.request(
+            "reset_state", artifact_id=artifact_id, model=(path or "").encode()
+        )
+        return int(json.loads(response.manifest)["state_id"])
+
+    def run_resident(
+        self,
+        path: Optional[str],
+        inputs: Sequence[TensorLike],
+        *,
+        artifact_id: str = "",
+        state: Optional[int] = None,
+        writes: Sequence = (),
+        omit: Sequence[int] = (),
+        profiling: int = PROFILING_OFF,
+    ) -> Response:
+        """Run a model whose inputs may stay on the worker.
+
+        `inputs` has one entry per model input, in engine order: an array to upload, or
+        `keep(dtype)` to leave that input's device buffer as it is. `state` is the id a
+        `reset_state` or an earlier `run_resident` returned; it must be given when any
+        input is kept, and the worker answers `ResidentStateLost` when it no longer
+        holds that state. Without `state`, every input has to be sent and a new state
+        is established. `writes` is a list of (output, input, slot): after execution
+        output `output` is copied, on the worker, into input `input` at byte offset
+        slot * that output's byte size. Outputs listed in `omit` come back empty.
+
+        Returns the Response; `resident_state_id(response)` is the state id to use next
+        (unchanged when `state` was given)."""
+        if (path is None) == (not artifact_id):
+            raise ValueError("run_resident needs exactly one of path / artifact_id")
+        return self.request(
+            "run_resident",
+            inputs,
+            artifact_id=artifact_id,
+            model=(path or "").encode(),
+            artifact=encode_resident_control(state, writes, omit),
+            profiling=profiling,
+        )
+
+
+def resident_state_id(response: Response) -> int:
+    """The state id in a `run_resident` / `reset_state` response."""
+    return int(json.loads(response.manifest)["state_id"])
