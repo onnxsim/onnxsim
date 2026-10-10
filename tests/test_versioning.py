@@ -2,6 +2,9 @@
 cases, equivalence checks, and the manifest."""
 
 import json
+import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -413,3 +416,95 @@ def test_nan_and_infinity_outputs_match_themselves():
     ]
     (report,) = check_equivalent(sqrt, sqrt, cases)
     assert report.ok and report.status == "pass"
+
+
+def test_graph_text_and_snapshot_bytes_are_stable_within_a_process(tmp_path):
+    model = _matmul_model()
+    assert graph_text(model) == graph_text(model)
+    first = save_snapshot(model, str(tmp_path / "first.onnx"))
+    second = save_snapshot(model, str(tmp_path / "second.onnx"))
+    assert first == second
+    assert (tmp_path / "first.onnx").read_bytes() == (
+        tmp_path / "second.onnx"
+    ).read_bytes()
+
+
+# Runs the whole snapshot path in a fresh interpreter and prints its digests as
+# one JSON line. Weights come from a seeded generator, not from the environment.
+_SNAPSHOT_CHILD = r"""
+import json
+import sys
+
+import numpy as np
+from onnx import numpy_helper, parser
+
+import onnxsim
+from onnxsim.versioning import (
+    GeneratedCase,
+    TensorSpec,
+    case_set_id,
+    generate_feeds,
+    graph_hash,
+    graph_text,
+    save_snapshot,
+    tensor_digest,
+)
+
+out_dir = sys.argv[1]
+rng = np.random.default_rng(0)
+model = parser.parse_model(
+    '<ir_version: 10, opset_import: ["" : 21]> '
+    '''
+    g (float[1,4] x) => (float[1,4] y)
+    {
+      h1 = MatMul (x, W1)
+      h2 = MatMul (x, W2)
+      a = Add (h1, h2)
+      b = Relu (a)
+      c = Relu (a)
+      d = Add (b, c)
+      y = Identity (d)
+    }
+    '''
+)
+for name in ("W1", "W2"):
+    weight = rng.standard_normal((4, 4)).astype(np.float32)
+    model.graph.initializer.append(numpy_helper.from_array(weight, name=name))
+
+simplified, ok = onnxsim.simplify(model)
+spec = (TensorSpec("x", "float32", (1, 4), 0.0, 1.0),)
+case = GeneratedCase("a", seed=7, specs=spec)
+print(json.dumps({
+    "graph": graph_hash(graph_text(model)),
+    "simplified": graph_hash(graph_text(simplified)),
+    "simplified_checked": bool(ok),
+    "case_set": case_set_id([case]),
+    "feeds": tensor_digest(generate_feeds(case)["x"]),
+    "snapshot": save_snapshot(model, out_dir + "/model.onnx"),
+}, sort_keys=True))
+"""
+
+
+def _snapshot_in_fresh_process(tmp_path, hash_seed):
+    out_dir = tmp_path / f"run-{hash_seed}"
+    out_dir.mkdir()
+    env = {**os.environ, "PYTHONHASHSEED": str(hash_seed)}
+    proc = subprocess.run(
+        [sys.executable, "-c", _SNAPSHOT_CHILD, str(out_dir)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    # onnxsim may log to stdout, so the digests are on the last line.
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_snapshot_digests_are_identical_across_processes_and_hash_seeds(tmp_path):
+    # Different PYTHONHASHSEED values reorder Python sets and dict keys between
+    # runs, so equal digests here rule out ordering that depends on hashing.
+    runs = [_snapshot_in_fresh_process(tmp_path, seed) for seed in (0, 12345, 999)]
+    assert runs[0] == runs[1] == runs[2]
+    assert runs[0]["simplified_checked"]
