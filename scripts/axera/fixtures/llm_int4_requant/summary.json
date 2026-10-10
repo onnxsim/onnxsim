@@ -1,0 +1,69 @@
+{
+ "smol_v": {
+  "tensor": "model.layers.0.self_attn.v_proj.weight",
+  "rows": [
+   0,
+   64
+  ],
+  "cin": 576,
+  "row_block": 64,
+  "rule": "A",
+  "offset": 5636,
+  "column_blocks": [
+   576
+  ],
+  "mismatched_codes": 0,
+  "npu_params_bytes": 1943428
+ },
+ "smol_o": {
+  "tensor": "model.layers.0.self_attn.o_proj.weight",
+  "rows": [
+   192,
+   224
+  ],
+  "cin": 576,
+  "row_block": 32,
+  "rule": "A",
+  "offset": 416516,
+  "column_blocks": [
+   576
+  ],
+  "mismatched_codes": 1,
+  "npu_params_bytes": 1943428
+ },
+ "qwen3_q": {
+  "tensor": "model.layers.0.self_attn.q_proj.weight",
+  "rows": [
+   0,
+   32
+  ],
+  "cin": 1024,
+  "row_block": 32,
+  "rule": "B",
+  "offset": 1426436,
+  "column_blocks": [
+   480,
+   544
+  ],
+  "mismatched_codes": 0,
+  "npu_params_bytes": 8939524
+ },
+ "smol_down": {
+  "tensor": "model.layers.0.mlp.down_proj.weight",
+  "rows": [
+   0,
+   32
+  ],
+  "cin": 1536,
+  "row_block": 32,
+  "rule": "A",
+  "offset": 1455620,
+  "column_blocks": [
+   448,
+   544,
+   544
+  ],
+  "mismatched_codes": 0,
+  "npu_params_bytes": 1943428
+ }
+}
