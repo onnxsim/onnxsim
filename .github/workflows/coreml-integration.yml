@@ -421,6 +421,17 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v7
+      # The 3B-class entries (Llama-3.2-3B, Phi-3.5-mini) fail with "No space
+      # left on device" while copying the converted .mlpackage's weights: the
+      # HF checkpoint download plus the fp16 package and its temp copy exceed
+      # the stock macOS runner's free space. Drop the preinstalled simulator
+      # runtimes this job never uses, then report what's left.
+      - name: Free disk space
+        run: |
+          df -h /
+          xcrun simctl delete unavailable || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes /Library/Developer/CoreSimulator/Cryptex || true
+          df -h /
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"

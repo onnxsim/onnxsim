@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
