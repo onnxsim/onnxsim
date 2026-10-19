@@ -257,7 +257,7 @@ def run_one(
     gen_err = _generate(seed, max_nodes, model_dir, gen_timeout)
     if gen_err is not None:
         return CaseResult(seed, "gen_error", gen_err, model_dir)
-    result = _run_onnxsim(
+    run_args = (
         model_dir / "model.onnx",
         model_dir / "model.simplified.onnx",
         check_n,
@@ -265,6 +265,13 @@ def run_one(
         check_atol,
         sim_timeout,
     )
+    result = _run_onnxsim(*run_args)
+    if result.status == "onnxsim_timeout":
+        # A single timeout is not treated as a finding on its own: seed 58 timed
+        # out once on a shared runner but finished in about 0.5s on 20 local
+        # reruns. Retry once and gate only if the retry also times out, so a
+        # real slowdown still fails the job while a one-off stall does not.
+        result = _run_onnxsim(*run_args)
     result.seed = seed
     result.model_dir = model_dir
     return result
