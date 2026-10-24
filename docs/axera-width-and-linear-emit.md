@@ -269,11 +269,11 @@ Pulsar2 leaves out a write of the value a register already holds; `retarget` dro
 become redundant and re-pads the segment. It refuses a template whose zero points are below 256
 or shared between tensors, because such a template has already left out writes.
 
-`calibrate` reproduces Pulsar2's U16 MinMax on 23 of the 24 checked builds (zero point
-`65535 - rint(hi / s)`; dynamic MatMul inputs signed, `max|x| / 32767.5`). On the 24th, one
-ReduceMean output scale is two ulps off.
+`calibrate` reproduces Pulsar2's U16 MinMax on 27 of the 28 checked builds (zero point
+`rint(-lo / s)`, but 32767 for a symmetric range `lo = -hi`; dynamic MatMul inputs signed,
+`max|x| / 32767.5`). On the 28th, one ReduceMean output scale is two ulps off.
 
-Offline (`tests/test_axera_u16_retarget.py`, native builds as local scratch): across 15 op/shape
+Offline (`tests/test_axera_u16_retarget.py`, native builds as local scratch): across 16 op/shape
 groups (the SmolLM2-135M layer-0 programs plus calibration variants), every template-to-target
 pair either equals the native build of the target calibration or is refused for a stated reason.
 

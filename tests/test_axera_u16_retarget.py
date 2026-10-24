@@ -111,6 +111,8 @@ GROUPS = {
         None,
         [(f"{RC}/silu16", "y"), (f"{RC}/act16", "y")] + _v("mul1536", 1),
     ),
+    # the attention-mask Add between score and softmax (mask [-32, 0] -> zero point 65535)
+    "madd129": ("Add", ("x", "mask"), None, _v("madd129", 4)),
     "sig1536": ("Sigmoid", ("x",), None, [(f"{RC}/sig16", "y")] + _v("sig1536", 4)),
     "smx129": ("Softmax", ("x",), None, [(f"{RC}/smx16", "y")] + _v("smx129", 4)),
     "score": ("MatMul", ("a", "b"), None, [(f"{RC}/score16", "y")] + _v("score", 4)),
@@ -214,6 +216,9 @@ CALIBRATED = [
         ("act16", "Mul"),
     ]
 ] + [(f"{EW}/u16_ew_mean_1x576_2x", "ReduceMean"), (f"{EW}/u16_ew_n_d_1x576_2x", "Div")]
+CALIBRATED += [
+    (f"{V}/madd129/v{i}", "Add") for i in range(4)
+]  # v3: an exact .5 at an asymmetric range
 
 
 @pytest.mark.parametrize("directory,op", CALIBRATED)
@@ -240,7 +245,10 @@ def test_calibrate_reduce_mean_output_within_two_ulps():
 
 def test_symmetric_range_zero_point():
     s, zp = ur.unsigned_minmax(-0.1751, 0.1751)
-    assert zp == 32767  # rint(32767.5) would give 32768
+    assert zp == 32767  # rint(-lo / s) = rint(32767.5...) would give 32768
+    assert (
+        ur.unsigned_minmax(-36.0, 4.0)[1] == 58982
+    )  # an asymmetric exact .5 rounds up
     assert ur.unsigned_minmax(0.0, 2.0)[1] == 0
     assert ur.unsigned_minmax(-2.0, 0.0)[1] == 65535
 

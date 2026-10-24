@@ -4,8 +4,9 @@
 the same op and shape at the target calibration, from one native Pulsar2
 build at any other calibration; ``calibrate(directory, op)`` computes that
 calibration from the program's samples, so no Pulsar2 build is needed per
-calibration. Ops: Mul, Add (also with a constant operand), Div, ReduceMean,
-Sqrt, Sigmoid, Softmax and dynamic (two-input) MatMul, built with
+calibration. Ops: Mul, Add (also with a constant operand, and the
+attention-mask Add), Div, ReduceMean, Sqrt, Sigmoid, Softmax and dynamic
+(two-input) MatMul, built with
 ``layer_configs: [{op_types: [<op>], data_type: U16}]``. A constant-weight
 MatMul is a FullyConnected (``linear_emit.emit_linear_u16``).
 
@@ -102,12 +103,14 @@ def quant_of(directory: str) -> dict[str, tuple[float, int]]:
 
 # ---- calibration --------------------------------------------------------------------
 def unsigned_minmax(lo: float, hi: float) -> tuple[float, int]:
-    """U16 MinMax of a range folded with 0. The zero point comes from the top
-    of the range: equal to ``rint(-lo / s)`` except at an exact .5 (a
-    symmetric range), where Pulsar2 gives 32767."""
+    """U16 MinMax of a range folded with 0: ``zp = rint(-lo / s)``, except a
+    symmetric range (``lo == -hi``, e.g. RoPE's sin table), where Pulsar2
+    gives 32767 although ``-lo / s`` rounds to 32768."""
     lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
     s = F((hi - lo) / 65535.0)
-    return float(s), int(np.clip(65535 - np.rint(hi / float(s)), 0, 65535))
+    if lo == -hi and hi > 0:
+        return float(s), 32767
+    return float(s), int(np.clip(np.rint(-lo / float(s)), 0, 65535))
 
 
 def signed_absmax(absmax: float) -> tuple[float, int]:
