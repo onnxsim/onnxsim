@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `c77430344` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `dc4f9054e` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -965,6 +965,27 @@ DSP time with `onnxsim::MSDA` and `GEMM_FP16=1`, each column adding to the one b
 
 The attention softmax computes exp in fp16 and the row sum in qf32. Probabilities below 2^-13 of the row's largest become 0. On
 hexagon-sim its maximum absolute error is 1e-3 against fp32 on the same fp16 inputs.
+
+**Fused attention in VTCM.** After the glue above, the decoder's attention was still about 14 ms per layer. Most of it was P @ V
+(8 ms), which packed each of P's 6728 activation tiles from DRAM. A hand kernel in the fork
+(`test/external/dsp/hand/attn/`) keeps everything between the two products in VTCM:
+- per head, K^T and V are packed into VTCM tiles once;
+- per 32-query block, the HMX writes S = Q K^T into VTCM tiles;
+- the softmax runs on those tiles in place, in the HMX tile layout (one vector is an interleaved row pair);
+- the tiles are then P @ V's activation tiles as they are, in one `:deep` span.
+
+An HMX call runs on the graph thread, so the kernel is split per head into three calls: an HMX call for S, the softmax on the
+4-thread HVX pool, and an HMX call for P @ V. The pooled call gets the VTCM address through a small token buffer, because a
+kernel that mentions the HMX runs under its lock, off the pool. Each query block's tiles sit in their own 64 KB VTCM slot,
+because an HMX operand span that crosses a 256 KB window page-faults on the phone. On hexagon-sim, at 8 heads x 900 x 900, the
+fused single-call form takes 12.3 M cycles: 3.0 M for the HMX products and packing, the rest for the single-thread softmax.
+`HMX_ATTN=1` keeps that form; `HMX_ATTN=0` turns both off.
+
+| model | before | fused, one call (`HMX_ATTN=1`) | split, softmax on 4 threads (default) | vs onnxruntime on the plain export |
+|---|---:|---:|---:|---|
+| decoder | 156 ms | 115 ms | 88 ms | max rel 1.15e-3 |
+
+The encoders have no Q K^T attention and are unchanged (41 / 111 ms).
 
 The capture runs no kernels, so any value the importer reads on the host must exist before the capture. `dsp_graph_onnx.py`
 reads the small constants' values first (Gather indices, Split sizes). Before this, the 3-layer encoder's scalar Gather indices
