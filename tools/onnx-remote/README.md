@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `016db5d97` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `002b2cea7` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1017,5 +1017,12 @@ Still hand-written:
 - *The attention.* Generated (`HMX_ATTN=0`), the decoder takes 136 ms, because S and P make a 13.8 MB round trip through
   DRAM per layer.
 - *MSDA.* Generated (`HAND_MSDA=0`, the GridSample form), the decoder's sampling is 1.8 ms per call against 1.6 by hand
-  (decoder 87.6 ms). The encoder's camera sampling (6 maps, 8 points, visibility mask) is 38.5 ms against 6.3 ms, and its
-  temporal sampling 12.4 against 7.1 ms.
+  (decoder 87.6 ms). The encoder's camera sampling (6 maps, 8 points, visibility mask) is 36.9 ms against 6.3 ms, and its
+  temporal sampling 12.4 against 7.1 ms. A form split like the hand kernel was also tried:
+  - one elementwise kernel computes each tap's row and weight;
+  - a second gathers one 128-byte row per tap.
+
+  Its gather alone took 22.8 ms. The hand kernel skips the cameras a query doesn't see and the taps that fall outside the map.
+  A BEVFormer query sees 1-2 of the 6 cameras, and a static generated kernel samples all 6 with weight 0. Also, the vector
+  floor / float -> int helpers (`HVX_REVEC_CMP=1`) gave wrong results on the phone: there HVX float math is qf32, which
+  hexagon-sim doesn't model.
