@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `7aa6a2c87` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `7ad783f96` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -921,3 +921,26 @@ there took several fixes in the fork; each of these was slow and/or wrong on the
 
 One bug remains in the fork's HMX lowering: a single 32-row M tile with several K tiles gives wrong results (cos 0.71, in
 hexagon-sim too). `GEMM_FP16` avoids it by padding M to at least 64 rows.
+
+**The hand MSDA kernel as an ONNX op (`onnxsim::MSDA`).** `scripts/android/vision_models/bevformer_tiny/msda_hvx/export_msda_op.py`
+exports the encoder and decoder with each deformable-attention span (sampling grid -> GridSample -> attention weights -> sum
+over points -> average over visible cameras) as one `onnxsim::MSDA` node. It checks that export against `model.py`'s own
+forward in torch. The fork's ONNX importer lowers that node on the DSP to one call of the hand-written kernel
+(`msda_kernel.h`, its HVX qf32 body), with the queries split across `DSP_THREADS`; on other devices it uses GridSample. The rest
+of the graph is the usual generated code. onnxruntime has no MSDA, so `check_outputs.py --ref-model` takes the reference from the
+plain export (`<piece>.sim.onnx`) on the same inputs. With `GEMM_FP16=1` too:
+
+| model | GridSample (above) | `onnxsim::MSDA` | vs onnxruntime on the plain export |
+|---|---:|---:|---|
+| decoder (`decoder.msda.onnx`) | 581 ms | 528 ms | max rel 6.0e-4, cos 1.000000 |
+| encoder, 1 layer (`enc1.msda.onnx`) | 143 ms | 77 ms | max rel 3.3e-4, cos 0.9999998 |
+| encoder, 3 layers (`enc3.msda.onnx`) | 450 ms | 266 ms | max rel 8.4e-4, cos 0.99999994 |
+
+```sh
+python3 .../bevformer_tiny/msda_hvx/export_msda_op.py enc3 --ckpt <checkpoint.pth> --work work
+python3 .../onnx_remote/check_outputs.py work/enc3.msda.onnx out.bin --input-raw ... --ref-model work/enc3.sim.onnx --rtol 2e-3
+```
+
+The capture runs no kernels, so any value the importer reads on the host must exist before the capture. `dsp_graph_onnx.py`
+reads the small constants' values first (Gather indices, Split sizes). Before this, the 3-layer encoder's scalar Gather indices
+on its merged `value_proj` output all read as 0, so every layer sampled layer 0's camera maps (cos 0.59).
