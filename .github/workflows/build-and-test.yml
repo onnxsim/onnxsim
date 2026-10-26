@@ -128,7 +128,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/v')
       run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> ${GITHUB_ENV}
     - name: Build onnxsim wheels
-      uses: pypa/cibuildwheel@v4.3.1
+      uses: pypa/cibuildwheel@v4.3.4
       env:
         CIBW_BUILD: "${{ matrix.py_ver }}-*"
     - name: Check ABI3

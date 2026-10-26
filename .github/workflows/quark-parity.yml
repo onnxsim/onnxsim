@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 0
       - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Build cp312 wheel
-        uses: pypa/cibuildwheel@v4.3.1
+        uses: pypa/cibuildwheel@v4.3.4
         env:
           CIBW_BUILD: "cp312-manylinux_x86_64"
           CIBW_ARCHS: native
