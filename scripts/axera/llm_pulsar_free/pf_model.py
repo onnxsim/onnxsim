@@ -11,6 +11,8 @@ is emitted from or fed with.
   ``llm_pulsar_free_out/<MODEL>`` under the current directory);
 * ``GPTQ=1``: linear programs are emitted from ``<out>/gptq/*.npz``
   (``pf_gptq.py``) instead of round-to-nearest;
+* ``LLM_PF_SPLIT_FIRST`` / ``LLM_PF_SPLIT_KEYS``: the first set's split
+  linears (``split_override``; default the model's ``split_first``);
 * ``LLM_PF_FUSE``: the program layout (``pf_layout``), default the model's
   ``fuse``: ``0`` one program per step (``LAYER``, 15 executes per Qwen3
   layer), ``1`` residual Add + two-pass norm and q / k RoPE + k norm merged
@@ -22,7 +24,10 @@ is emitted from or fed with.
   rotate_half made in ``dnqk`` / ``n1qk`` (three linears instead of five),
   ``7`` also the attention into the program after it (``LAYER_FUSED7``, 2;
   without a per-head q / k norm layout 3's ``attn`` + ``on2``, 6), ``8`` the
-  whole layer as one program (``LAYER_FUSED8``, 1; Qwen3 only).
+  whole layer as one program (``LAYER_FUSED8``, 1; Qwen3 only), ``9`` also
+  the last layer and the final norm as one program (``alyrf``; Qwen3 only),
+  ``10`` also each split first-set layer as one program (``alyrs``), ``11``
+  also ``lm_head`` in the rest set's last program (``alyrfh``).
   Qwen3-0.6B defaults to 8, llama-160m (no per-head q / k norm: ``4`` to
   ``6`` and ``8`` do not apply, ``7`` is layout 3 with ``aon2``) to 3.
 * ``LLM_PF_ADD_OFFSET``: the Adds' offset words ``pf_generate.py`` writes,
@@ -241,12 +246,21 @@ class Config:
         if li == 0:
             return "L0", "n1qk"
         if self.is_split(st, li - 1, "down_proj"):
+            if self.whole_split(li - 1):
+                return f"L{li - 1}", "alyrs"
             return f"L{li}", "qk"
         return f"L{li - 1}", "alyr" if self.fuse >= 8 else "dnqk"
+
+    def whole_split(self, li: int) -> bool:
+        """``fuse=10``: a split first-set layer ``li`` is one program too
+        (``alyrs``, split gate / up / down linears inside), but the last."""
+        return self.fuse >= 10 and self.qk_norm and li + 1 < self.L
 
     def programs(self, st: str, wh: str) -> list[str]:
         """The programs of set ``st`` at ``wh`` (``L<i>`` or ``post``), in order."""
         if wh == "post":
+            if self.fuse >= 11 and self.qk_norm and st == "rest":
+                return []  # lm_head is in the last layer's alyrfh
             return list(self.post_programs)
         progs = list(self.layer_programs)
         if self.fuse >= 4 and self.qk_norm:
@@ -256,6 +270,8 @@ class Config:
             head = ["n1qk" if five else "n1q"] if li == 0 else []
             if li > 0 and self.is_split(st, li - 1, "down_proj"):
                 head = ["qkv5", "qk"] if five else ["qkv5"]
+                if self.whole_split(li - 1):
+                    head = []
             dnq = "dnqk" if five else "dnq"
             tail = ["on2g", dnq if li + 1 < self.L else "dn"]
             attn = ["attn"]
@@ -263,7 +279,13 @@ class Config:
                 attn, tail[0] = [], "aon2g"
             if self.fuse >= 8 and li + 1 < self.L:  # the whole layer
                 tail = ["alyr"]
-            if split:
+            elif self.fuse >= 9 and st == "rest":  # the last layer + final norm
+                # (the first set's last MLP cancels position 0's massive
+                # residual: its Add shifts 13, a write the templates elide)
+                tail = ["alyrfh" if self.fuse >= 11 else "alyrf"]
+            if split and self.whole_split(li):
+                attn, tail = [], ["alyrs"]
+            elif split:
                 attn, tail = ["attn"], ["on2", "gu", "silu_f", "down_proj", "dn"]
             return head + ([] if five else ["qk"]) + attn + tail
         if self.fuse >= 2:
@@ -412,6 +434,23 @@ class Config:
         return ids[:n]
 
 
+def split_override(spec: dict, env) -> dict:
+    """``spec`` with its first-set split linears taken from ``env``:
+    ``LLM_PF_SPLIT_FIRST`` the split layers (``"0,2"``; ``"-"`` none: every
+    first-set layer with s8 linears, as the rest set), ``LLM_PF_SPLIT_KEYS``
+    the split linears (``"gu,down_proj"``)."""
+    sf = spec.get("split_first")
+    if not sf:
+        return spec
+    sf = dict(sf)
+    if env.get("LLM_PF_SPLIT_FIRST") is not None:
+        ts = env["LLM_PF_SPLIT_FIRST"].split(",")
+        sf["layers"] = [int(t) for t in ts if t.strip() not in ("", "-")]
+    if env.get("LLM_PF_SPLIT_KEYS"):
+        sf["keys"] = env["LLM_PF_SPLIT_KEYS"].split(",")
+    return dict(spec, split_first=sf)
+
+
 def load(name: str | None = None, out: str | None = None) -> Config:
     """The ``Config`` the environment selects (see the module docstring)."""
     name = name or os.environ.get("MODEL", "llama160m")
@@ -428,6 +467,7 @@ def load(name: str | None = None, out: str | None = None) -> Config:
         spec["fuse"] = int(os.environ["LLM_PF_FUSE"])
     if os.environ.get("LLM_PF_ADD_OFFSET"):
         spec["add_offset"] = os.environ["LLM_PF_ADD_OFFSET"]
+    spec = split_override(spec, os.environ)
     return Config(
         ref.Model.load(snap),
         name=name,

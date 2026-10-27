@@ -286,11 +286,20 @@ class Chain:
             x = {"x": x["x"], "q": qr}
         res = x["x"]
         att_in = dict(q=x["q"], k=K, v=V, mask=cfg.mask_plan(p))
-        if (wh, "alyr") in self.f:  # fuse=8: the whole layer
+        ly = next((k for k in ("alyr", "alyrs") if (wh, k) in self.f), None)
+        if ly:  # fuse=8: the whole layer (fuse=10: a split one, alyrs)
             gn = cfg.gains(li + 1)[0]
             ins = {f"{k}_a": v for k, v in att_in.items()}
-            xn, qn, kn, vn = f("alyr")(**ins, a=res, g_1=g2, g=gn, **tabs(li + 1))
+            xn, qn, kn, vn = f(ly)(**ins, a=res, g_1=g2, g=gn, **tabs(li + 1))
             return {"x": xn, "q": qn, "kv": (kn, vn)}
+        if (wh, "alyrfh") in self.f:  # fuse=11: also lm_head (y: the logits)
+            ins = {f"{k}_a": v for k, v in att_in.items()}
+            xn, lg = f("alyrfh")(**ins, a=res, g_1=g2, g=cfg.ln_f)
+            return {"x": xn, "a": lg, "logits": lg}
+        if (wh, "alyrf") in self.f:  # fuse=9: the last layer and the final norm
+            ins = {f"{k}_a": v for k, v in att_in.items()}
+            xn, a = f("alyrf")(**ins, a=res, g_1=g2, g=cfg.ln_f)
+            return {"x": xn, "a": a}
         if (wh, "aon2g") in self.f:  # fuse=7: the attention is in aon2g
             x1, gu = f("aon2g")(**att_in, a=res, g=g2)
         elif (wh, "on2g") in self.f:
@@ -364,6 +373,8 @@ class Chain:
         return f("res2")(x1, f("down_proj")(act))
 
     def post(self, x):
+        if isinstance(x, dict) and "logits" in x:  # fuse=11: computed by alyrfh
+            return np.asarray(x["logits"]).reshape(-1)
         if self.cfg.fuse >= 4 and self.cfg.qk_norm:
             return self.f[("post", "lm_head")](x["a"]).reshape(-1)
         if self.cfg.fuse >= 2:

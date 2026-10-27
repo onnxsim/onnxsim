@@ -221,7 +221,7 @@ def _config(name, out, fuse=0):
 
 
 WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
-WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5, 6, 7, 8)]
+WIRING += [("qwen3_like", f) for f in range(1, 12)]
 WIRING += [(m, f) for m in ("llama_gqa", "llama_mha") for f in (1, 2, 3, 7)]
 
 
@@ -338,7 +338,8 @@ def test_template_names():
 
 @pytest.mark.parametrize(
     "fuse,runs",
-    [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3), (7, 2), (8, 1)],
+    [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3), (7, 2), (8, 1)]
+    + [(9, 1), (10, 1), (11, 1)],
 )
 def test_programs_per_layer(fuse, runs):
     """Executes per layer of the rest set; layer 0 also runs the first norm,
@@ -347,7 +348,22 @@ def test_programs_per_layer(fuse, runs):
     # fuse=8: the synthetic model's L1 is its last layer (aon2g + dn)
     progs = cfg.programs("rest", "L0" if fuse == 8 else "L1")
     assert len([k for k in progs if k != "n1qk"]) == runs
-    if fuse == 8:
+    if fuse == 11:  # lm_head joins the rest set's last program
+        assert cfg.programs("rest", "L1") == ["alyrfh"]
+        assert cfg.programs("rest", "post") == []
+        assert cfg.programs("first", "post") == ["lm_head"]
+        assert cfg.programs("first", "L0") == ["n1qk", "alyrs"]
+    elif fuse == 10:  # the split first-set layer 0 is one program too
+        assert cfg.programs("first", "L0") == ["n1qk", "alyrs"]
+        assert cfg.programs("first", "L1") == ["aon2g", "dn"]
+        assert cfg.kv_producer("first", 1) == ("L0", "alyrs")
+        assert cfg.programs("rest", "L1") == ["alyrf"]
+    elif fuse == 9:  # the last layer is one program too
+        assert cfg.programs("rest", "L0") == ["n1qk", "alyr"]
+        assert cfg.programs("rest", "L1") == ["alyrf"]
+        assert cfg.programs("first", "L1") == ["qkv5", "qk", "aon2g", "dn"]
+        assert cfg.programs("rest", "post") == ["lm_head"]
+    elif fuse == 8:
         assert cfg.programs("rest", "L0") == ["n1qk", "alyr"]
         assert cfg.programs("rest", f"L{cfg.L - 1}") == ["aon2g", "dn"]
         assert cfg.programs("first", "L0")[:3] == ["n1qk", "attn", "on2"]  # split
@@ -400,6 +416,12 @@ def test_merged_template_names():
     eight = set(tpl.needed(_config("qwen3_like", ".", 8)))
     seven = set(tpl.needed(_config("qwen3_like", ".", 7)))
     assert "alyrqkr64" in eight and "alyrqkr64" not in seven
+    nine = set(tpl.needed(_config("qwen3_like", ".", 9)))
+    assert nine - eight == {"alyrf64"}
+    ten = set(tpl.needed(_config("qwen3_like", ".", 10)))
+    assert ten - nine == {"alyrqkrs64"}
+    eleven = set(tpl.needed(_config("qwen3_like", ".", 11)))
+    assert eleven - ten == {f"alyrf64x{_config('qwen3_like', '.').vocab}"}
 
 
 @pytest.mark.parametrize("name", ["nrmqkr32", "slanormqkr64"])
@@ -533,3 +555,65 @@ def test_generate_patches_add_offsets(monkeypatch):
         ("/set", "/set", "rest", "L3", "alyr"),
         ("/set", "/set", "rest", "L3", "lm"),
     ]
+
+
+def test_alyrf_graph_is_its_parts():
+    """``alyrf`` (``fuse=9``, the last layer) computes ``alanorm``, the gate /
+    up linears, then ``slanorm`` (SiLU + down_proj + residual Add + the final
+    norm); ``alyrf<n>x<v>`` (``fuse=11``) also ``lm_head`` on the norm."""
+    ops, body, ins, outs, inits, gens = tpl.graph("alyrf64", DIMS)
+    assert list(outs) == ["x", "y"] and "cq" not in ins and len(gens) == 4
+    gen, ws = gens[1]
+    w = {**inits, **ws}
+    feeds = gen(np.random.default_rng(0))
+    got = ReferenceEvaluator(tpl.model_of(body, ins, outs, w)).run(None, feeds)
+
+    def run(name, feeds, **weights):
+        g = tpl.float_graph(name, DIMS)
+        for i in g.graph.initializer:
+            if i.name in weights:
+                i.CopyFrom(onnx.numpy_helper.from_array(weights[i.name], i.name))
+        names = [o.name for o in g.graph.output]
+        return dict(zip(names, ReferenceEvaluator(g).run(None, feeds)))
+
+    fins = tpl.graph("alanorm64", DIMS)[2]
+    a = run("alanorm64", {t: feeds[tpl.lyr_name(t)] for t in fins}, w=w["w_1"])
+    gate, up = a["y"] @ w["wg"], a["y"] @ w["wu"]
+    b = run("slanorm64", dict(gate=gate, up=up, a=a["x"], g=feeds["g"]), w=w["w"])
+    for name, v in zip(outs, got):
+        np.testing.assert_allclose(v, b[name], rtol=1e-5, atol=1e-5)
+    _, bh, insh, outsh, initsh, _ = tpl.graph("alyrf64x48", DIMS)
+    assert list(outsh) == ["x", "y"] and outsh["y"] == [1, 48]
+    wh = {**initsh, **{k: v for k, v in w.items() if k in initsh and k != "w2"}}
+    yh = ReferenceEvaluator(tpl.model_of(bh, insh, outsh, wh)).run(None, feeds)[1]
+    np.testing.assert_allclose(yh, got[1] @ wh["w2"], rtol=1e-4, atol=1e-5)
+
+
+def test_alyrqkrs_split_linears():
+    """``alyrqkrs`` (``fuse=10``) is ``alyrqkr`` with the gate, up and down
+    linears each two linears and an Add: with the second parts zero it equals
+    ``alyrqkr``; its variants keep ``alanorm``'s v0 half."""
+    ops, body, ins, outs, inits, gens = tpl.graph("alyrqkrs64", DIMS)
+    assert len(gens) == 6
+    _, body8, ins8, outs8, inits8, gens8 = tpl.graph("alyrqkr64", DIMS)
+    assert ins == ins8 and outs == outs8
+    gen, ws = gens[1]
+    z = {k: np.zeros_like(inits[k]) for k in ("wgl", "wul", "wl")}
+    got = ReferenceEvaluator(tpl.model_of(body, ins, outs, {**inits, **ws, **z}))
+    want = ReferenceEvaluator(tpl.model_of(body8, ins8, outs8, {**inits8, **ws}))
+    feeds = gen(np.random.default_rng(1))
+    for a, b in zip(got.run(None, feeds), want.run(None, feeds)):
+        np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
+
+
+def test_split_override():
+    spec = dict(split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]))
+    assert pf_model.split_override(spec, {}) == spec
+    got = pf_model.split_override(spec, {"LLM_PF_SPLIT_FIRST": "-"})
+    assert got["split_first"] == dict(layers=[], keys=["gu", "down_proj"])
+    got = pf_model.split_override(
+        spec, {"LLM_PF_SPLIT_FIRST": "2", "LLM_PF_SPLIT_KEYS": "down_proj"}
+    )
+    assert got["split_first"] == dict(layers=[2], keys=["down_proj"])
+    assert spec["split_first"]["layers"] == [0, 1, 2]  # not modified
+    assert pf_model.split_override({}, {"LLM_PF_SPLIT_FIRST": "-"}) == {}

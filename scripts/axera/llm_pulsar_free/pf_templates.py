@@ -53,7 +53,9 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
   (``u16_retarget.fuse_silu``) whose table is ~5x less accurate than the
   Sigmoid table and the Mul; ``alyrqk<n>`` / ``alyrqkr<n>`` (``fuse=8``:
   ``alyrqkr``, the whole layer) with ``alanorm<n>`` (the attention's tensors
-  suffixed ``_a``) in place of ``lanorm<n>``.
+  suffixed ``_a``) in place of ``lanorm<n>``; ``alyrf<n>`` (``fuse=9``, the
+  last layer) with ``slanorm<I>`` (the final norm) in place of
+  ``slanormqkr<I>``: outputs ``x`` and ``y``, no RoPE tables.
 
 usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [--jobs N]
        [--mem-gb G] [NAME...]
@@ -445,7 +447,7 @@ def graph(name: str, d: Dims):
     m = re.fullmatch(
         r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
         r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk|alanorml?"
-        r"|a?lyrqkr?)"
+        r"|alyrqkrs|a?lyrqkr?|alyrf)"
         r"(\d+)(?:x(\d+))?(t?)",
         name,
     )
@@ -490,6 +492,16 @@ def graph(name: str, d: Dims):
         return ops, body, ins, outs, inits, gens
     if kind in ("lyrqk", "lyrqkr", "alyrqk", "alyrqkr"):
         return _lyr_graph(n, d, rot=kind.endswith("r"), attn=kind[0] == "a")
+    if kind == "alyrqkrs":
+        # ``alyrqkr<n>`` with the gate, up and down linears split in two
+        # (``W ~ Q8 + R8``: ~16-bit weights for the first set's layers 0-2)
+        return _lyr_graph(n, d, rot=True, attn=True, split=True)
+    if kind == "alyrf":
+        # the last layer as one program: ``alanorm<n>``, gate / up, then
+        # ``slanorm<I>`` (the final norm), or ``slanorml<I>x<n2>`` (the final
+        # norm and ``lm_head``)
+        tail = f"slanorml{d.I}x{n2}" if n2 else f"slanorm{d.I}"
+        return _lyr_graph(n, d, attn=True, tail=tail)
     eps = {"eps": np.array([d.eps], F)}
     heads = {
         "shh": np.array([n // d.hd, d.hd], np.int64),
@@ -693,6 +705,24 @@ LYR_VARIANTS += ((0, 3, 1), (0, 1, 0.8), (0, 1, 1.25))
 #: off); every variant keeps ``lanorm``'s v0 but the last two
 ALYR_VARIANTS = ((0, 0, 1), (0, 1, 1), (0, 1, 0.8), (0, 1, 1.25), (0, 2, 1))
 ALYR_VARIANTS += ((0, 3, 1), (2, 2, 1), (3, 3, 1))
+#: ``alyrqkrs``: the split gate / up linears (``W ~ Q8 + R8``) and down linear
+SPLIT_MID = """
+  gh = MatMul(y_1, wg)
+  gl = MatMul(y_1, wgl)
+  gate = Add(gh, gl)
+  uh = MatMul(y_1, wu)
+  ul = MatMul(y_1, wul)
+  up = Add(uh, ul)
+"""
+SPLIT_DOWN = """
+  bh = MatMul(z, w)
+  bl = MatMul(z, wl)
+  b = Add(bh, bl)
+"""
+#: the template's second parts' weights, relative to the first parts'
+SPLIT_LO = 1 / 256
+#: ``alyrf``'s variants (no RoPE): ``alanorm``'s v0 with each ``slanorm`` variant
+ALYRF_VARIANTS = ((0, 0, 1), (0, 1, 1), (0, 2, 1), (0, 3, 1))
 
 
 def lyr_name(t: str) -> str:
@@ -703,35 +733,63 @@ def lyr_name(t: str) -> str:
     return f"{t}_a" if t in LYR_ATTN else f"{t}_1"
 
 
-def _lyr_graph(n: int, d: Dims, rot: bool = False, attn: bool = False):
+def _lyr_graph(
+    n: int,
+    d: Dims,
+    rot: bool = False,
+    attn: bool = False,
+    tail: str | None = None,
+    split: bool = False,
+):
     """``lyrqk<n>``: ``lanorm<n>`` + gate / up linears + ``slanormqk<I>``
     (``lyrqkr<n>``: ``slanormqkr<I>``, q / k rotated in the program;
-    ``alyrqk<n>`` / ``alyrqkr<n>``: ``alanorm<n>``, the attention first)."""
+    ``alyrqk<n>`` / ``alyrqkr<n>``: ``alanorm<n>``, the attention first).
+    ``tail``: another second half (``slanorm<I>`` / ``slanorml<I>x<n2>``:
+    ``alyrf``, no q / k / v, no RoPE tables). ``split``: the gate, up and down
+    linears each as two linears and an Add (``alyrqkrs``: ``gate = gh + gl``,
+    ``gh = y_1 @ wg``, ``gl = y_1 @ wgl``; ``up`` and ``b`` alike)."""
     if n != d.nh * d.hd:
         raise ValueError(f"lyrqk{n}: the model's q width is {d.nh * d.hd}")
     ops1, b1, ins1, _, in1, g1s = graph(f"{'a' if attn else ''}lanorm{n}", d)
-    ops2, b2, ins2, outs2, in2, g2s = graph(f"slanormqk{'r' if rot else ''}{d.I}", d)
+    tail = tail or f"slanormqk{'r' if rot else ''}{d.I}"
+    qk = tail.startswith("slanormqk")
+    ops2, b2, ins2, outs2, in2, g2s = graph(tail, d)
     b1 = re.sub(r"\b[A-Za-z_]\w*\b", lambda t: _lyr_word(t.group(0)), b1)
     b2 = b2.replace("  x = Add(a, b)\n", "  x = Add(x_1, b)\n")
     # Mul(sg, gate), not Mul(gate, sg): Pulsar2 then keeps the Sigmoid table and
     # the Mul (a fused Silu's table interpolates x * sigmoid(x) ~5x coarser)
     b2 = b2.replace("  sl = Mul(gate, sg)\n", "  sl = Mul(sg, gate)\n")
-    body = b1 + "  gate = MatMul(y_1, wg)\n  up = MatMul(y_1, wu)\n" + b2
+    mid = "  gate = MatMul(y_1, wg)\n  up = MatMul(y_1, wu)\n"
+    if split:
+        mid = SPLIT_MID
+        b2 = b2.replace("  b = MatMul(z, w)\n", SPLIT_DOWN)
+    body = b1 + mid + b2
     ins = {lyr_name(k): v for k, v in ins1.items()} | {"g": [1, d.H]}
-    ins |= {t: ins2[t] for t in ("cq", "sq", "ck", "sk")}
+    if qk:
+        ins |= {t: ins2[t] for t in ("cq", "sq", "ck", "sk")}
     inits = {lyr_name(k): v for k, v in in1.items()}
     inits |= {"wg": template_weight(d.H, d.I, 11), "wu": template_weight(d.H, d.I, 12)}
     inits |= in2
+    if split:  # the second parts: about a weight rounding step (~1 / 256)
+        for t, (k, m), seed in (("wgl", (d.H, d.I), 13), ("wul", (d.H, d.I), 14)):
+            inits[t] = (template_weight(k, m, seed) * F(SPLIT_LO)).astype(F)
+        inits["wl"] = (template_weight(d.I, d.H, 15) * F(SPLIT_LO)).astype(F)
     gens = []
     # variant i: the halves' variants i; then lanorm's v0 (the residual Add at
     # shift 15, as every real o_proj target) with slanormqk's v1..v3 (q / k
     # RoPE Adds at lower shifts)
-    for i, j, ks in ALYR_VARIANTS if attn else LYR_VARIANTS:
-        ga, (gb, ws) = g1s[i], g2s[j]
+    variants = ALYR_VARIANTS if attn else LYR_VARIANTS
+    if split:  # lanorm's v2 / v3 halves (v6, v7) gave wrong x / yq / v on the card
+        variants = [v for v in variants if v[0] == 0]
+    for i, j, ks in variants if qk else ALYRF_VARIANTS:
+        ga, gb = g1s[i], g2s[j]
+        gb, ws = gb if isinstance(gb, tuple) else (gb, {})
 
         def gen(r, ga=ga, gb=gb, ks=ks):
             fa, fb = ga(r), gb(r)
             out = {lyr_name(k): v for k, v in fa.items()} | {"g": fb["g"]}
+            if not qk:
+                return out
             out |= {t: fb[t] for t in ("cq", "sq")}
             return out | {t: (fb[t] * F(ks)).astype(F) for t in ("ck", "sk")}
 
@@ -818,6 +876,12 @@ def needed(cfg) -> list[str]:
             names += [f"alanorml{qd}x{2 * inter}" if cfg.qk_norm else f"alanorm{qd}"]
         if cfg.fuse >= 8 and cfg.qk_norm:
             names += [f"alyrqk{r}{qd}"]
+        if cfg.fuse >= 9 and cfg.qk_norm:
+            names += [f"alyrf{qd}"]
+        if cfg.fuse >= 11 and cfg.qk_norm:
+            names += [f"alyrf{qd}x{cfg.vocab}"]
+        if cfg.fuse >= 10 and cfg.qk_norm and cfg.split_first["layers"]:
+            names += [f"alyrqkrs{qd}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]

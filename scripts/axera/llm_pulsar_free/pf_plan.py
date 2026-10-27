@@ -455,11 +455,29 @@ class Plan:
             att_in = dict(q=q, k=self.K[li], v=self.V[li], mask=self.mask)
             gn = self.gain[li + 1][0] if li + 1 < cfg.L else self.gf
             g2 = self.gain[li][1]
-            if "alyr" in progs:  # fuse=8: the whole layer
+            ly = next((k for k in ("alyr", "alyrs") if k in progs), None)
+            if ly:  # fuse=8: the whole layer (fuse=10: a split one, alyrs)
                 ins = {f"{k}_a": v for k, v in att_in.items()}
-                self._bind_ins(st, wh, "alyr", **ins, a=x, g_1=g2, g=gn, **tabs(li + 1))
-                x = self.outputs(st, wh, "alyr", skip=("yq", "yk", "v"))["x"]
-                q = self._qbuf(st, wh, "alyr", li + 1)
+                self._bind_ins(st, wh, ly, **ins, a=x, g_1=g2, g=gn, **tabs(li + 1))
+                x = self.outputs(st, wh, ly, skip=("yq", "yk", "v"))["x"]
+                q = self._qbuf(st, wh, ly, li + 1)
+                continue
+            if "alyrfh" in progs:  # fuse=11: also lm_head; y is the logits
+                ins = {f"{k}_a": v for k, v in att_in.items()}
+                self._bind_ins(st, wh, "alyrfh", **ins, a=x, g_1=g2, g=gn)
+                io["logits"] = self.outputs(st, wh, "alyrfh")["y"]
+                return io
+            if "alyrf" in progs:  # fuse=9: the last layer and the final norm
+                ins = {f"{k}_a": v for k, v in att_in.items()}
+                self._bind_ins(st, wh, "alyrf", **ins, a=x, g_1=g2, g=gn)
+                # the buffers of the first set's ``dn``: the shared lm_head
+                # reads one input buffer in both sets
+                m = self.M[(st, wh, "alyrf")]
+                o = {
+                    s.name: self._out(st, wh, "dn", "alyrf", i)
+                    for i, s in enumerate(m.outputs)
+                }
+                x, a = o["x"], o["y"]
                 continue
             if "aon2g" in progs:  # fuse=7: the attention is in aon2g
                 self._bind_ins(st, wh, "aon2g", **att_in, a=x, g=g2)
@@ -591,7 +609,7 @@ class Plan:
                 if lj is not None:  # this program writes layer lj's K (and V) row
                     row = p * kvd * 4
                     self.bind(st, wh, k, "O", kout, self.K[lj], row, now=False)
-                    v_out = k in ("n1qk", "dnqk", "alyr")
+                    v_out = k in ("n1qk", "dnqk", "alyr", "alyrs")
                     if v_out:
                         self.bind(st, wh, k, "O", "v", self.V[lj], row, now=False)
                 X(wh, k)
@@ -600,7 +618,7 @@ class Plan:
                     self.lines.append(f"C {self.V[lj]} {row} {y5} {ov * 4} {kvd * 4}")
         for k in cfg.programs(st, "post"):
             X("post", k)
-        nb = self.M[(st, "post", "lm_head")].outputs[0].nbytes
+        nb = cfg.vocab * 4
         self.lines.append(f"R {self.io[st]['logits']} 0 {nb} {self.g}/t/logits.bin")
         tm = self.run("step")
         return np.fromfile(os.path.join(self.h, "t", "logits.bin"), F32), tm
@@ -617,7 +635,7 @@ def _io_stub(k, n):
 
 #: merged programs that hold a linear (their float graphs carry its weights)
 MERGED_LINEAR = ("on2", "dn", "on2g", "dnq", "n1q", "dnqk", "n1qk", "aon2g", "aon2")
-MERGED_LINEAR += ("alyr",)
+MERGED_LINEAR += ("alyr", "alyrf", "alyrfh", "alyrs")
 
 
 def _float_program(cfg, d, wh, k, ml, fused):
@@ -664,6 +682,28 @@ def _float_program(cfg, d, wh, k, ml, fused):
                 "qkv": ("qkv5", li + 1),
             },
         ),
+        "alyrf": (
+            f"alyrf{qd}",
+            {"w_1": ("o_proj", li), "gu": ("gu", li), "w": ("down_proj", li)},
+        ),
+        "alyrfh": (
+            f"alyrf{qd}x{cfg.vocab}",
+            {
+                "w_1": ("o_proj", li),
+                "gu": ("gu", li),
+                "w": ("down_proj", li),
+                "w2": ("lm_head", None),
+            },
+        ),
+        "alyrs": (  # the second parts of the split linears zero: float weights
+            f"alyrqkrs{qd}",
+            {
+                "w_1": ("o_proj", li),
+                "gu": ("gu", li),
+                "w": ("down_proj", li),
+                "qkv": ("qkv5", li + 1),
+            },
+        ),
     }[k]
     fg = tpl.float_graph(name, d)
     for wn, (key, lj) in ws.items():
@@ -682,6 +722,10 @@ def _float_program(cfg, d, wh, k, ml, fused):
         for pn, pw in parts.items():
             wi = next(i for i in fg.graph.initializer if i.name == pn)
             wi.CopyFrom(onnx.numpy_helper.from_array(np.ascontiguousarray(pw), pn))
+    for wi in fg.graph.initializer:
+        if k == "alyrs" and wi.name in ("wgl", "wul", "wl"):
+            z = np.zeros_like(onnx.numpy_helper.to_array(wi))
+            wi.CopyFrom(onnx.numpy_helper.from_array(z, wi.name))
     return fg
 
 

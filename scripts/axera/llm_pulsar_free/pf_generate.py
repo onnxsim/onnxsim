@@ -153,6 +153,11 @@ def _owner():
     return u, g
 
 
+def _r2(a):
+    """``[lo, hi]`` of ``a``'s range x2 (folded with 0), as a linear's output."""
+    return [2 * min(float(np.min(a)), 0.0), 2 * max(float(np.max(a)), 0.0)]
+
+
 def rng2(*arrs):
     """U16 MinMax of the arrays' range x2 (folded with 0)."""
     lo = min(float(np.min(a)) for a in arrs)
@@ -1136,14 +1141,17 @@ class Generator:
                 ml[k]["parts"] = {p: dict(col=o[p], n=n) for p, n in parts}
         man[w] = ml
 
-    def alyr(self, st, li, A, C, D, ml, x, g2, gn):
+    def alyr(self, st, li, A, C, D, ml, x, g2, gn, split=False):
         """The whole layer as one program (``alyrqk<nh*hd>``): ``aon2g`` +
         SiLU + ``dnqk``. Each half calibrated as its own program was (``norm2``
         ranges; the attention as ``aon2g``'s, its MatMul operands signed), the
         first half's tensors renamed as in the template (``tpl.lyr_name``), the
         gate / up linears' outputs as the SiLU's inputs (x sqrt(2) copies, as
         ``dnqk``'s inputs were), the residual ``x_1`` the union of both
-        halves'."""
+        halves'. ``split`` (``alyrs``): the gate, up and down linears as
+        ``split`` does them, ``W ~ Q8 + R8`` from the original weights, each
+        part's output at the real range x2 (the down linear's first part x
+        2 sqrt(2), see below)."""
         cfg = self.cfg
 
         def r2(k):
@@ -1167,6 +1175,13 @@ class Generator:
         rgs.append(
             {"y_1": [2 * min(float(m.min()), 0.0), 2 * max(float(m.max()), 0.0)]}
         )
+        last = li + 1 == cfg.L  # ``alyrf``: the final norm, no q / k / v
+        head = None  # ``alyrfh``: lm_head after the final norm, as its program
+        if last and "alyrfh" in cfg.programs(st, f"L{li}"):
+            P = self._acts(st, "post")
+            xn = P["xn"].reshape(len(P["xn"]), -1).astype(F32)
+            lg = P["logits"].reshape(len(P["logits"]), -1)
+            head = (cfg.merged_weight("lm_head"), xn, [lg])
         rg2, _, w2, u2, _ = self.norm2(
             C,
             D,
@@ -1178,20 +1193,49 @@ class Generator:
             z=r2("act"),
             w=cfg.merged_weight("down_proj", li),
             silu=(r2("gate"), r2("up")),
-            qkv=li + 1,
+            qkv=None if last else li + 1,
+            post=head,
             ranges=True,
         )
         rgs += [{("x_1" if t == "a" else t): r for t, r in rg.items()} for rg in rg2]
         wgu = cfg.merged_weight("gu", li)
         og = pf_model.lay.offsets(cfg.GU)
-        ws = {"w_1": w1, **w2}
+        ws = {"w_1": w1, **(w2 if isinstance(w2, dict) else {"w": w2})}
         ws["wg"] = wgu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
         ws["wu"] = wgu[:, og["up_proj"] : og["up_proj"] + cfg.I]
         um = max(float(np.abs(u1).max()), float(np.abs(u2).max()))
         name = f"alyrqk{'r' if cfg.fuse >= 6 else ''}{cfg.nh * cfg.hd}"
+        key = "alyr"
+        if last:
+            name, key = f"alyrf{cfg.nh * cfg.hd}", "alyrf"
+            if head is not None:
+                name, key = f"{name}x{cfg.vocab}", "alyrfh"
+        if split:
+            name, key = f"alyrqkrs{cfg.nh * cfg.hd}", "alyrs"
+            sw = cfg.merged_weight("gu", li, gptq=False)
+            parts = dict(
+                g=sw[:, og["gate_proj"] : og["gate_proj"] + cfg.I],
+                u=sw[:, og["up_proj"] : og["up_proj"] + cfg.I],
+            )
+            rg = {}
+            for t, w in parts.items():
+                q, r = cfg.split_weights(w)
+                ws[f"w{t}"], ws[f"w{t}l"] = w, r
+                rg[f"{t}h"], rg[f"{t}l"] = _r2(m @ q), _r2(m @ r)
+            w = cfg.merged_weight("down_proj", li, gptq=False)
+            q, r = cfg.split_weights(w)
+            ws["w"], ws["wl"] = w, r
+            z = r2("act")
+            # bh at sqrt(2) x its range x2: wider than ``b``'s (the linear's
+            # real range x2), so ``b = bh + bl`` shifts 14 as the gate / up
+            # sums do (their sums are calibrated as the SiLU's inputs, x
+            # sqrt(2)); a template elides the repeated shift write
+            rg["bh"] = [v * float(K2) for v in _r2(z @ q)]
+            rg["bl"] = _r2(z @ r)
+            rgs.append(rg)
         signed = {tpl.lyr_name(t) for t in sg1}
         return self.merged(
-            C, D, "alyr", name, rgs, ml, dict(u_absmax=um), w=ws, signed=signed
+            C, D, key, name, rgs, ml, dict(u_absmax=um), w=ws, signed=signed
         )
 
     def layer_fused8(self, st, li, man):
@@ -1199,7 +1243,7 @@ class Generator:
         ``dnqk`` as one program (``alyr``) where ``pf_model.Config.programs``
         has it."""
         progs = self.cfg.programs(st, f"L{li}")
-        if "alyr" not in progs:
+        if not {"alyr", "alyrf", "alyrfh", "alyrs"} & set(progs):
             return self.layer_fused5(st, li, man)
         cfg = self.cfg
         w = f"L{li}"
@@ -1238,11 +1282,16 @@ class Generator:
                 ml,
                 dict(u_absmax=float(np.abs(uk).max())),
             )
-        self.alyr(st, li, A, C, D, ml, r2("x"), g2, cfg.gains(li + 1)[0])
+        gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
+        split = "alyrs" in progs
+        self.alyr(st, li, A, C, D, ml, r2("x"), g2, gn, split=split)
         man[w] = ml
 
     def post_fused2(self, st, man):
         cfg = self.cfg
+        if not cfg.programs(st, "post"):  # fuse=11: lm_head is in alyrfh
+            man["post"] = {}
+            return
         D = os.path.join(self.out, st, "post")
         os.makedirs(D, exist_ok=True)
         ml = {}
@@ -1540,7 +1589,7 @@ def _run_one(job):
     layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
     layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
     layer += [gen.layer_fused5 if cfg.qk_norm else gen.layer_fused2]
-    layer += [gen.layer_fused8]
+    layer += [gen.layer_fused8] * 4
     layer[cfg.fuse](st, li, man)
     if _ADD_OFFSET == "exact":
         _exact_offsets(st, f"L{li}", man[f"L{li}"])
@@ -1679,8 +1728,9 @@ def main():
         )
         n1, n2 = [("n1_rms", "n2_rms"), ("n1", "n2")][min(cfg.fuse, 1)]
         if cfg.fuse >= 2:
-            n1 = next(k for k in ("on2", "on2g", "aon2g", "aon2", "alyr") if k in ml)
-            n2 = next(k for k in ("dnqk", "dnq", "dn", "alyr") if k in ml)
+            ly = ("alyr", "alyrf", "alyrfh", "alyrs")
+            n1 = next(k for k in ("on2", "on2g", "aon2g", "aon2", *ly) if k in ml)
+            n2 = next(k for k in ("dnqk", "dnq", "dn", *ly) if k in ml)
         print(
             f"{st} L{li}: {len(ml)} programs, templates {tnames}, u max "
             f"{ml[n1]['u_absmax']:.1f}/{ml[n2]['u_absmax']:.1f}, "
