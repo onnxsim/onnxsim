@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `73f3ef25e` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `9edd28d9e` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1359,3 +1359,22 @@ was worked on in parallel on its own branch, then merged (fork commit `73f3ef25e
 | encoder, 3 layers | 40.0 ms | 29.6 ms |
 
 All pass against onnxruntime.
+
+**No hand kernels left.** Since fork commit `9edd28d9e`, every kernel in BEVFormer's three programs is generated. Two hand
+kernels were still in use:
+- **The decoder's MSDA (900 queries).** The generated MSDA kernel was already faster than the hand one, 2.9 vs 3.3 ms over six
+  layers, but layers 1, 3 and 4 also ran two prep kernels each. Those layers' reference points are refined by a sigmoid of
+  the previous layer's regression. The tables broadcast them over heads and taps, and that broadcast of computed values ends
+  the scheduler's ranges. The tap columns and rows (`x0 + tap`, `y0 + tap`) were therefore realized as (Q, M, 4, P) int
+  buffers by scalar kernels, 0.2-0.6 ms each. Storing the reference points first (a few KB) keeps the taps in the MSDA
+  kernel's register tables. MSDA is now generated at any query count (`MSDA_GEN_MIN_Q=0`): decoder 23.5 -> 22.7 ms.
+- **The row copy for the one-row can_bus MLP** (1 x 18 padded to 64 x 32). Padded both ways in one go, every lane was a
+  scalar fp16 select, 94 vs 11 us. Columns first, then rows, gives one vector select per row instead.
+
+| model | hand kernels in use | all generated |
+|---|---:|---:|
+| decoder | 23.5 ms | 22.7 ms |
+| encoder, 1 layer | 9.7 ms | 9.8 ms |
+| encoder, 3 layers | 29.6 ms | 29.5 ms |
+
+All pass against onnxruntime. The hand kernels stay available behind `HAND_MSDA=1`, `HAND_ROWCOPY=1` and `HMX_ATTN=1|2`.
