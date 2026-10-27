@@ -23,8 +23,12 @@ is emitted from or fed with.
   ``7`` also the attention into the program after it (``LAYER_FUSED7``, 2;
   without a per-head q / k norm layout 3's ``attn`` + ``on2``, 6), ``8`` the
   whole layer as one program (``LAYER_FUSED8``, 1; Qwen3 only).
-  Qwen3-0.6B defaults to 5, llama-160m (no per-head q / k norm: ``4`` to
+  Qwen3-0.6B defaults to 8, llama-160m (no per-head q / k norm: ``4`` to
   ``6`` and ``8`` do not apply, ``7`` is layout 3 with ``aon2``) to 3.
+* ``LLM_PF_ADD_OFFSET``: the Adds' offset words ``pf_generate.py`` writes,
+  default the model's ``add_offset``: ``exact`` (Qwen3-0.6B;
+  ``u16_retarget.exact_add_offset``, as ``pf_add_offset.py`` patches a set) or
+  ``pulsar2`` (llama-160m; Pulsar2's own word, with its zero-point bias).
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -75,6 +79,9 @@ MODELS = {
         zero_pos0=True,
         fuse=3,
         nl_tokens=(13,),  # "\n" (<0x0A>)
+        # exact Add offsets were tried (layouts 3 and 7): mean logit error
+        # 0.1 points lower, one more top-1 miss at a near tie (adaquant 30)
+        add_offset="pulsar2",
     ),
     # Per-head q / k RMSNorm before RoPE (qk_norm). The linears are shared by
     # both calibration sets (one copy of the weights on the card; calibration =
@@ -90,9 +97,14 @@ MODELS = {
         zero_pos0=False,
         share_linears=True,
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
-        fuse=5,
+        fuse=8,
+        add_offset="exact",
     ),
 }
+#: the Adds' offset words ``pf_generate.py`` writes: ``exact``
+#: (``u16_retarget.exact_add_offset``, ``pf_add_offset.py``) or ``pulsar2``
+#: (Pulsar2's own word, with its zero-point bias)
+ADD_OFFSETS = ("exact", "pulsar2")
 #: share a linear between the sets when the first set's ranges are within this factor
 SHARE_MAX = 2.0
 #: the program sets every model has; ``nl`` is added where ``manifest_nl.json`` exists
@@ -127,6 +139,7 @@ class Config:
         seq: int = lay.S,
         fuse: int = 0,
         nl_tokens: tuple = (),
+        add_offset: str = "pulsar2",
     ):
         self.model, self.name, self.out = model, name, out
         #: tokens that run on the ``nl`` set (``pf_record.py``), when it exists
@@ -147,6 +160,9 @@ class Config:
         self.QKV = lay.qkv_parts(self.nh, self.hd, self.kvd, self.qk_norm)
         self.GU = lay.gu_parts(self.I)
         self.fuse = int(fuse)
+        if add_offset not in ADD_OFFSETS:
+            raise ValueError(f"add_offset={add_offset!r}: one of {ADD_OFFSETS}")
+        self.add_offset = add_offset
         self.layer_programs = lay.layer_programs(self.qk_norm, self.fuse)
         self.post_programs = lay.post_programs(self.fuse)
         self.k_program = lay.k_program(self.qk_norm, self.fuse)
@@ -410,6 +426,8 @@ def load(name: str | None = None, out: str | None = None) -> Config:
     os.makedirs(out, exist_ok=True)
     if os.environ.get("LLM_PF_FUSE"):
         spec["fuse"] = int(os.environ["LLM_PF_FUSE"])
+    if os.environ.get("LLM_PF_ADD_OFFSET"):
+        spec["add_offset"] = os.environ["LLM_PF_ADD_OFFSET"]
     return Config(
         ref.Model.load(snap),
         name=name,
