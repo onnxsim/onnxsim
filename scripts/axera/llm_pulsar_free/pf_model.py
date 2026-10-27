@@ -21,9 +21,10 @@ is emitted from or fed with.
   RoPE into ``dn`` (``LAYER_FUSED5``, 3), ``6`` the same programs with
   rotate_half made in ``dnqk`` / ``n1qk`` (three linears instead of five),
   ``7`` also the attention into the program after it (``LAYER_FUSED7``, 2;
-  without a per-head q / k norm layout 3's ``attn`` + ``on2``, 6).
+  without a per-head q / k norm layout 3's ``attn`` + ``on2``, 6), ``8`` the
+  whole layer as one program (``LAYER_FUSED8``, 1; Qwen3 only).
   Qwen3-0.6B defaults to 5, llama-160m (no per-head q / k norm: ``4`` to
-  ``6`` do not apply, ``7`` is layout 3 with ``aon2``) to 3.
+  ``6`` and ``8`` do not apply, ``7`` is layout 3 with ``aon2``) to 3.
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -204,14 +205,14 @@ class Config:
 
     def kv_producer(self, st: str, li: int) -> tuple[str, str]:
         """``(where, program)`` that computes layer ``li``'s K row (and, with
-        ``fuse=5``, its V row: ``yk`` and ``v``)."""
+        ``fuse>=5``, its V row: ``yk`` and ``v``)."""
         if self.fuse < 5 or not self.qk_norm:
             return f"L{li}", self.k_program[0]
         if li == 0:
             return "L0", "n1qk"
         if self.is_split(st, li - 1, "down_proj"):
             return f"L{li}", "qk"
-        return f"L{li - 1}", "dnqk"
+        return f"L{li - 1}", "alyr" if self.fuse >= 8 else "dnqk"
 
     def programs(self, st: str, wh: str) -> list[str]:
         """The programs of set ``st`` at ``wh`` (``L<i>`` or ``post``), in order."""
@@ -230,6 +231,8 @@ class Config:
             attn = ["attn"]
             if self.fuse >= 7:  # the attention joins on2g
                 attn, tail[0] = [], "aon2g"
+            if self.fuse >= 8 and li + 1 < self.L:  # the whole layer
+                tail = ["alyr"]
             if split:
                 attn, tail = ["attn"], ["on2", "gu", "silu_f", "down_proj", "dn"]
             return head + ([] if five else ["qk"]) + attn + tail

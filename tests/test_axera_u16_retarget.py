@@ -795,3 +795,140 @@ def test_layout5_template_equals_a_held_out_native_build(held, t):
         segs.append(seg)
     assert 0 < lanes <= 8 * 4 * len(moved)
     assert ur.compare_jobs(ur.wr.with_segments(got, segs), want) == []
+
+
+# ---- Pulsar2's fused Silu: a SiLU after a FullyConnected (the gate linear) -------------
+def test_silu_table_is_x_sigmoid_x():
+    """The fused Silu's job is the U16 Sigmoid table layout (one entry per 256
+    input codes) of ``x * sigmoid(x)``; its last entry is code 65535's."""
+    q = {"x": (3.3e-4, 27726), "y": (1.95e-4, 1426)}
+    c = ur.candidates("Silu", q, ("x",))
+    t = []
+    for k in range(128):
+        v = c[f"sig_t{k}@{0x1050 + 16 * k:#06x}"]
+        t += [v & 0xFFFF, v >> 16]
+    x = (np.arange(256) * 256 - 27726) * 3.3e-4
+    want = np.clip(np.rint(x / (1 + np.exp(-x)) / 1.95e-4) + 1426, 0, 65535)
+    assert np.abs(np.array(t) - want).max() <= 1
+    lo = int(np.argmin(t))  # the minimum near x = -1.28, monotonic after it
+    assert abs(x[lo] + 1.28) < 0.1 and all(a <= b for a, b in zip(t[lo:], t[lo + 1 :]))
+    x_last = (65535 - 27726) * 3.3e-4
+    want_last = min(round(x_last / (1 + np.exp(-x_last)) / 1.95e-4) + 1426, 65535)
+    assert abs(c["sig_tail@0x1850"] - want_last) <= 1
+
+
+def _silu_after_linear():
+    m = onnx.parser.parse_model(
+        """<ir_version: 9, opset_import: ["" : 17]>
+        g (float[1,8] m) => (float[1,4] y) {
+          gate = MatMul(m, wg)
+          up = MatMul(m, wu)
+          sg = Sigmoid(gate)
+          sl = Mul(gate, sg)
+          y = Mul(sl, up)
+        }"""
+    )
+    w = np.zeros((8, 4), np.float32)
+    m.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(w, "wg"), onnx.numpy_helper.from_array(w, "wu")]
+    )
+    return m
+
+
+def test_fuse_silu_folds_an_uncalibrated_sigmoid():
+    """Without a calibration of ``sg`` (Pulsar2 fused the pair) the Sigmoid
+    and its ``Mul(gate, sg)`` are one Silu node; with one they stay."""
+    nodes = ur.graph_nodes(_silu_after_linear())
+    q = {t: (1e-3, 300) for t in ("m", "gate", "up", "sl", "y")}
+    got = ur.fuse_silu(nodes, q)
+    assert [n[0] for n in got] == ["MatMul", "MatMul", "Silu", ur.FOLDED, "Mul"]
+    assert got[2][1:3] == (("gate",), "sl")
+    assert ur.fuse_silu(nodes, {**q, "sg": (1e-3, 300)}) == nodes
+
+
+#: two FullyConnected (gate / up, [1, 1024] -> [1, 3072]) + SiLU, U16 op_types
+#: with Silu, calibration seeds 0..3 (s3's wider gate range: Pulsar2 spaces its
+#: table unevenly) and a rebuild of seed 0 (``s0b``)
+SILU = os.environ.get(
+    "AXERA_U16_SILU_BUILDS", "/mnt/data/cache/claude-work/tmp/qwen-fuse/B/probe"
+)
+SILU_EVEN = ("s0", "s1", "s2", "s0b")
+
+
+@pytest.mark.parametrize("t,n", list(itertools.permutations(SILU_EVEN, 2)))
+def test_fused_silu_program_equals_the_native_build(t, n):
+    td, nd = f"{SILU}/gus_silu_{t}", f"{SILU}/gus_silu_{n}"
+    template, want = _need(td), gs.load_model(_need(nd))
+    got = ur.retarget_graph(
+        template, f"{nd}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+    )
+    assert ur.compare(got, want) == []
+
+
+def test_uneven_silu_table_refused():
+    td, nd = f"{SILU}/gus_silu_s3", f"{SILU}/gus_silu_s0"
+    template = _need(td)
+    _need(nd)
+    with pytest.raises(ValueError, match="not spaced evenly"):
+        ur.retarget_graph(
+            template, f"{nd}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+        )
+
+
+#: ``lyrqkr2048`` (pf_templates, fuse=7): o_proj + Add + norm, gate / up + SiLU
+#: (``Mul(sigmoid(gate), gate)``: not fused), down_proj + Add + norm, q / k / v,
+#: the in-program rotation and RoPE in one program
+LYR = os.environ.get(
+    "AXERA_U16_LYR_BUILDS", "/mnt/data/cache/claude-work/tmp/qwen-fuse/B/templates"
+)
+
+
+@pytest.mark.parametrize("t,n", list(itertools.permutations(range(4), 2)))
+def test_whole_mlp_program_equals_the_native_build_or_refuses(t, n):
+    """Six linears, the Sigmoid and its Mul in one program: every pair of
+    variants is the native build up to the IO order (``compare_jobs``) or
+    refused (the variants' Add shifts and tied calibrations)."""
+    td, nd = f"{LYR}/fused/lyrqkr2048/v{t}", f"{LYR}/fused/lyrqkr2048/v{n}"
+    template, want = _need(td), gs.load_model(_need(nd))
+    try:
+        got = ur.retarget_graph(
+            template, f"{nd}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+        )
+    except ValueError as e:
+        assert any(r in str(e) for r in REFUSALS), e
+        return
+    assert ur.compare_jobs(got, want) == []
+
+
+def test_whole_layer_assignment_puts_the_attention_first():
+    """``alyrqkr2048`` (fuse=8: the attention, then everything ``lyrqkr``
+    has): too many CORE jobs for the strict rule, so the nodes after the
+    attention are assigned strictly from the latest job that fits and the
+    attention's nodes may sit in any job before it. Every non-attention node
+    gets one job after all the attention's, and the template retargeted to
+    its own calibration is itself."""
+    d = f"{LYR}/fused/alyrqkr2048/v0"
+    template = _need(d)
+    m = onnx.load(f"{d}/model.onnx")
+    nodes = ur.graph_nodes(m)
+    consts = {i.name for i in m.graph.initializer}
+    for i, n in enumerate(nodes):
+        if n[0] == "MatMul" and n[1][1] in consts:
+            nodes[i] = ("FullyConnected", n[1][:1], n[2], {})
+    q = ur.propagate(m, ur.quant_of(d))
+    nodes = ur.fuse_silu(nodes, q)
+    comp = [
+        i
+        for i, n in enumerate(nodes)
+        if n[0] not in ur.MOVES and n[0] not in ("FullyConnected", ur.FOLDED)
+    ]
+    main = ur._segs(gs.load_model(template))[gs.MAIN]
+    assign, head = ur._assign_after_attention(
+        main, comp, ur._graph_candidates(nodes, q), nodes
+    )
+    assert {nodes[int(n[1:])][0] for n in head} == {"MatMul", "Add", "Softmax"}
+    got = sorted(n for v in assign.values() for n in v.split("+") if n)
+    assert got == sorted(f"n{i}" for i in comp if f"n{i}" not in head)
+    q = ur.quant_of(d)
+    same = ur.retarget_graph(template, f"{d}/model.onnx", q, q, attention_first=True)
+    assert ur.compare_jobs(same, gs.load_model(template)) == []

@@ -286,6 +286,11 @@ class Chain:
             x = {"x": x["x"], "q": qr}
         res = x["x"]
         att_in = dict(q=x["q"], k=K, v=V, mask=cfg.mask_plan(p))
+        if (wh, "alyr") in self.f:  # fuse=8: the whole layer
+            gn = cfg.gains(li + 1)[0]
+            ins = {f"{k}_a": v for k, v in att_in.items()}
+            xn, qn, kn, vn = f("alyr")(**ins, a=res, g_1=g2, g=gn, **tabs(li + 1))
+            return {"x": xn, "q": qn, "kv": (kn, vn)}
         if (wh, "aon2g") in self.f:  # fuse=7: the attention is in aon2g
             x1, gu = f("aon2g")(**att_in, a=res, g=g2)
         elif (wh, "on2g") in self.f:

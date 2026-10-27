@@ -11,6 +11,7 @@ import os
 import sys
 
 import numpy as np
+import onnx
 import pytest
 from onnx import parser
 from onnx.reference import ReferenceEvaluator
@@ -220,7 +221,7 @@ def _config(name, out, fuse=0):
 
 
 WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
-WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5, 6, 7)]
+WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5, 6, 7, 8)]
 WIRING += [(m, f) for m in ("llama_gqa", "llama_mha") for f in (1, 2, 3, 7)]
 
 
@@ -287,14 +288,24 @@ def test_template_names():
 
 
 @pytest.mark.parametrize(
-    "fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3), (7, 2)]
+    "fuse,runs",
+    [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3), (7, 2), (8, 1)],
 )
 def test_programs_per_layer(fuse, runs):
     """Executes per layer of the rest set; layer 0 also runs the first norm,
     and a split first-set ``down_proj`` keeps its own programs."""
     cfg = _config("qwen3_like", ".", fuse)
-    assert len(cfg.programs("rest", "L1")) == runs
-    if fuse == 7:
+    # fuse=8: the synthetic model's L1 is its last layer (aon2g + dn)
+    progs = cfg.programs("rest", "L0" if fuse == 8 else "L1")
+    assert len([k for k in progs if k != "n1qk"]) == runs
+    if fuse == 8:
+        assert cfg.programs("rest", "L0") == ["n1qk", "alyr"]
+        assert cfg.programs("rest", f"L{cfg.L - 1}") == ["aon2g", "dn"]
+        assert cfg.programs("first", "L0")[:3] == ["n1qk", "attn", "on2"]  # split
+        assert cfg.programs("first", "L1")[:2] == ["qkv5", "qk"]
+        assert cfg.kv_producer("rest", 1) == ("L0", "alyr")
+        assert cfg.kv_producer("first", 1) == ("L1", "qk")
+    elif fuse == 7:
         assert cfg.programs("rest", "L0") == ["n1qk", "aon2g", "dnqk"]
         assert cfg.programs("first", "L0")[:3] == ["n1qk", "attn", "on2"]  # split
         assert cfg.kv_producer("rest", 1) == ("L0", "dnqk")
@@ -337,6 +348,9 @@ def test_merged_template_names():
     assert {"nrmqkr32", "slanormqkr64"} <= six and not {"nrmqk32"} & six
     assert "alanorml64x128" in tpl.needed(_config("qwen3_like", ".", 7))
     assert "alanorm32" in tpl.needed(_config("llama_gqa", ".", 7))  # nh * hd = 32
+    eight = set(tpl.needed(_config("qwen3_like", ".", 8)))
+    seven = set(tpl.needed(_config("qwen3_like", ".", 7)))
+    assert "alyrqkr64" in eight and "alyrqkr64" not in seven
 
 
 @pytest.mark.parametrize("name", ["nrmqkr32", "slanormqkr64"])
@@ -358,6 +372,44 @@ def test_in_program_rotation_equals_rotated_weights(name):
     ):
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(a, c, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["lyrqk64", "lyrqkr64", "alyrqkr64"])
+def test_lyr_graph_is_its_parts(name):
+    """``lyrqk`` computes ``lanorm`` (o_proj + residual Add + norm), the gate /
+    up linears, then ``slanormqk`` (SiLU + down_proj + residual Add + norm +
+    q / k / v + RoPE) on them; ``lyrqkr`` with ``slanormqkr``; ``alyrqkr``
+    (``fuse=8``, the whole layer) with ``alanorm`` (the attention first).
+    Every output equals the chain of the parts' float graphs, same weights."""
+    ops, body, ins, outs, inits, gens = tpl.graph(name, DIMS)
+    assert "Silu" in ops and list(outs) == ["x", "yq", "yk", "v"]
+    assert "Mul(sg, gate)" in body  # Pulsar2 keeps the Sigmoid table and the Mul
+    gen, ws = gens[1]
+    w = {**inits, **ws}
+    m = tpl.model_of(body, ins, outs, w)
+    feeds = gen(np.random.default_rng(0))
+    got = ReferenceEvaluator(m).run(None, feeds)
+
+    def run(name, feeds, **weights):
+        g = tpl.float_graph(name, DIMS)
+        for i in g.graph.initializer:
+            if i.name in weights:
+                i.CopyFrom(onnx.numpy_helper.from_array(weights[i.name], i.name))
+        names = [o.name for o in g.graph.output]
+        return dict(zip(names, ReferenceEvaluator(g).run(None, feeds)))
+
+    first = "alanorm64" if name.startswith("a") else "lanorm64"
+    fins = tpl.graph(first, DIMS)[2]
+    a = run(first, {t: feeds[tpl.lyr_name(t)] for t in fins}, w=w["w_1"])
+    gate, up = a["y"] @ w["wg"], a["y"] @ w["wu"]
+    rope = {t: feeds[t] for t in ("cq", "sq", "ck", "sk")}
+    b = run(
+        name.lstrip("a").replace("lyrqk", "slanormqk"),
+        dict(gate=gate, up=up, a=a["x"], g=feeds["g"], **rope),
+        **{k: w[k] for k in ("w", "wq", "wqr", "wk", "wkr", "wv") if k in w},
+    )
+    for name, v in zip(outs, got):
+        np.testing.assert_allclose(v, b[name], rtol=1e-5, atol=1e-5)
 
 
 def test_signed_inputs_skip_a_constant_weight():

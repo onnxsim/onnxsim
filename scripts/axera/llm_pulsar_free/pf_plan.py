@@ -452,6 +452,12 @@ class Plan:
             att_in = dict(q=q, k=self.K[li], v=self.V[li], mask=self.mask)
             gn = self.gain[li + 1][0] if li + 1 < cfg.L else self.gf
             g2 = self.gain[li][1]
+            if "alyr" in progs:  # fuse=8: the whole layer
+                ins = {f"{k}_a": v for k, v in att_in.items()}
+                self._bind_ins(st, wh, "alyr", **ins, a=x, g_1=g2, g=gn, **tabs(li + 1))
+                x = self.outputs(st, wh, "alyr", skip=("yq", "yk", "v"))["x"]
+                q = self._qbuf(st, wh, "alyr", li + 1)
+                continue
             if "aon2g" in progs:  # fuse=7: the attention is in aon2g
                 self._bind_ins(st, wh, "aon2g", **att_in, a=x, g=g2)
                 o = self.outputs(st, wh, "aon2g")
@@ -582,7 +588,7 @@ class Plan:
                 if lj is not None:  # this program writes layer lj's K (and V) row
                     row = p * kvd * 4
                     self.bind(st, wh, k, "O", kout, self.K[lj], row, now=False)
-                    v_out = k in ("n1qk", "dnqk")
+                    v_out = k in ("n1qk", "dnqk", "alyr")
                     if v_out:
                         self.bind(st, wh, k, "O", "v", self.V[lj], row, now=False)
                 X(wh, k)
@@ -608,6 +614,7 @@ def _io_stub(k, n):
 
 #: merged programs that hold a linear (their float graphs carry its weights)
 MERGED_LINEAR = ("on2", "dn", "on2g", "dnq", "n1q", "dnqk", "n1qk", "aon2g", "aon2")
+MERGED_LINEAR += ("alyr",)
 
 
 def _float_program(cfg, d, wh, k, ml, fused):
@@ -645,6 +652,15 @@ def _float_program(cfg, d, wh, k, ml, fused):
             {"w": ("o_proj", li), "w2": ("gu", li)},
         ),
         "aon2": (f"alanorm{qd}", {"w": ("o_proj", li)}),
+        "alyr": (
+            f"alyrqk{rot}{qd}",
+            {
+                "w_1": ("o_proj", li),
+                "gu": ("gu", li),
+                "w": ("down_proj", li),
+                "qkv": ("qkv5", li + 1),
+            },
+        ),
     }[k]
     fg = tpl.float_graph(name, d)
     for wn, (key, lj) in ws.items():
@@ -656,6 +672,10 @@ def _float_program(cfg, d, wh, k, ml, fused):
             parts = {f"w{src[p]}": w[:, o[p] : o[p] + n] for p, n in cfg.QKV}
             if rot:
                 parts = {t: parts[t] for t in ("wq", "wk", "wv")}
+        if wn == "gu":  # alyr's gate / up linears: column slices of gu
+            o = lay.offsets(cfg.GU)
+            src = dict(gate_proj="wg", up_proj="wu")
+            parts = {src[p]: w[:, o[p] : o[p] + n] for p, n in cfg.GU}
         for pn, pw in parts.items():
             wi = next(i for i in fg.graph.initializer if i.name == pn)
             wi.CopyFrom(onnx.numpy_helper.from_array(np.ascontiguousarray(pw), pn))

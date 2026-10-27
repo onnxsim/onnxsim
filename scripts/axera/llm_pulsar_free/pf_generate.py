@@ -200,7 +200,12 @@ class Generator:
             try:
                 qt = q(tdir) if callable(q) else q
                 m = ur.retarget_graph(
-                    axm, model, ur.quant_of(tdir), qt, weights=weights
+                    axm,
+                    model,
+                    ur.quant_of(tdir),
+                    qt,
+                    weights=weights,
+                    attention_first=name.startswith("alyr"),
                 )
             except ValueError as e:
                 refused.append(f"{self._rel(tdir, self.root)}: {str(e)[:90]}")
@@ -475,6 +480,7 @@ class Generator:
         post=None,
         qkv=None,
         attn=None,
+        ranges=False,
     ):
         """The two-pass RMSNorm as one program (``nrm<H>``), or with the
         residual Add before it (``anorm<H>``: ``x = a + b``, outputs ``x`` and
@@ -497,7 +503,9 @@ class Generator:
         (``alanorm`` / ``alanorml``, ``fuse=7``), calibrated as ``attn`` was
         (its samples and x sqrt(2) copies, the MatMul operands signed); the
         attention's output and the linear's input are one tensor, at the union
-        of both ranges."""
+        of both ranges. ``ranges``: return ``(ranges,
+        template name, weights, u, signed)`` instead of emitting (a part of a
+        bigger program, ``alyr``)."""
         H = self.cfg.H
         inits = tpl.graph(f"nrm{H}", tpl.Dims.of(self.cfg))[4]
         rgs = []
@@ -660,6 +668,8 @@ class Generator:
             # the union of the attention's output and the linear's input range
             u_["o"] = u_["z"] = self._union({"t": u_["o"]}, {"t": u_["z"]})["t"]
             rgs = [u_]
+        if ranges:
+            return rgs, name, weights, u, signed
         return self.merged(
             C,
             D,
@@ -1103,6 +1113,111 @@ class Generator:
                 ml[k]["parts"] = {p: dict(col=o[p], n=n) for p, n in parts}
         man[w] = ml
 
+    def alyr(self, st, li, A, C, D, ml, x, g2, gn):
+        """The whole layer as one program (``alyrqk<nh*hd>``): ``aon2g`` +
+        SiLU + ``dnqk``. Each half calibrated as its own program was (``norm2``
+        ranges; the attention as ``aon2g``'s, its MatMul operands signed), the
+        first half's tensors renamed as in the template (``tpl.lyr_name``), the
+        gate / up linears' outputs as the SiLU's inputs (x sqrt(2) copies, as
+        ``dnqk``'s inputs were), the residual ``x_1`` the union of both
+        halves'."""
+        cfg = self.cfg
+
+        def r2(k):
+            return A[k].reshape(len(A[k]), -1).astype(F32)
+
+        rg1, _, w1, u1, sg1 = self.norm2(
+            C,
+            D,
+            "alyr",
+            ml,
+            g2,
+            a=x,
+            b=r2("op"),
+            z=r2("att"),
+            w=cfg.merged_weight("o_proj", li),
+            attn=self._attn_samples(A),
+            ranges=True,
+        )
+        rgs = [{tpl.lyr_name(t): r for t, r in rg.items()} for rg in rg1]
+        m = r2("m")  # the norm's output as the gate / up linears' input (x2)
+        rgs.append(
+            {"y_1": [2 * min(float(m.min()), 0.0), 2 * max(float(m.max()), 0.0)]}
+        )
+        rg2, _, w2, u2, _ = self.norm2(
+            C,
+            D,
+            "alyr",
+            ml,
+            gn,
+            a=r2("x1"),
+            b=r2("down"),
+            z=r2("act"),
+            w=cfg.merged_weight("down_proj", li),
+            silu=(r2("gate"), r2("up")),
+            qkv=li + 1,
+            ranges=True,
+        )
+        rgs += [{("x_1" if t == "a" else t): r for t, r in rg.items()} for rg in rg2]
+        wgu = cfg.merged_weight("gu", li)
+        og = pf_model.lay.offsets(cfg.GU)
+        ws = {"w_1": w1, **w2}
+        ws["wg"] = wgu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
+        ws["wu"] = wgu[:, og["up_proj"] : og["up_proj"] + cfg.I]
+        um = max(float(np.abs(u1).max()), float(np.abs(u2).max()))
+        name = f"alyrqk{'r' if cfg.fuse >= 6 else ''}{cfg.nh * cfg.hd}"
+        signed = {tpl.lyr_name(t) for t in sg1}
+        return self.merged(
+            C, D, "alyr", name, rgs, ml, dict(u_absmax=um), w=ws, signed=signed
+        )
+
+    def layer_fused8(self, st, li, man):
+        """One layer of the ``fuse=8`` layout: ``fuse=7`` with ``aon2g`` and
+        ``dnqk`` as one program (``alyr``) where ``pf_model.Config.programs``
+        has it."""
+        progs = self.cfg.programs(st, f"L{li}")
+        if "alyr" not in progs:
+            return self.layer_fused5(st, li, man)
+        cfg = self.cfg
+        w = f"L{li}"
+        A = self._acts(st, w)
+        D = os.path.join(self.out, st, w)
+        C = os.path.join(self.out, "cal", st, w)
+        os.makedirs(D, exist_ok=True)
+        g1, g2 = cfg.gains(li)
+        ml = {}
+        self._st = st
+
+        def r2(k):
+            return A[k].reshape(len(A[k]), -1).astype(F32)
+
+        if "n1qk" in progs:
+            self.norm2(C, D, "n1qk", ml, g1, x=r2("x"), qkv=li)
+        if "qkv5" in progs:  # after a split first-set layer
+            ml["qkv5"] = self.lin(
+                st,
+                li,
+                "qkv5",
+                f"{D}/qkv5.axmodel",
+                cfg.merged_weight("qkv5", li),
+                "a",
+                ["qp", "kp", "vp"],
+            )
+            o = pf_model.lay.offsets(cfg.QKV)
+            ml["qkv5"]["parts"] = {p: dict(col=o[p], n=n) for p, n in cfg.QKV}
+            rgs, uk = self.qk_ranges("rest", li, self._acts("rest", w))
+            self.merged(
+                C,
+                D,
+                "qk",
+                f"qkf{cfg.nh * cfg.hd}",
+                rgs,
+                ml,
+                dict(u_absmax=float(np.abs(uk).max())),
+            )
+        self.alyr(st, li, A, C, D, ml, r2("x"), g2, cfg.gains(li + 1)[0])
+        man[w] = ml
+
     def post_fused2(self, st, man):
         cfg = self.cfg
         D = os.path.join(self.out, st, "post")
@@ -1386,6 +1501,7 @@ def _run_one(job):
     layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
     layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
     layer += [gen.layer_fused5 if cfg.qk_norm else gen.layer_fused2]
+    layer += [gen.layer_fused8]
     layer[cfg.fuse](st, li, man)
     return man[f"L{li}"]
 
@@ -1440,8 +1556,8 @@ def main():
         )
         n1, n2 = [("n1_rms", "n2_rms"), ("n1", "n2")][min(cfg.fuse, 1)]
         if cfg.fuse >= 2:
-            n1 = next(k for k in ("on2", "on2g", "aon2g", "aon2") if k in ml)
-            n2 = next(k for k in ("dnqk", "dnq", "dn") if k in ml)
+            n1 = next(k for k in ("on2", "on2g", "aon2g", "aon2", "alyr") if k in ml)
+            n2 = next(k for k in ("dnqk", "dnq", "dn", "alyr") if k in ml)
         print(
             f"{st} L{li}: {len(ml)} programs, templates {tnames}, u max "
             f"{ml[n1]['u_absmax']:.1f}/{ml[n2]['u_absmax']:.1f}, "
