@@ -21,7 +21,7 @@ extern "C" {
 }
 
 struct TgProg {
-  struct In { int onnx = 0; uint32_t dtype = 0; uint64_t bytes = 0; int slot = -1; size_t off = 0; };
+  struct In { int onnx = 0; uint32_t dtype = 0; uint64_t bytes = 0; int slot = -1; size_t off = 0, off_res = 0; bool state = false; };
   struct Out { uint32_t dtype = 1; uint64_t elements = 0; size_t off = 0; };
   int ncalls = 0, threads = 1;
   uint64_t output_bytes = 0, output_align = 1;
@@ -29,15 +29,30 @@ struct TgProg {
   std::vector<Out> out;
   remote_handle64 h = 0;
   uint8_t *ibuf = nullptr, *obuf = nullptr;
-  size_t ibytes = 0;
+  size_t ibytes = 0, ibytes_res = 0;  // the packed input, in full / without the recurrent state inputs
+  int state_flags = 0;  // program.txt "state o i": input i is output o's last value, kept on the DSP (tg_graph.idl run flags)
+  bool ran = false;  // after the first run the state is on the DSP: the inputs are packed without it
+  bool omit_state_out = false;  // the state outputs stay on the DSP too (flags bit 16+k): output(k) of one is then unavailable
   double last_dsp_ms = 0;
 
-  // the packed input slot of ONNX input i (nullptr: the program doesn't read it)
+  // the packed input slot of ONNX input i for the next run (nullptr: the program doesn't read it, or it's state already on the DSP)
   void* input(int i) {
-    for (auto& s : in) if (s.onnx == i) return s.slot < 0 ? nullptr : ibuf + s.off;
+    for (auto& s : in)
+      if (s.onnx == i) return s.slot < 0 || (ran && s.state) ? nullptr : ibuf + (ran ? s.off_res : s.off);
     throw std::runtime_error("no program input " + std::to_string(i));
   }
-  const void* output(int k) const { return obuf + out.at(k).off; }
+  const void* output(int k) const {
+    if (omit_state_out && ran) {
+      size_t at = 0;
+      for (int j = 0; j < k; ++j) if (!is_state_out(j)) at += out[j].elements * (out[j].dtype == 1 ? 4 : 1);
+      return is_state_out(k) ? nullptr : obuf + at;  // (unaligned packing: this path is for output_align 1 programs)
+    }
+    return obuf + out.at(k).off;
+  }
+  bool is_state_out(int k) const {
+    for (auto& st : states) if (st.first == k) return true;
+    return false;
+  }
 
   void load(const std::string& tghx, const std::string& so_dir, const std::string& so_name) {
     std::ifstream f(tghx, std::ios::binary);
@@ -82,7 +97,12 @@ struct TgProg {
     std::vector<In*> by_slot;
     for (auto& s : in) if (s.slot >= 0) by_slot.push_back(&s);
     std::sort(by_slot.begin(), by_slot.end(), [](const In* x, const In* y) { return x->slot < y->slot; });
-    for (In* s : by_slot) { s->off = ibytes; ibytes += (s->bytes + 127) / 128 * 128; }
+    for (In* s : by_slot) {
+      const size_t n = (s->bytes + 127) / 128 * 128;
+      s->off = ibytes;
+      ibytes += n;
+      if (!s->state) { s->off_res = ibytes_res; ibytes_res += n; }
+    }
     ibuf = (uint8_t*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, std::max<size_t>(ibytes, 128));
     obuf = (uint8_t*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, std::max<size_t>(output_bytes, 128));
     if (!ibuf || !obuf) throw std::runtime_error("rpcmem_alloc for " + so_name);
@@ -91,12 +111,16 @@ struct TgProg {
 
   void run() {
     uint64 t = 0;
-    if (int rc = tg_graph_run(h, 0, ncalls, threads, 0, ibuf, (int)ibytes, obuf, (int)output_bytes, &t, 1))
+    const int fl = ran ? state_flags | (omit_state_out ? state_flags << 16 : 0) : 0;
+    if (int rc = tg_graph_run(h, 0, ncalls, threads, fl, ibuf, (int)(ran ? ibytes_res : ibytes), obuf,
+                              (int)output_bytes, &t, 1))
       throw std::runtime_error("tg_graph_run: " + std::to_string(rc));
     last_dsp_ms = t / 1000.0;
+    ran = true;
   }
 
   void close() { if (h) tg_graph_close(h); h = 0; }
+  std::vector<std::pair<int, int>> states;  // (output, input)
 
  private:
   void parse(const std::string& text) {
@@ -112,7 +136,15 @@ struct TgProg {
       else if (key == "output_align") f >> output_align;
       else if (key == "input") { In s; f >> s.onnx >> s.dtype >> s.bytes >> s.slot; in.push_back(s); }
       else if (key == "output") { Out o; f >> o.dtype >> o.elements; out.push_back(o); }
-      else if (key == "state") throw std::runtime_error("programs with recurrent state aren't supported here");
+      else if (key == "state") {
+        int o = -1, i = -1;
+        f >> o >> i;
+        states.emplace_back(o, i);
+      }
+    }
+    for (size_t k = 0; k < states.size(); ++k) {
+      for (auto& s : in) if (s.onnx == states[k].second) s.state = true;
+      state_flags |= 1 << k;  // (bit 16+k would also leave its output slice out: the caller reads the BEV)
     }
     size_t o = 0;
     for (auto& x : out) {

@@ -74,8 +74,20 @@ void stage_inputs(const Frame& fr, const float* prev_bev, const uint8_t* feats_q
 }
 
 // the same for a tinygrad encoder program (TG_ENC): straight into its packed input buffer, in its ONNX input order
-// (feats, prev_bev, has_prev, shift, can_bus, ref_cam, bev_mask)
+// (feats, prev_bev, has_prev, shift, can_bus, ref_cam, bev_mask). A program whose first input is uint8 is export_msda_op.py's
+// frame --resident: (feats_q, bev_state, rot_idx, has_prev, shift, can_bus, ref_cam, bev_mask), the backbone's uint8 feats as
+// they are and the previous BEV kept on the DSP (sent once, as zeros), gathered there by rot_idx
 void stage_tg(TgProg& p, const Frame& fr, const float* prev_bev, const uint8_t* feats_q) {
+  if (p.in.at(0).dtype == 2) {
+    memcpy(p.input(0), feats_q, FEATS);
+    if (void* st = p.input(1)) memset(st, 0, (size_t)NQ * E * 4);
+    float* ri = (float*)p.input(2);
+    for (int q = 0; q < NQ; ++q) ri[q] = (float)fr.rot_idx[q];
+    const std::vector<float>* rest[] = {&fr.has_prev, &fr.shift, &fr.can_bus, &fr.ref_cam, &fr.bev_mask};
+    for (int i = 0; i < 5; ++i)
+      if (void* d = p.input(3 + i)) memcpy(d, rest[i]->data(), rest[i]->size() * 4);
+    return;
+  }
   float* feats = (float*)p.input(0);
   for (size_t i = 0; i < FEATS; ++i) feats[i] = ((int)feats_q[i] - feats_zp) * feats_scale;
   float* pb = (float*)p.input(1);
@@ -182,7 +194,9 @@ int main(int argc, char** argv) {
       double a = now_ms();
       tenc.load(tg_enc, ".", "tg_enc.so");
       create += now_ms() - a;
-      printf("tinygrad encoder %s: %d calls, %zu input bytes\n", tg_enc, tenc.ncalls, tenc.ibytes);
+      tenc.omit_state_out = getenv("TG_OMIT_STATE_OUT") && atoi(getenv("TG_OMIT_STATE_OUT"));
+      printf("tinygrad encoder %s: %d calls, %zu input bytes (%zu with the state on the DSP)%s\n", tg_enc, tenc.ncalls, tenc.ibytes,
+             tenc.ibytes_res, tenc.omit_state_out ? ", state output left on the DSP (no bev_embed out)" : "");
     }
     if (tg_dec) {
       double a = now_ms();
@@ -309,7 +323,7 @@ int main(int argc, char** argv) {
         mark(-1);
         tg_run(tenc);
         mark(1);
-        memcpy(get("bev" + std::to_string(s_out)).p, tenc.output(0), NQ * E * 4);
+        if (const void* b = tenc.output(0)) memcpy(get("bev" + std::to_string(s_out)).p, b, NQ * E * 4);
         if (tg_frame) {
           memcpy(get("cls" + std::to_string(s_out)).p, tenc.output(1), DQ * 10 * 4);
           memcpy(get("bbox" + std::to_string(s_out)).p, tenc.output(2), DQ * 10 * 4);
