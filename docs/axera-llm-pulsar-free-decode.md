@@ -32,12 +32,12 @@ GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
 GPTQ=1 python pf_plan.py --generate 48    # free-running greedy decode vs float -> <out>/gen.json
-# LLM_PF_FUSE=0..8 picks the program layout (Qwen3-0.6B default 8, llama-160m 3);
+# LLM_PF_FUSE=0..11 picks the program layout (Qwen3-0.6B default 8, llama-160m 3);
 # LLM_PF_ADD_OFFSET / pf_generate.py --add-offset exact|pulsar2 the Adds' offset words
 # (default Qwen3-0.6B exact, llama-160m pulsar2; "Defaults" below)
 python pf_add_offset.py <out> <out>_x     # exact Add offsets for a set generated with pulsar2
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
-python pf_profile.py                      # per-program card time of the rest set
+python pf_profile.py [--set first]        # per-program card time of the rest (first) set
 ```
 
 | script | what it does |
@@ -116,6 +116,9 @@ token. The table above is layout `0`. Layouts `1`..`8` run neighbouring programs
 | 6 | the programs of `5`, with rotate_half made inside `dnqk` / `n1qk` (`slanormqkr<I>` / `nrmqkr<H>`): three linears q, k, v (4096 columns instead of 7168), and q_rot / k_rot by `Split` / `Concat` of each head's halves | 3 | 86 |
 | 7 | the attention joins the program after it: `aon2g` = `attn` + `on2g` (`alanorml<k>x<n>`); without a per-head q / k norm (llama-160m) layout 3's `attn` + `on2` = `aon2` (`alanorm<k>`) | 2 (llama: 6) | 58 (llama: 74) |
 | 8 (Qwen3 default, with exact Add offsets) | the whole layer as one program: `alyr` = `aon2g` + SiLU + `dnqk` (`alyrqkr<nh*hd>`: the attention, `o_proj` + `res1` + second norm, gate / up, SiLU, `down_proj` + `res2` + the next layer's norm, q / k / v, rotation and RoPE; six linears, 17 MB); the last layer keeps `aon2g` + `dn` | 1 | 31 |
+| 9 (opt-in, Qwen3) | the rest set's last layer and the final norm as one program too: `alyrf` = `aon2g` + SiLU + `dn` (`alyrf<nh*hd>`) | 1 | 30 |
+| 10 (opt-in, Qwen3) | the first set's split layers (0-2) as whole-layer programs too: `alyrs` = `alyr` with the gate, up and down linears as two s8 linears and an Add each (`alyrqkrs<nh*hd>`, 37 MB); first token 32 executes instead of 64 | 1 | 30 |
+| 11 (opt-in, Qwen3) | `lm_head` in the rest set's last program: `alyrfh` = `alyrf` + `lm_head` (`alyrf<nh*hd>x<vocab>`, 180 MB); the first set keeps `aon2g`, `dn` and an `lm_head` of its own | 1 | 29 |
 
 A merged program has several outputs where the residual stream goes on (`x` and the
 normalized `y`; `qk`'s `yq` and `yk`, which is bound to K row `p` as `rk`'s was). Only
@@ -232,6 +235,23 @@ How the merged programs are made:
   residual Add explains; the attention's nodes may sit in any job before it. Starting from
   the first job that merely fits shifted every assignment and gave 0.5-14x errors on the
   card.
+- **The last layer, the first set's split layers and `lm_head` (layouts 9-11).**
+  `pf_templates._lyr_graph` takes another second half: `alyrf<n>` is `alanorm<n>`, gate /
+  up and `slanorm<I>` (the final norm; outputs `x` and `y`, no RoPE tables; four variants,
+  `alanorm`'s v0 with each `slanorm` variant), `alyrf<n>x<v>` the same with `slanorml<I>x<v>`
+  (`lm_head` after the final norm; one 1.7 GB build, 4.7 min). `alyrqkrs<n>` is `alyrqkr<n>`
+  with `gate = y_1 @ wg + y_1 @ wgl` (up and the down linear alike): the split linears of
+  the first set's layers 0-2, `W ~ Q8 + R8` from the original weights as their separate
+  programs were. Its variants keep `alanorm`'s v0: v6 (`alanorm`'s v2 half) was accepted by
+  the retarget for layers 0 and 2 and was wrong on the card (`x` 0.17-0.29 in
+  `pf_check.py`), so it is left out. Each part is calibrated as its program was; the first
+  part of the down linear (`bh`) at sqrt(2) x its range x2, so that `b = bh + bl` shifts
+  14 like the gate / up sums (calibrated as the SiLU's inputs, x sqrt(2)): a template
+  elides the third, equal shift write, and with `bh` at x2 the sum shifted 15 or 14 by
+  layer. The first set's last layer keeps `aon2g` + `dn`: at position 0 the last MLP
+  cancels the massive residual (`x` far below `x_1`), so its residual Add shifts 13, a
+  write every `alyrf` variant elides. That keeps the shared `lm_head`'s input buffer: the
+  rest set's `alyrf` writes its `y` into the first set's `dn` output buffer.
 - **Pulsar2's fused `Silu`.** `Mul(gate, sigmoid(gate))` right after a FullyConnected is
   fused into one onnx `Silu` op. Its input is quantized at U8 unless `Silu` is in the U16
   `op_types`. Its job is the U16 Sigmoid table layout (256 entries, one per 256 input
@@ -396,6 +416,8 @@ and after every run.
 | Qwen3-0.6B | Pulsar2 `llm_build` | 45/48, 7.47% (9.73%) | 47/48, 7.27% (9.66%) | 0.29 |
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=7` | 43/48, 3.45% (6.12%) | 43/48, 2.81% (3.76%) | card 55 ms |
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=8` (whole layer) | 43/48, 3.52% (6.11%) | 42/48, 2.81% (3.76%) | card 47 ms |
+| Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=10` (split layers whole) | 43/48, 3.55% (6.12%) | 43/48, 2.71% (3.79%) | card 46.5 ms, first token 49-51 ms (layout 8: 59-61) |
+| Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=11` (+ `lm_head`) | 43/48, 3.53% (6.11%) | 43/48, 2.71% (3.78%) | card 46.4 ms |
 | Qwen3-0.6B | layout 5 + exact Add offsets (`pf_add_offset.py`) | 45/48, 2.85% (6.04%) | 44/48, 2.24% (3.56%) | card 70 ms |
 | llama-160m | layout 3 + exact Add offsets (`pf_add_offset.py`) | 45/47, 1.23% (1.75%) | 46/47, 1.14% (1.40%) | card 37 ms |
 | Qwen3-0.6B | layout 7 + exact Add offsets (2026-10-28) | 45/48, 2.88% (6.01%) | 45/48, 2.29% (3.81%) | card 56-57 ms |
@@ -478,6 +500,37 @@ Notes on the table:
   `pf_check.py` (with `card_add`): every program within the tolerance, `alyr` within
   1.1e-2 (rest, `v`) and 2.3e-3 (first). With exact Add offsets it is the default
   (Defaults, below).
+- **Layouts 9-11 against 8** (2026-10-28, back to back, host load 1-12; plain sets, the
+  layout-8 set's programs reused where they are the same). Per token:
+
+  | layout | executes (first token) | resident programs, MB | `pf_profile.py` step | first token | adaquant (mean) | activation-memory-planning (mean) |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 8 | 31 (64) | 94, 1159 | 47.6 ms | 59-62 ms | 43/48, 3.92% | 42/48, 3.19% |
+  | 9 | 30 (64) | 93, 1159 | 46.3 ms | 60-64 ms | 44/48, 3.92% | 42/48, 3.19% |
+  | 10 | 30 (32) | 60, 1149 | 46.0-46.8 ms | 49-51 ms | 43/48, 3.79% | 43/48, 3.06% |
+  | 11 | 29 (32) | 60, 1317 | 45.7 ms | 50-52 ms | 43/48, 3.79% | 43/48, 3.05% |
+  | 9, first set unsplit (`LLM_PF_SPLIT_FIRST=-`) | 30 (31) | 60, 1119 | | 48-50 ms | 43/48, 4.09% | 43/48, 3.29% |
+
+  The 48-step wall medians of the steady steps are within 0.5 ms of each other at this
+  host load (46.3-47.3 ms for 8, 46.3-46.9 ms for 10, 46.4-46.7 ms for 11); the
+  `pf_profile.py` step times are the cleaner comparison. In the profile `alyrf` takes 1.09-1.12
+  ms against 1.01 + 0.52 ms for `aon2g` + `dn`, and `alyrfh` 9.21-9.36 ms against 1.10 + 8.52-8.65
+  ms for `alyrf` + `lm_head` (alternating runs). Layout 9 computes what 8 does (every step's
+  logit error equal). The first set of layout 8 spends 15.9 ms of its 58.7 ms (`pf_profile.py
+  --set first`) in the 37 programs of layers 0-3 (split linears 0.29-0.63 ms each); layout 10
+  runs them as four. Its accuracy is layout 8's level: plain, every step's error 0.1 points
+  lower on average from step 16 on (the position-0 K / V rows). With exact Add offsets
+  (against the default set, layout 8 with them, run back to back at host load 1-5):
+  3.47% / 2.88% and 44/48 / 44/48 against 3.41% / 2.80% and 45/48 / 45/48 (the new misses:
+  adaquant 46, activation-memory-planning 7), the extra error in steps 2-15; first token
+  48-50 ms against 59-60 ms, steady medians 45.9-47.7 ms against 46.8-47.6 ms. Layout 11 costs
+  a second 155 MB `lm_head` (the first set's, which no longer shares one) for 0.3-0.4 ms per
+  token. `pf_check.py` (with `card_add`): `alyrf` within 8.6e-3, `alyrfh` 1.4e-2 (its
+  logits; 1.7e-2 with exact offsets), `alyrs` within 4.9e-3 (5.3e-3 with exact offsets).
+  Without the split (s8 linears at layers 0-2 of the first set, as alyr) the first token
+  is as fast, but the error is 0.1-0.17 points higher, all of it at position 0 (15.4% against
+  12.7%) and steps 2-15; splitting only layer 2's linears (which make the massive activation:
+  `down` 7562 at position 0) brings position 0 back (12.2%) but not steps 2-15 (4.01% / 3.25%).
 - **llama-160m, merged layouts** (rebuilt the same way, round-to-nearest weights,
   layouts 0-3 back to back). Executes per token: 171 (`0`), 122 (`1`), 98 (`2`) and 86
   (`3`); resident programs 342 / 244 / 196 / 172. Without a per-head q / k norm, `rq` and
@@ -769,7 +822,7 @@ nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 agai
 ## Checks
 
 - **Merged layouts** (`tests/test_axera_llm_pulsar_free.py`): the whole-plan wiring check
-  for `LLM_PF_FUSE=1..8` on the qwen3-like synthetic model, `1..3` on the llama ones. It includes the split
+  for `LLM_PF_FUSE=1..11` on the qwen3-like synthetic model, `1..3` on the llama ones. It includes the split
   first-set `down_proj`, several-output binding and `qk`'s K row. Also programs per layer,
   template names, FusedEval of each merged graph against `ReferenceEvaluator`, and the
   calibration ties. Regenerating layout `0` from the same templates is byte-identical to
@@ -963,8 +1016,12 @@ after the changes above they take about 7.5 s of a 94 s serial set.
 - **Layout 8 (the Qwen3 default) needs the exact Add offsets.** Without them its mean
   logit error is layout 7's, 0.07 / 0.10 points above layout 6's, and it misses one more
   near tie. The last layer keeps two programs (`aon2g` + `dn`, the final norm), and the
-  first set's split layers (0-2) and the layer after them keep their own programs. Its
-  `alyrqkr2048` templates are eight Pulsar2 builds, about 0.9 GB.
+  first set's split layers (0-2) and the layer after them keep their own programs
+  (layouts 9-11 merge them). Its `alyrqkr2048` templates are eight Pulsar2 builds,
+  about 0.9 GB.
+- **Layouts 9-11 are opt-in.** The first set's last layer keeps `aon2g` + `dn` (its
+  residual Add shifts 13). Layer 0's first norm (`n1qk`, 0.57 ms) stays its own program:
+  it writes layer 0's K / V row, which the attention after it reads from the cache.
 - **Even tables only.** Pulsar2's uneven Sigmoid / Silu tables (above) would be more
   accurate on wide ranges; generating them is not done.
 - **Layouts 6 and 8 keep layout 5's first-set programs after a split layer.** The first

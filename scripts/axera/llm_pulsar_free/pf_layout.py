@@ -100,6 +100,15 @@ LAYER_FUSED7_NO_QK_NORM = ["qkv5", "rq", "rk", "aon2", "gu", "dn"]
 #: the second norm, gate / up, SiLU, ``down_proj`` + ``res2`` + the next layer's
 #: norm, q / k / v and RoPE). The last layer keeps ``aon2g`` + ``dn``.
 LAYER_FUSED8 = ["alyr"]
+#: ``fuse=9`` (Qwen3): ``fuse=8`` with the last layer as one program too
+#: (``alyrf``: ``aon2g``, SiLU and ``dn`` with the final norm, no q / k / v)
+#: in the rest set; ``lm_head`` stays a program of its own
+#: ``fuse=10`` (Qwen3): ``fuse=9`` with each split first-set layer (layers
+#: 0-2) as one program too (``alyrs``: ``alyr`` with the gate, up and down
+#: linears as two s8 linears and an Add each, ~16-bit weights)
+#: ``fuse=11`` (Qwen3): ``fuse=10`` with ``lm_head`` in the rest set's last
+#: program (``alyrfh``: ``alyrf`` + ``lm_head``, outputs ``x`` and the logits
+#: ``y``); the first set keeps ``aon2g``, ``dn`` and an ``lm_head`` of its own
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
