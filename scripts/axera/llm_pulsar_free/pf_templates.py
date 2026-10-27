@@ -55,8 +55,12 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
   ``alyrqkr``, the whole layer) with ``alanorm<n>`` (the attention's tensors
   suffixed ``_a``) in place of ``lanorm<n>``.
 
-usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [NAME...]
-(no NAME: every template the model needs that is not built yet; serial builds)
+usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [--jobs N]
+       [--mem-gb G] [NAME...]
+(no NAME: every template the model needs that is not built yet.) The builds
+(one per variant, one per linear) run ``--jobs`` at once, the longest (the
+lm_head linear) first, each Docker container capped at ``Unit.gb`` with the
+caps summing to at most ``--mem-gb``; ``--jobs 1``: one at a time, uncapped.
 """
 
 from __future__ import annotations
@@ -847,7 +851,7 @@ def template_dir(root: str, name: str) -> str:
 
 
 # ---- Pulsar2 builds ---------------------------------------------------------------------
-def _pulsar2_build(W, ins, samples, ops):
+def _pulsar2_build(W, ins, samples, ops, memory=None):
     import pulsar2_docker as P
 
     os.makedirs(os.path.join(W, "dataset"), exist_ok=True)
@@ -876,7 +880,13 @@ def _pulsar2_build(W, ins, samples, ops):
     json.dump(cfg, open(os.path.join(W, "config.json"), "w"), indent=1)
     t0 = time.time()
     res = P.build(
-        W, "model.onnx", "out", config_path="config.json", image=IMAGE, timeout=1800
+        W,
+        "model.onnx",
+        "out",
+        config_path="config.json",
+        image=IMAGE,
+        timeout=1800,
+        memory=memory,
     )
     ok = bool(res.success) and os.path.exists(
         os.path.join(W, "out", "compiled.axmodel")
@@ -890,46 +900,58 @@ def _pulsar2_build(W, ins, samples, ops):
     return ok, err
 
 
+def _fused_variant(root, name, g, i, memory=None) -> None:
+    """Variant ``i`` of fused template ``name`` (``g``: ``graph(name, d)``)."""
+    ops, body, ins, out, inits, gens = g
+    gen = gens[i]
+    W = os.path.join(template_dir(root, name), f"v{i}")
+    os.makedirs(W, exist_ok=True)
+    vinits = inits
+    if isinstance(gen, tuple):  # a variant with weights of its own
+        gen, extra = gen
+        vinits = {**inits, **extra}
+    onnx.save(model_of(body, ins, out, vinits), os.path.join(W, "model.onnx"))
+    r = np.random.default_rng(300 + i)
+    draws = [gen(r) for _ in range(18)]
+    samples = {n: [x[n] for x in draws] for n in ins}
+    ok, err = _pulsar2_build(W, ins, samples, ops, memory=memory)
+    print(name, i, ok, "" if ok else err[-200:], flush=True)
+
+
 def build_fused(root: str, name: str, d: Dims) -> None:
     """Four variants; samples: 18 draws of the variant's generator (seed 300 + i)."""
-    ops, body, ins, out, inits, gens = graph(name, d)
-    for i, gen in enumerate(gens):
+    g = graph(name, d)
+    for i in range(len(g[5])):
         W = os.path.join(template_dir(root, name), f"v{i}")
-        if os.path.exists(os.path.join(W, "result.json")):
-            continue
-        os.makedirs(W, exist_ok=True)
-        vinits = inits
-        if isinstance(gen, tuple):  # a variant with weights of its own
-            gen, extra = gen
-            vinits = {**inits, **extra}
-        onnx.save(model_of(body, ins, out, vinits), os.path.join(W, "model.onnx"))
-        r = np.random.default_rng(300 + i)
-        draws = [gen(r) for _ in range(18)]
-        ok, err = _pulsar2_build(W, ins, {n: [x[n] for x in draws] for n in ins}, ops)
-        print(name, i, ok, "" if ok else err[-200:], flush=True)
+        if not os.path.exists(os.path.join(W, "result.json")):
+            _fused_variant(root, name, g, i)
+
+
+def _add_variant(root, name, i, memory=None) -> None:
+    n, rng = int(name[3:]), ADD_RANGES[i]
+    W = os.path.join(template_dir(root, name), f"v{i}")
+    os.makedirs(W, exist_ok=True)
+    onnx.save(add_model(n), os.path.join(W, "model.onnx"))
+    r = np.random.default_rng(100 + i)
+    samples = {}
+    for t in ("a", "b"):
+        lo, hi = rng[t]
+        s = [r.uniform(lo, hi, (1, n)).astype(F) for _ in range(16)]
+        samples[t] = s + [np.full((1, n), lo, F), np.full((1, n), hi, F)]
+    ok, err = _pulsar2_build(W, ("a", "b"), samples, ["Add"], memory=memory)
+    print(name, i, ok, "" if ok else err[-200:], flush=True)
 
 
 def build_add(root: str, name: str) -> None:
     """Four variants; per input 16 uniform samples over the variant's range plus
     the two range ends as constant samples (seed 100 + i)."""
-    n = int(name[3:])
-    for i, rng in enumerate(ADD_RANGES):
+    for i in range(len(ADD_RANGES)):
         W = os.path.join(template_dir(root, name), f"v{i}")
-        if os.path.exists(os.path.join(W, "result.json")):
-            continue
-        os.makedirs(W, exist_ok=True)
-        onnx.save(add_model(n), os.path.join(W, "model.onnx"))
-        r = np.random.default_rng(100 + i)
-        samples = {}
-        for t in ("a", "b"):
-            lo, hi = rng[t]
-            s = [r.uniform(lo, hi, (1, n)).astype(F) for _ in range(16)]
-            samples[t] = s + [np.full((1, n), lo, F), np.full((1, n), hi, F)]
-        ok, err = _pulsar2_build(W, ("a", "b"), samples, ["Add"])
-        print(name, i, ok, "" if ok else err[-200:], flush=True)
+        if not os.path.exists(os.path.join(W, "result.json")):
+            _add_variant(root, name, i)
 
 
-def build_linear(root: str, name: str) -> None:
+def build_linear(root: str, name: str, memory=None) -> None:
     """One build; calibration: 16 samples of default_rng(0).uniform(-1, 1)."""
     import pulsar2_docker as P
 
@@ -950,7 +972,13 @@ def build_linear(root: str, name: str) -> None:
     json.dump(cfg, open(os.path.join(W, "config.json"), "w"), indent=2)
     t0 = time.time()
     res = P.build(
-        W, "model.onnx", "out", config_path="config.json", image=IMAGE, timeout=1800
+        W,
+        "model.onnx",
+        "out",
+        config_path="config.json",
+        image=IMAGE,
+        timeout=1800,
+        memory=memory,
     )
     ok = bool(res.success) and os.path.exists(
         os.path.join(W, "out", "compiled.axmodel")
@@ -972,6 +1000,125 @@ def build(root: str, name: str, d: Dims) -> None:
         build_fused(root, name, d)
 
 
+# ---- parallel builds ---------------------------------------------------------------------
+#: memory cap of one Pulsar2 container (GB, ``docker run --memory``) by build
+#: kind. Measured peaks (Qwen3-0.6B, 2026-10-28): fused and Add builds and the
+#: layer linears at most 1.1 GB, the lm_head linear (k1024n151936) 4.5 GB
+UNIT_GB = {"fused": 2, "add": 2, "linear": 2}
+#: a linear's cap grows with its weights (GB of float32 K x N): the lm_head's
+#: 0.58 GB -> 2 + 5 GB
+LINEAR_GB_PER_GB = 8
+
+
+@dataclass
+class Unit:
+    """One Pulsar2 run: a fused / Add template variant or a linear."""
+
+    name: str
+    variant: int | None
+    run: object  # run(memory=...)
+    gb: int
+    seconds: float  # a rough estimate, for the order (longest first)
+
+
+def units(root: str, names: list[str], d: Dims) -> list[Unit]:
+    """The builds of ``names`` not yet in ``root`` (no ``result.json``)."""
+    out = []
+    for nm in names:
+        if re.fullmatch(r"k\d+n\d+", nm):
+            if os.path.exists(os.path.join(template_dir(root, nm), "result.json")):
+                continue
+            k, n = map(int, re.fullmatch(r"k(\d+)n(\d+)", nm).groups())
+            gb = UNIT_GB["linear"] + -(-4 * k * n * LINEAR_GB_PER_GB // (1 << 30))
+
+            def run(memory=None, nm=nm):
+                build_linear(root, nm, memory=memory)
+
+            out.append(Unit(nm, None, run, gb, 20 + 1.8e-6 * k * n))
+            continue
+        if nm.startswith("add"):
+            n_var, g = len(ADD_RANGES), None
+        else:
+            g = graph(nm, d)
+            n_var = len(g[5])
+        for i in range(n_var):
+            W = os.path.join(template_dir(root, nm), f"v{i}")
+            if os.path.exists(os.path.join(W, "result.json")):
+                continue
+            if g is None:
+
+                def run(memory=None, nm=nm, i=i):
+                    _add_variant(root, nm, i, memory=memory)
+
+                out.append(Unit(nm, i, run, UNIT_GB["add"], 20))
+            else:
+
+                def run(memory=None, nm=nm, i=i, g=g):
+                    _fused_variant(root, nm, g, i, memory=memory)
+
+                out.append(Unit(nm, i, run, UNIT_GB["fused"], 30))
+    return out
+
+
+def _result(root, u: Unit) -> dict:
+    W = template_dir(root, u.name)
+    if u.variant is not None:
+        W = os.path.join(W, f"v{u.variant}")
+    try:
+        return json.load(open(os.path.join(W, "result.json")))
+    except (OSError, ValueError):
+        return {"ok": False}
+
+
+def build_parallel(
+    root: str, names: list[str], d: Dims, jobs: int, mem_gb: int, stagger=1.0
+) -> list[Unit]:
+    """Build every missing template of ``names``, up to ``jobs`` Pulsar2
+    containers at once, the longest builds first. Each container is capped at
+    its ``Unit.gb`` (``docker run --memory``) and the running caps sum to at
+    most ``mem_gb``; the starts are ``stagger`` seconds apart. A build that
+    fails is rebuilt alone afterwards, capped at ``mem_gb``. Returns the
+    builds that failed both times."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    todo = sorted(units(root, names, d), key=lambda u: -u.seconds)
+    cond = threading.Condition()
+    state = {"gb": 0, "n": 0, "last": 0.0, "next": 0}
+
+    def one(iu):
+        i, u = iu
+        gb = min(u.gb, mem_gb)
+        with cond:  # start in list order, when a slot and the memory are free
+            while state["next"] != i or (
+                state["n"] and (state["n"] >= jobs or state["gb"] + gb > mem_gb)
+            ):
+                cond.wait()
+            wait = state["last"] + stagger - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            state["last"] = time.time()
+            state["gb"] += gb
+            state["n"] += 1
+            state["next"] += 1
+            cond.notify_all()
+        try:
+            u.run(memory=f"{gb}g")
+        finally:
+            with cond:
+                state["gb"] -= gb
+                state["n"] -= 1
+                cond.notify_all()
+
+    with ThreadPoolExecutor(max(1, jobs)) as ex:
+        list(ex.map(one, enumerate(todo)))
+    failed = [u for u in todo if not _result(root, u).get("ok")]
+    for u in failed:
+        print("rebuilding alone:", u.name, u.variant, flush=True)
+        u.run(memory=f"{mem_gb}g")
+    return [u for u in failed if not _result(root, u).get("ok")]
+
+
 def main():
     import pf_model
 
@@ -979,6 +1126,19 @@ def main():
     ap.add_argument("names", nargs="*")
     ap.add_argument("--root", default=None)
     ap.add_argument("--list", action="store_true", help="print the names and exit")
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("LLM_PF_TEMPLATE_JOBS", 8)),
+        help="Pulsar2 builds at once (default: LLM_PF_TEMPLATE_JOBS, else 8); "
+        "1 builds one at a time without memory caps",
+    )
+    ap.add_argument(
+        "--mem-gb",
+        type=int,
+        default=20,
+        help="with --jobs > 1: the sum of the running containers' memory caps",
+    )
     a = ap.parse_args()
     cfg = pf_model.load()
     names = a.names or needed(cfg)
@@ -986,6 +1146,11 @@ def main():
         print("\n".join(names))
         return
     root = a.root or default_root(cfg)
+    t0 = time.time()
+    if a.jobs > 1:
+        bad = build_parallel(root, names, Dims.of(cfg), a.jobs, a.mem_gb)
+        print(f"done, {time.time() - t0:.0f}s, {len(bad)} failed", flush=True)
+        sys.exit(1 if bad else 0)
     for nm in names:
         build(root, nm, Dims.of(cfg))
 

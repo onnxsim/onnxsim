@@ -49,12 +49,17 @@ activations reads those); models without ``share_linears`` / ``first_pos ==
 0`` only.
 
 Writes ``<out>/<set>/L<l>/<program>.axmodel``, ``<out>/cal/<set>/...`` (the
-programs' float graphs and calibration samples) and
+programs' float graphs and calibration samples; ``LLM_PF_CAL_TARS=0`` skips
+the samples' tars, which no later step reads) and
 ``<out>/manifest_<set>.json``.
 
 usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer] [--jobs N]
-       (SET: first | rest | nl; the layers run in N worker processes, the files
-       are the same for any N)
+       (SET: first | rest | nl | both; the layers run in N worker processes, the
+       files are the same for any N. ``both`` writes the same files as
+       ``rest`` then ``first`` in one run: the longest programs (the post
+       programs, the first set's split layers) start first, and a first-set
+       layer as soon as its rest layer is in ``manifest_rest.json``, the only
+       part of the rest set it reads)
 """
 
 from __future__ import annotations
@@ -168,10 +173,13 @@ class Generator:
     def _tar(d, name, samples):
         """``dataset/<name>.tar`` of the samples (as
         ``pulsar2_docker.make_numpy_calibration_tar`` writes it, built in
-        memory); returns the float32 samples for the calibration."""
-        os.makedirs(os.path.join(d, "dataset"), exist_ok=True)
+        memory; not with ``LLM_PF_CAL_TARS=0``: only a Pulsar2 build of the
+        float graph would read it); returns the float32 samples for the
+        calibration."""
         arrs = [np.asarray(a, F32) for a in samples]
-        write_npy_tar(os.path.join(d, "dataset", f"{name}.tar"), arrs)
+        if os.environ.get("LLM_PF_CAL_TARS", "1") != "0":
+            os.makedirs(os.path.join(d, "dataset"), exist_ok=True)
+            write_npy_tar(os.path.join(d, "dataset", f"{name}.tar"), arrs)
         return arrs
 
     # ---- one program ------------------------------------------------------------------
@@ -1514,10 +1522,72 @@ def _run_one(job):
     return man[f"L{li}"]
 
 
+def _ordered(base: dict, done: dict, keys: list) -> dict:
+    """``base`` with ``done``'s entries assigned in ``keys`` order: the manifest
+    a serial run writes (layers in order, then ``post``)."""
+    m = dict(base)
+    for k in keys:
+        if k in done:
+            m[k] = done[k]
+    return m
+
+
+def run_both(cfg, layers: list, post: bool, n_jobs: int, t0: float) -> None:
+    """``rest`` then ``first`` (``layers``, and the post programs when ``post``)
+    as one schedule over ``n_jobs`` forked workers (``_GEN``); the files and
+    manifests are those of the two runs one after the other."""
+    import multiprocessing as mp
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
+    keys = [f"L{li}" for li in layers] + (["post"] if post else [])
+    path = {
+        st: os.path.join(cfg.out, f"manifest_{st}.json") for st in ("rest", "first")
+    }
+    base = {
+        st: json.load(open(p)) if os.path.exists(p) else {} for st, p in path.items()
+    }
+    done: dict = {"rest": {}, "first": {}}
+    split = set(cfg.split_first["layers"])
+
+    def prio(job):  # lower first: the longest programs, then layer order
+        st, li = job
+        if li is None:
+            return (0 if st == "rest" else 2, 0)
+        if li in split:
+            return (1, li)
+        return (3, li)
+
+    ready = [("rest", li) for li in layers] + ([("rest", None)] if post else [])
+    running: dict = {}
+    with ProcessPoolExecutor(n_jobs, mp_context=mp.get_context("fork")) as ex:
+        print(f"both: {n_jobs} workers", flush=True)
+        while ready or running:
+            ready.sort(key=prio)
+            while ready and len(running) < n_jobs:
+                job = ready.pop(0)
+                running[ex.submit(_run_one, job)] = job
+            fin, _ = wait(running, return_when=FIRST_COMPLETED)
+            for f in fin:
+                st, li = running.pop(f)
+                k = "post" if li is None else f"L{li}"
+                done[st][k] = f.result()
+                # a new file renamed over the old: a worker may be reading it
+                tmp = path[st] + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(_ordered(base[st], done[st], keys), fh, indent=1)
+                os.replace(tmp, path[st])
+                if st == "rest":  # its first-set job reads this entry: now written
+                    ready.append(("first", li))
+                print(
+                    f"{st} {k}: {len(done[st][k])} programs, {time.time() - t0:.0f}s",
+                    flush=True,
+                )
+
+
 def main():
     global _GEN
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("set", choices=("first", "rest", "nl"))
+    ap.add_argument("set", choices=("first", "rest", "nl", "both"))
     ap.add_argument("layers", nargs="*", type=int, help="first_layer last_layer")
     ap.add_argument("--templates", default=None, help="template root (pf_templates.py)")
     ap.add_argument(
@@ -1536,6 +1606,13 @@ def main():
         if cfg.share_linears or cfg.first_pos == 0:
             sys.exit("the nl set: models without share_linears / first_pos 0 only")
         gen.acts_alias = {"rest": "nl"}
+    if st == "both":
+        _GEN = gen
+        lis = list(range(lo_l, hi_l + 1))
+        post = hi_l == cfg.L - 1
+        n = min(a.jobs or default_jobs(), 2 * (len(lis) + post))
+        run_both(cfg, lis, post, n, time.time())
+        return
     mpath = os.path.join(cfg.out, f"manifest_{st}.json")
     man = json.load(open(mpath)) if os.path.exists(mpath) else {}
     t0 = time.time()

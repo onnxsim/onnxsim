@@ -77,6 +77,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -253,6 +254,7 @@ def build(
     image: str = DEFAULT_IMAGE,
     profile: bool = False,
     timeout: int = 900,
+    memory: Optional[str] = None,
 ) -> BuildResult:
     """Run a real `pulsar2 build` in Docker.
 
@@ -264,7 +266,10 @@ def build(
     `work_dir/config/`), or `config_path` (relative to `work_dir`) for a
     hand-written one. With `profile=True`, adds `--compiler.npu_perf
     --debug.dump_frontend_graph` and locates the resulting `trace.json` /
-    `optimized_quant_axmodel.onnx`.
+    `optimized_quant_axmodel.onnx`. `memory` (e.g. `"4g"`) caps the
+    container's memory (`docker run --memory`, no swap): the container runs in
+    the Docker daemon's cgroup, not the caller's, so a caller's own memory
+    limit does not cover it.
     """
     if not docker_image_available(image):
         return BuildResult(success=False, error=f"docker image not loaded: {image}")
@@ -307,13 +312,19 @@ def build(
     # build runs next, concurrently, on the same host (see
     # `docs/axera-on-device-training-handoff.md`'s "Batching" section, which
     # hit exactly this).
-    container_name = f"onnxsim-pulsar2-build-{os.getpid()}-{int(time.time() * 1000)}"
+    # The random suffix keeps builds started in the same millisecond by
+    # threads of one process (`pf_templates.py --jobs`) apart.
+    container_name = (
+        f"onnxsim-pulsar2-build-{os.getpid()}-{int(time.time() * 1000)}"
+        f"-{uuid.uuid4().hex[:8]}"
+    )
     cmd = [
         "docker",
         "run",
         "--rm",
         "--name",
         container_name,
+        *(["--memory", memory, "--memory-swap", memory] if memory else []),
         "-v",
         f"{work_dir}:/data",
         image,

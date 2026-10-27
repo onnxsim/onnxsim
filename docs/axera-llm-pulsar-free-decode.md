@@ -736,14 +736,17 @@ are systemd's for the job (Docker's container cgroup for `llm_build`).
 | stage | Qwen3-0.6B, layout 5 (GPTQ) | llama-160m, layout 3 |
 | --- | --- | --- |
 | Pulsar2 `llm_build` (s8, bf16, `--prefill_len 128 --kv_cache_len 255 --parallel 8`) | 7.7 min, CPU 19.4 min, 6.8 GB; 29 files, 666 MB | 119 s, CPU 344 s, 5.2 GB; 13 files, 158 MB |
-| `pf_templates.py` (one-off per shape, cached) | 22.1 min for the 15 shapes layout 5 uses (`k1024n151936` alone 4.8 min); 28.1 min for all 66 builds | 12.4 min, 37 builds |
-| `pf_record.py` | 84 s, CPU 255 s, 16.7 GB | 20 s, CPU 69 s, 4.6 GB |
+| `pf_templates.py` (one-off per shape, cached), before (one build at a time) | 22.1 min for the 15 shapes layout 5 uses (`k1024n151936` alone 4.8 min); 28.1 min for all 66 builds | 12.4 min, 37 builds |
+| `pf_templates.py`, now (`--jobs 8`, 2026-10-28) | 6.0 min for the 57 builds of `--list` (18 names, 24.8 min of serial build time), bounded by `k1024n151936` (5.9 min); Docker containers at most 7.7 GB together | (not measured) |
+| `pf_record.py`, before (numpy `ReferenceEvaluator`) | 84 s, CPU 255 s, 16.7 GB (2026-10-28, back to back with the next row: 110 s, CPU 281 s, 13.8 GB) | 20 s, CPU 69 s, 4.6 GB |
+| `pf_record.py --device cuda` (torch, 2026-10-28) | 50 s, CPU 34 s, 12.6 GB (the float steps 93 s -> 20 s; the rest is the checkpoint load and the `npz` writes) | (not measured) |
 | `pf_gptq.py --device cuda` | 106 s, CPU 214 s, 13.9 GB | (not used) |
 | `pf_generate.py rest`, before | 7.6 min, CPU 7.6 min, 17.7 GB | 57 s, CPU 64 s, 3.8 GB |
 | `pf_generate.py first`, before | 6.8 min, CPU 6.8 min, 11.3 GB | 44 s, CPU 52 s, 3.6 GB |
 | `pf_generate.py rest`, now (7 workers) | 29 s, CPU 200 s, 14.6 GB | 4.1 s, CPU 32 s, 3.3 GB |
 | `pf_generate.py first`, now (7 workers) | 49 s, CPU 142 s, 13.2 GB | 5.6 s, CPU 27 s, 2.9 GB |
 | `pf_generate.py rest` / `first`, now, `--jobs 1` | 97 s / 95 s | 29 s / 25 s |
+| `pf_generate.py rest` + `first` against `both`, back to back (7 workers, 2026-10-28, load 5-10) | 101 s + 43 s = 144 s against 119 s, 20.5 GB | 20 s + 14 s = 34 s against 19 s, 5.2 GB |
 | output | 198 programs, 1.34 GB (and 12.3 GB of `cal/`) | 172 programs, 336 MB (3.6 GB of `cal/`) |
 
 The "before" rows of `pf_generate.py` are master's serial code under the phase timer
@@ -811,32 +814,50 @@ another tensor of the same tie. Master's serial code reproduces the shipped `n5b
 sets the same way. `tests/test_axera_pf_build_time.py` checks each fast path against
 the code it replaced. No card run was needed.
 
+**Second round (2026-10-28)**, the first four items of the list that stood here:
+
+- **Template builds in parallel**: `pf_templates.py --jobs N` (default 8,
+  `LLM_PF_TEMPLATE_JOBS`) runs one Pulsar2 container per variant (per linear), the
+  longest first (by `Unit.seconds`: the lm_head linear), the starts 1 s apart. Each
+  container is capped with `docker run --memory` (no swap) at `Unit.gb`, and the running
+  caps sum to at most `--mem-gb` (default 20): the containers run in the Docker daemon's
+  cgroup, so a `systemd-run -p MemoryMax` around the script does not bound them. The
+  measured container peaks: 1.1 GB at most for the fused, Add and layer-linear builds,
+  4.7 GB for `k1024n151936`; the caps are 2 GB and 7 GB. A build that fails is rebuilt
+  alone at the whole budget. `pulsar2_docker.build` names its container with a random
+  suffix, so two builds started in the same millisecond no longer collide. Checked:
+  every one of the 57 builds of two parallel runs (`--jobs 6` with larger caps, 7.2 min;
+  `--jobs 8`, 6.0 min) against the shared serial templates: 4 byte-equal, the rest
+  equal under `u16_retarget.compare_jobs` with the same `quant_of`, none different. A
+  layout-5 set generated from the first run's templates passes `pf_check.py` on the
+  card (rest 198 outputs, worst 8.7e-3; first 222, worst 8.6e-3; tolerance 2e-2).
+- **`pf_record.py --device cuda`** (`pf_float_torch.py`): the same ONNX layer and norm
+  graphs, node by node on torch tensors (float32, TF32 off), the K / V caches on the
+  device. Not byte-identical to the CPU recording: against it every recorded tensor is
+  within 8.7e-5 of its absmax (rest; first 9.3e-6), the MinMax ends within 1.6e-5, the
+  positions and attention samples equal. `pf_gptq.py` on those activations rounds 1-4
+  in 10^4 weights differently (rerun on the CPU recording, it reproduces the shipped
+  weights exactly). A layout-5 set from the CUDA recording and its GPTQ passes
+  `pf_check.py` (rest worst 8.8e-3, first 8.4e-3), and its 48 steps on the card, back
+  to back with `n5b`: 43/48, mean 3.90% against 43/48, 3.85% (adaquant); 43/48, 3.13%
+  against 43/48, 3.09% (activation-memory-planning). The CPU stays the default.
+- **`pf_generate.py both`**: the two sets as one schedule over one pool: the post
+  programs and the first set's split layers first, and a `first` layer as soon as its
+  `rest` entry is in `manifest_rest.json` (written to a new file and renamed, since a
+  worker may be reading it). Checked byte-identical with `rest` then `first` (same
+  code and templates): Qwen3 layout 5, 624 / 624 files, and llama-160m layout 3,
+  584 / 584 (tars equal but for their time stamps); `rest` then `first` also still
+  reproduces the shipped `n5b`.
+- **`LLM_PF_CAL_TARS=0`**: no calibration tars under `cal/` (llama-160m 3.4 GB -> 0.27 GB);
+  no later step reads them (`pf_check.py`, `pf_estimate.py`, `pf_plan.py` read the float
+  graph and the manifest's calibration). Every other file is byte-identical.
+
 **What remains, ranked** (estimate, and how to check it):
 
-1. **Template builds in parallel** (`pf_templates.py`): the builds are independent Docker
-   runs of 20-30 s each (the lm_head linear 4.8 min), run one at a time. Four to six
-   at once should bring Qwen3's 22 min to about 5-6 min, bounded by the lm_head build.
-   Pulsar2's container names collide when builds start in the same millisecond, so
-   stagger the starts. Pulsar2 rebuilds are not always byte-equal (MatMul table order),
-   so check every parallel build against the serial one, and with `pf_check.py` on the
-   card where they differ.
-2. **`pf_record.py` on torch** (CUDA): 84 s and 16.7 GB of float decode through
-   `ReferenceEvaluator`; about 15-20 s expected. The activations would then differ in
-   the last bits, and so would the MinMax calibration: `pf_check.py` and the 48-step
-   accuracy on the card, back to back with the current set.
-3. **Longest jobs first and both sets in one run**: the `first` set (49 s) waits on its
-   split layers 0-2 and the lm_head. Starting those first, and a `first` layer as soon as
-   its `rest` layer is written (it reads only that layer's `rest` entry), saves an
-   estimated 20-30 s of the 78 s, and the checkpoint load and the worker warm-up of the
-   second run. Check: byte-identical as above.
-4. **Optional calibration tars**: 7.6 GB of Qwen3's 12.3 GB `cal/` are tars that only
-   the generator itself read. A switch to skip them saves the disk and about 10 s of
-   llama-160m's serial time. Check that `pf_check.py` / `pf_estimate.py` read only
-   `model.onnx`.
-5. **A program cache by content hash** (template bytes, float graph, calibration
+1. **A program cache by content hash** (template bytes, float graph, calibration
    samples, weights, code version): a rerun after one change would rebuild only what
    changed. Check by perturbing each input in turn.
-6. **Templates named by their full dims** (eps, heads, head size, context): a checkpoint
+2. **Templates named by their full dims** (eps, heads, head size, context): a checkpoint
    whose dims match another's could reuse its templates without any Pulsar2 run.
    Today the names carry the widths only, so a shared root is not safe.
 
