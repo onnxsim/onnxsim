@@ -187,14 +187,25 @@ def _samples(path: str) -> list[np.ndarray]:
         return [np.load(io.BytesIO(t.extractfile(m).read())) for m in members]
 
 
-def calibrate(directory: str, op: str) -> dict[str, tuple[float, int]]:
+def _data(directory, ins, samples):
+    """Each input's samples: ``samples[name]`` when given (the arrays the
+    tars were written from), else read from ``dataset/<name>.tar``."""
+    if samples is not None:
+        return {n: list(samples[n]) for n in ins}
+    return {n: _samples(os.path.join(directory, "dataset", f"{n}.tar")) for n in ins}
+
+
+def calibrate(
+    directory: str, op: str, samples: Mapping | None = None
+) -> dict[str, tuple[float, int]]:
     """The U16 calibration of a single-op build directory (``model.onnx``,
     ``dataset/<input>.tar``) from its samples: MinMax of each input, of each
-    constant operand, and of the float op's output over every sample."""
+    constant operand, and of the float op's output over every sample.
+    ``samples``: ``{input: arrays}`` in place of the tars."""
     m = onnx.load(os.path.join(directory, "model.onnx"))
     consts = {i.name for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
-    data = {n: _samples(os.path.join(directory, "dataset", f"{n}.tar")) for n in ins}
+    data = _data(directory, ins, samples)
     ref = ReferenceEvaluator(m)
     ys = [
         ref.run(None, {n: data[n][j].astype(F) for n in ins})[0]
@@ -377,20 +388,61 @@ def _rewrite(template, ct, cn, allowed, n_core=None, fixed=None) -> onnx.ModelPr
     result = wr.with_segments(model, segs)
     params = next((t for t in result.graph.initializer if t.name == "npu_params"), None)
     if params is not None:
-        p = bytearray(params.raw_data)
-        for off in range(0, len(p) - 3, 2):
-            if any(off + 4 > a and off < b for a, b in fixed or ()):
-                continue
-            val = struct.unpack_from("<I", p, off)[0]
-            names = [
-                n
-                for n in by_val.get(val, [])
-                if not _base(n).startswith(("zp:", "inv:", "s:"))
-            ]
-            if len(names) == 1:
-                struct.pack_into("<I", p, off, cn[names[0]])
-        params.raw_data = bytes(p)
+        lut = {}
+        for val, ns in by_val.items():
+            names = [n for n in ns if not _base(n).startswith(("zp:", "inv:", "s:"))]
+            if len(names) == 1 and 0 <= val < 1 << 32:
+                lut[val] = cn[names[0]]
+        params.raw_data = _rewrite_params(bytes(params.raw_data), lut, fixed or ())
     return result
+
+
+def _rewrite_params(raw: bytes, lut: Mapping[int, int], fixed) -> bytes:
+    """Every 32-bit word of ``npu_params`` at an even offset whose value is a key
+    of ``lut`` rewritten to ``lut[value]``, in offset order (a rewrite changes
+    the word two bytes on, which is then read rewritten), outside the
+    ``fixed`` byte ranges. The candidate offsets are found with numpy on the
+    original bytes; after a rewrite only the next offset is re-read (a plain
+    scan of a 10 MB table took seconds per program)."""
+    p = bytearray(raw)
+    if len(p) < 4 or not lut:
+        return bytes(p)
+    a = np.frombuffer(raw, np.uint8)
+    off = np.arange(0, len(p) - 3, 2)
+    w = (
+        a[off].astype(np.uint32)
+        | a[off + 1].astype(np.uint32) << 8
+        | a[off + 2].astype(np.uint32) << 16
+        | a[off + 3].astype(np.uint32) << 24
+    )
+    free = np.ones(len(off), bool)
+    for lo, hi in fixed:
+        free &= ~((off + 4 > lo) & (off < hi))
+    keys = np.fromiter(lut, np.uint32, len(lut))
+    cand = off[free & np.isin(w, keys)].tolist()
+    last = len(p) - 4
+
+    def visit(o):
+        val = struct.unpack_from("<I", p, o)[0]
+        if val in lut:
+            struct.pack_into("<I", p, o, lut[val])
+            return True
+        return False
+
+    ci, redo = 0, None
+    while ci < len(cand) or redo is not None:
+        if redo is not None and (ci >= len(cand) or redo <= cand[ci]):
+            o, redo = redo, None
+            if ci < len(cand) and cand[ci] == o:
+                ci += 1
+            free_o = o <= last and not any(o + 4 > lo and o < hi for lo, hi in fixed)
+            wrote = free_o and visit(o)
+        else:
+            o, ci = cand[ci], ci + 1
+            wrote = visit(o)
+        if wrote:
+            redo = o + 2
+    return bytes(p)
 
 
 def retarget(
@@ -667,7 +719,7 @@ def retarget_graph(
     assign = {}
     if strict:
         try:
-            assign = _assign_core_jobs(main, comp, ct, nodes)
+            assign = _assign_core_jobs_memo(main, comp, ct, nodes)
         except ValueError:  # e.g. a Softmax in two jobs: any node in any CORE job
             strict = False
     if strict:
@@ -706,13 +758,7 @@ def retarget_graph(
         )
         if weights is not None:
             w = weights[wname] if isinstance(weights, Mapping) else weights
-        old_tab = le.linear_params_u16(
-            b"",
-            _template_weight(template, wname),
-            *template_q[x],
-            *template_q[y],
-            table_only=True,
-        )
+        old_tab = _template_table(template, wname, template_q[x], template_q[y])
         at = tp.find(old_tab)
         if at < 0 or tp.find(old_tab, at + 1) >= 0:
             raise ValueError(f"{wname}: the template's weight table is not found once")
@@ -793,6 +839,49 @@ def exact_add_offsets(program, nodes, q) -> tuple[onnx.ModelProto, int]:
     return _rewrite(model, ct, cn, allowed, fixed=fixed), len(ct)
 
 
+#: template-only results reused across the programs of one shape (every layer
+#: retargets the same template variants): CORE job assignments, weight tables
+_MEMO: dict = {}
+_MEMO_MAX = 256
+
+
+def _memo(key, fn):
+    if key not in _MEMO:
+        if len(_MEMO) >= _MEMO_MAX:
+            _MEMO.pop(next(iter(_MEMO)))
+        _MEMO[key] = fn()
+    return _MEMO[key]
+
+
+def _assign_core_jobs_memo(main, comp, ct, nodes=None) -> dict[int, str]:
+    """``_assign_core_jobs``, memoized on its whole input (a template's main
+    segment, its candidates and the graph): the same for every layer."""
+    key = (
+        "assign",
+        b"".join(main),
+        tuple(comp),
+        tuple(sorted(ct.items())),
+        repr(nodes),
+    )
+    return dict(_memo(key, lambda: _assign_core_jobs(main, comp, ct, nodes)))
+
+
+def _template_table(template, name, qx, qy) -> bytes:
+    """``linear_params_u16``'s table of the template's own weights ``name`` at
+    the template's calibration (``qx``, ``qy``), memoized per template file."""
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(template))), "model.onnx"
+    )
+    st = os.stat(path)
+    key = ("table", path, st.st_mtime_ns, st.st_size, name, tuple(qx), tuple(qy))
+    return _memo(
+        key,
+        lambda: le.linear_params_u16(
+            b"", _template_weight(template, name), *qx, *qy, table_only=True
+        ),
+    )
+
+
 def _template_weight(template, name) -> np.ndarray:
     """The template build's own weights, from the ``model.onnx`` beside its ``out/``."""
     path = os.path.join(
@@ -804,17 +893,20 @@ def _template_weight(template, name) -> np.ndarray:
     )
 
 
-def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:
+def calibrate_graph(
+    directory: str, samples: Mapping | None = None
+) -> dict[str, tuple[float, int]]:
     """``calibrate`` for a fused program: U16 MinMax of every tensor (inputs,
     constants, inner tensors, output) over the float forward of the whole
     graph; both operands of every MatMul are signed (``signed_absmax``), as
     Pulsar2 quantizes them. Pulsar2's inner scales can be a float32 ulp or two
-    off this (seen on fused RMSNorms and attention); the zero points agree."""
+    off this (seen on fused RMSNorms and attention); the zero points agree.
+    ``samples``: ``{input: arrays}`` in place of the tars."""
     m = onnx.load(os.path.join(directory, "model.onnx"))
     signed = {t for n in m.graph.node if n.op_type == "MatMul" for t in n.input}
     consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
-    data = {n: _samples(os.path.join(directory, "dataset", f"{n}.tar")) for n in ins}
+    data = _data(directory, ins, samples)
     ref = ReferenceEvaluator(m)
     lo, hi = {}, {}
     for j in range(len(data[ins[0]])):

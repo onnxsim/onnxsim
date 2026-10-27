@@ -36,6 +36,7 @@ carries them (residual ~6.4e3-7e3 from layer ~4 on, <= ~400 later).
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 
@@ -127,8 +128,6 @@ class Config:
         self.tokenizer_dir = tokenizer_dir
         self.qk_norm = bool(model.qk_norm)
         self.eps = float(model.eps)
-        self.head_t = np.ascontiguousarray(model.weight(model._head).T.astype(F32))
-        self.vocab = self.head_t.shape[1]
         self.ln_f = model.weight("model.norm.weight").astype(F32).reshape(1, self.H)
         self.QKV = lay.qkv_parts(self.nh, self.hd, self.kvd, self.qk_norm)
         self.GU = lay.gu_parts(self.I)
@@ -147,6 +146,20 @@ class Config:
             )
         )
         self._tok = None
+
+    @functools.cached_property
+    def head_t(self) -> np.ndarray:
+        """The head weights ``[H, vocab]`` (computed on first use: a strided copy
+        of 0.6 GB for Qwen3, which ``pf_generate.py`` with GPTQ never needs)."""
+        m = self.model
+        return np.ascontiguousarray(m.weight(m._head).T.astype(F32))
+
+    @functools.cached_property
+    def vocab(self) -> int:
+        raw = getattr(getattr(self.model, "_w", None), "raw", None)
+        if raw is not None:
+            return int(raw(self.model._head).shape[0])
+        return int(self.head_t.shape[1])
 
     # ---- float reference ------------------------------------------------------------
     def mask_ref(self, p):

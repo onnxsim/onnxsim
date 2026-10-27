@@ -667,42 +667,40 @@ def u16_table_bytes(k: int, n: int) -> int:
 
 
 def _u16_table(codes, bias, m) -> np.ndarray:
+    """The U16 weight-and-requantization table. Per group of 32 outputs and per
+    segment: 16 rows of ``s1`` bytes (output ``o & 15``), each row 72-byte blocks
+    of 18 input pairs, a block holding ``[o < 16: low nibbles, high nibbles][o >=
+    16: low, high]`` (a byte packs pair ``(2j, 2j + 1)``'s nibbles), then the
+    256-byte requantization block (bias, M of the 32 outputs). Written with
+    reshapes rather than per-byte indices (an index per byte took seconds per
+    table)."""
     n, k = codes.shape
     segs, offs, g_bytes = u16_layout(k)
     u16_table_bytes(k, n)
     ng = n // 32
-    t = np.zeros(ng * g_bytes, np.uint8)
-    o = np.arange(n)
-    g, op = o >> 5, o & 31
-    u = codes.astype(np.int64)
+    t = np.zeros((ng, g_bytes), np.uint8)
+    u = np.asarray(codes).astype(np.uint8)
     rq = np.concatenate(
         [bias.reshape(ng, 32).view(np.uint8), m.reshape(ng, 32).view(np.uint8)], axis=1
     )  # [group, 256]
     start = 0
     for pairs, off in zip(segs, offs):
         s1 = _u16_row_bytes(pairs)
-        nslot = -(-pairs // U16_BLOCK) * U16_BLOCK
-        jp = np.arange(nslot)
-        slot = 72 * (jp // U16_BLOCK) + jp % U16_BLOCK
-        ue = np.full((n, nslot), 128, np.int64)
-        uo = np.full((n, nslot), 128, np.int64)
+        nb = s1 // 72
+        nslot = nb * U16_BLOCK
+        ue = np.full((n, nslot), 128, np.uint8)
+        uo = np.full((n, nslot), 128, np.uint8)
         ue[:, :pairs] = u[:, 2 * start : 2 * (start + pairs) : 2]
         uo[:, :pairs] = u[:, 2 * start + 1 : 2 * (start + pairs) : 2]
-        row = s1 * (op & 15) + 36 * ((op >> 4) & 1)
-        for p in (0, 1):
-            byte = (((ue >> (4 * p)) & 15) | (((uo >> (4 * p)) & 15) << 4)).astype(
-                np.uint8
-            )
-            t[
-                (g * g_bytes + off)[:, None]
-                + row[:, None]
-                + slot[None, :]
-                + U16_BLOCK * p
-            ] = byte
-        at = np.arange(ng) * g_bytes + off + 16 * s1
-        t[at[:, None] + np.arange(256)[None, :]] = rq
+        byte = np.stack(
+            [(ue & 15) | ((uo & 15) << 4), (ue >> 4) | ((uo >> 4) << 4)], axis=1
+        )  # [n, p, nslot]
+        # o = 32 g + 16 h + r -> [g, r, block, h, p, 18]
+        byte = byte.reshape(ng, 2, 16, 2, nb, U16_BLOCK).transpose(0, 2, 4, 1, 3, 5)
+        t[:, off : off + 16 * s1] = byte.reshape(ng, 16 * s1)
+        t[:, off + 16 * s1 : off + 16 * s1 + 256] = rq
         start += pairs
-    return t
+    return t.reshape(-1)
 
 
 def linear_params_u16(
