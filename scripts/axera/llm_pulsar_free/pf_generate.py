@@ -53,7 +53,14 @@ programs' float graphs and calibration samples; ``LLM_PF_CAL_TARS=0`` skips
 the samples' tars, which no later step reads) and
 ``<out>/manifest_<set>.json``.
 
+Each Add's offset word (``--add-offset``, else ``LLM_PF_ADD_OFFSET``, else the
+model's ``add_offset``): ``exact`` (Qwen3-0.6B) patches every program as
+``pf_add_offset.py`` patches a set, as it is written, and marks its manifest
+entry (``"add_offset": "exact"``); ``pulsar2`` (llama-160m) keeps Pulsar2's
+word, with its zero-point bias, as the sets before 2026-10-28 did.
+
 usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer] [--jobs N]
+       [--add-offset exact|pulsar2]
        (SET: first | rest | nl | both; the layers run in N worker processes, the
        files are the same for any N. ``both`` writes the same files as
        ``rest`` then ``first`` in one run: the longest programs (the post
@@ -1474,6 +1481,20 @@ class Generator:
 JOB_BYTES = 3 << 30
 #: the generator the worker processes inherit (``fork``)
 _GEN = None
+#: the Adds' offset words of this run (``pf_model.ADD_OFFSETS``): ``exact``
+#: patches each program as it is written (``pf_add_offset.patch_entry``)
+_ADD_OFFSET = "pulsar2"
+
+
+def _exact_offsets(st: str, wh: str, entry: dict) -> dict:
+    """``entry`` (the manifest of ``wh``) with every program's Adds patched in
+    place to the exact offset word (``pf_add_offset.patch_entry``)."""
+    import pf_add_offset
+
+    out = _GEN.cfg.out
+    for k, e in entry.items():
+        pf_add_offset.patch_entry(out, out, st, wh, k, e)
+    return entry
 
 
 def _mem_free() -> int:
@@ -1513,12 +1534,16 @@ def _run_one(job):
     if li is None:
         post = [gen.post, gen.post_fused, gen.post_fused2, gen.post_fused2]
         (post[cfg.fuse] if cfg.fuse < 4 else gen.post_fused2)(st, man)  # noqa
+        if _ADD_OFFSET == "exact":
+            _exact_offsets(st, "post", man["post"])
         return man["post"]
     layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
     layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
     layer += [gen.layer_fused5 if cfg.qk_norm else gen.layer_fused2]
     layer += [gen.layer_fused8]
     layer[cfg.fuse](st, li, man)
+    if _ADD_OFFSET == "exact":
+        _exact_offsets(st, f"L{li}", man[f"L{li}"])
     return man[f"L{li}"]
 
 
@@ -1585,7 +1610,7 @@ def run_both(cfg, layers: list, post: bool, n_jobs: int, t0: float) -> None:
 
 
 def main():
-    global _GEN
+    global _GEN, _ADD_OFFSET
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("set", choices=("first", "rest", "nl", "both"))
     ap.add_argument("layers", nargs="*", type=int, help="first_layer last_layer")
@@ -1597,9 +1622,18 @@ def main():
         help="worker processes, one layer at a time each (default: LLM_PF_JOBS, "
         "else by cores and free memory); every count writes the same files",
     )
+    ap.add_argument(
+        "--add-offset",
+        choices=pf_model.ADD_OFFSETS,
+        default=None,
+        help="the Adds' offset words: exact or pulsar2 (Pulsar2's own, with its "
+        "zero-point bias); default LLM_PF_ADD_OFFSET, else the model's "
+        "(Qwen3-0.6B exact, llama-160m pulsar2)",
+    )
     a = ap.parse_args()
     cfg = pf_model.load()
     gen = Generator(cfg, a.templates or tpl.default_root(cfg))
+    _ADD_OFFSET = a.add_offset or cfg.add_offset
     lo_l, hi_l = (a.layers[0], a.layers[1]) if len(a.layers) == 2 else (0, cfg.L - 1)
     st = a.set
     if st == "nl":

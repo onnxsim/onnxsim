@@ -32,8 +32,10 @@ GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
 GPTQ=1 python pf_plan.py --generate 48    # free-running greedy decode vs float -> <out>/gen.json
-# LLM_PF_FUSE=0..8 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
-python pf_add_offset.py <out> <out>_x     # optional: exact Add offset words (below)
+# LLM_PF_FUSE=0..8 picks the program layout (Qwen3-0.6B default 8, llama-160m 3);
+# LLM_PF_ADD_OFFSET / pf_generate.py --add-offset exact|pulsar2 the Adds' offset words
+# (default Qwen3-0.6B exact, llama-160m pulsar2; "Defaults" below)
+python pf_add_offset.py <out> <out>_x     # exact Add offsets for a set generated with pulsar2
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
 python pf_profile.py                      # per-program card time of the rest set
 ```
@@ -49,7 +51,7 @@ python pf_profile.py                      # per-program card time of the rest se
 | `pf_estimate.py` | the whole decode in fake-quant on the host |
 | `pf_plan.py` | the decode on the card: every program resident, one `PLAN` per token; `--generate N`: free-running greedy decode against the float model's |
 | `pf_gptq.py` | `linear_emit.gptq_weight` for every linear (CUDA torch) |
-| `pf_add_offset.py` | a copy of a program set with every Add's offset word exact (`u16_retarget.exact_add_offset`) |
+| `pf_add_offset.py` | a copy of a program set with every Add's offset word exact (`u16_retarget.exact_add_offset`); `patch_entry` is what `pf_generate.py` applies to each program by default for Qwen3-0.6B |
 | `pf_baseline_llm_build.py`, `pf_profile.py` | the `llm_build` reference point; per-program card time |
 
 Calibration text: the prose of `README.md`, `docs/qat.md`, `docs/accuracy-drop.md` and
@@ -108,12 +110,12 @@ token. The table above is layout `0`. Layouts `1`..`8` run neighbouring programs
 | 0 | none (`LAYER`) | 15 | 423 |
 | 1 | `n1` / `n2` = residual Add + two-pass norm (`anorm<H>`; layer 0 `nrm<H>`), `qk` = `rq` + `kc` + `rk` (`qkf<nh*hd>`); the final Add + norm `nf` | 9 | 254 |
 | 2 | `on2` = `o_proj` + `res1` + second norm, `dn` = `down_proj` + `res2` + the next layer's first norm (or the final norm) (`lanorm<k>`) | 7 | 198 |
-| 3 | `dn` also takes the fused SiLU (`slanorm<I>`) | 6 | 170 |
+| 3 (llama-160m default) | `dn` also takes the fused SiLU (`slanorm<I>`) | 6 | 170 |
 | 4 | the linear after each norm joins it: `on2g` = `on2` + `gu` (`lanorml<k>x<n>`), `dnq` = `dn` + the next layer's `qkv5` (`slanorml<k>x<n>`); layer 0 `n1q` (`nrml<n>`) | 4 | 114 |
-| 5 (Qwen3 default) | the next layer's q / k / v and its RoPE join `dn`: `dnqk` (`slanormqk<I>`: five linears q, q_rot, k, k_rot, v, then `qkf`; outputs the residual, q, and the K / V rows); layer 0 `n1qk` (`nrmqk<H>`) | 3 | 86 |
+| 5 | the next layer's q / k / v and its RoPE join `dn`: `dnqk` (`slanormqk<I>`: five linears q, q_rot, k, k_rot, v, then `qkf`; outputs the residual, q, and the K / V rows); layer 0 `n1qk` (`nrmqk<H>`) | 3 | 86 |
 | 6 | the programs of `5`, with rotate_half made inside `dnqk` / `n1qk` (`slanormqkr<I>` / `nrmqkr<H>`): three linears q, k, v (4096 columns instead of 7168), and q_rot / k_rot by `Split` / `Concat` of each head's halves | 3 | 86 |
-| 7 (opt-in) | the attention joins the program after it: `aon2g` = `attn` + `on2g` (`alanorml<k>x<n>`); without a per-head q / k norm (llama-160m) layout 3's `attn` + `on2` = `aon2` (`alanorm<k>`) | 2 (llama: 6) | 58 (llama: 74) |
-| 8 (opt-in, Qwen3) | the whole layer as one program: `alyr` = `aon2g` + SiLU + `dnqk` (`alyrqkr<nh*hd>`: the attention, `o_proj` + `res1` + second norm, gate / up, SiLU, `down_proj` + `res2` + the next layer's norm, q / k / v, rotation and RoPE; six linears, 17 MB); the last layer keeps `aon2g` + `dn` | 1 | 31 |
+| 7 | the attention joins the program after it: `aon2g` = `attn` + `on2g` (`alanorml<k>x<n>`); without a per-head q / k norm (llama-160m) layout 3's `attn` + `on2` = `aon2` (`alanorm<k>`) | 2 (llama: 6) | 58 (llama: 74) |
+| 8 (Qwen3 default, with exact Add offsets) | the whole layer as one program: `alyr` = `aon2g` + SiLU + `dnqk` (`alyrqkr<nh*hd>`: the attention, `o_proj` + `res1` + second norm, gate / up, SiLU, `down_proj` + `res2` + the next layer's norm, q / k / v, rotation and RoPE; six linears, 17 MB); the last layer keeps `aon2g` + `dn` | 1 | 31 |
 
 A merged program has several outputs where the residual stream goes on (`x` and the
 normalized `y`; `qk`'s `yq` and `yk`, which is bound to K row `p` as `rk`'s was). Only
@@ -396,6 +398,10 @@ and after every run.
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=8` (whole layer) | 43/48, 3.52% (6.11%) | 42/48, 2.81% (3.76%) | card 47 ms |
 | Qwen3-0.6B | layout 5 + exact Add offsets (`pf_add_offset.py`) | 45/48, 2.85% (6.04%) | 44/48, 2.24% (3.56%) | card 70 ms |
 | llama-160m | layout 3 + exact Add offsets (`pf_add_offset.py`) | 45/47, 1.23% (1.75%) | 46/47, 1.14% (1.40%) | card 37 ms |
+| Qwen3-0.6B | layout 7 + exact Add offsets (2026-10-28) | 45/48, 2.88% (6.01%) | 45/48, 2.29% (3.81%) | card 56-57 ms |
+| Qwen3-0.6B | layout 8 + exact Add offsets (default since 2026-10-28) | 45/48, 2.91% (5.98%) | 45/48, 2.36% (3.95%) | card 47-49 ms |
+| llama-160m | layout 7 as `pf_generate.py` makes it now (2026-10-28) | 45/47, 1.26% (1.89%) | 46/47, 1.25% (1.52%) | card 33-35 ms |
+| llama-160m | the same + exact Add offsets | 45/47, 1.22% (1.75%) | 46/47, 1.15% (1.44%) | card 33-34 ms |
 
 Notes on the table:
 
@@ -456,9 +462,9 @@ Notes on the table:
   against 46/47 and 46/47 (the extra miss is adaquant position 30, float gap 0.036,
   which layout 0 also missed). `pf_check.py` (with `card_add`): every `aon2g` / `aon2`
   output within 1.3e-3 on both sets of both models. Every program layout 7 shares with
-  layout 6 (llama-160m: layout 3) is byte-identical. Layout 7 is not the default: on the
+  layout 6 (llama-160m: layout 3) is byte-identical. Layout 7 was not made the default: on the
   48 steps its mean error is 0.1 points higher on Qwen3, and llama-160m misses one more
-  near tie.
+  near tie (with exact Add offsets too; Defaults, below).
 - **Layout 8, back to back** (2026-10-28, host load 1-2, three alternating rounds
   6 / 7 / 8). 31 executes and 94 resident programs per token (1.1 GB) against 58 / 145
   (layout 7) and 86 / 198 (layout 6). Card time, medians: 46.9 / 47.8 / 47.0 ms against
@@ -470,7 +476,8 @@ Notes on the table:
   The extra miss is activation-memory-planning position 34 (float top-1 / top-2 gap 0.202,
   missed by the GPTQ rows above too). Host estimate 44/48 2.38% and 44/48 2.13%.
   `pf_check.py` (with `card_add`): every program within the tolerance, `alyr` within
-  1.1e-2 (rest, `v`) and 2.3e-3 (first). Not with `pf_add_offset.py`.
+  1.1e-2 (rest, `v`) and 2.3e-3 (first). With exact Add offsets it is the default
+  (Defaults, below).
 - **llama-160m, merged layouts** (rebuilt the same way, round-to-nearest weights,
   layouts 0-3 back to back). Executes per token: 171 (`0`), 122 (`1`), 98 (`2`) and 86
   (`3`); resident programs 342 / 244 / 196 / 172. Without a per-head q / k norm, `rq` and
@@ -507,6 +514,76 @@ logit gap between the two is at most 0.2, against a logit standard deviation of 
 | Qwen3-0.6B, adaquant, 3 / 10 | 0.021 / 0.068 | Pulsar-free (GPTQ) |
 | Qwen3-0.6B, activation-memory-planning, 13 / 28 / 34 | 0.040 / 0.006 / 0.202 | Pulsar-free (GPTQ) |
 
+### Defaults (2026-10-28)
+
+`pf_model.MODELS` picks each model's layout (`fuse`, `LLM_PF_FUSE`) and Add offset words
+(`add_offset`, `LLM_PF_ADD_OFFSET`, `pf_generate.py --add-offset`). The rule: the fastest
+configuration whose 48-step accuracy is at least the old default's (layout 5 for Qwen3,
+layout 3 for llama-160m) on both passages, top-1 and mean logit error. With `exact`,
+`pf_generate.py` patches every program as it writes it (`pf_add_offset.patch_entry`, the
+same records `pf_add_offset.py` rewrites, and the same `"add_offset": "exact"` manifest
+mark). With `pulsar2` it writes what it wrote before, so every older set regenerates byte
+for byte.
+
+| model | default | was |
+| --- | --- | --- |
+| Qwen3-0.6B | layout 8, exact Add offsets: 31 executes per token, 47-49 ms, 45/48 and 45/48 | layout 5, Pulsar2's offsets: 86, 68-74 ms, 43/48 and 43/48 |
+| llama-160m | layout 3 with the `nl` set (`pf_generate.py nl`, "Newline steps" below), Pulsar2's offsets: 86 executes per token | layout 3, Pulsar2's offsets, no `nl` set |
+
+Card runs, back to back: each set alternated with the others in the same sessions, two
+rounds per passage, the card lock taken per run, health check 0.0 before and after
+every run. Host load (1-minute) 3-16 from other jobs. 48 steps (llama-160m 47).
+Accuracy is deterministic: it was the same in every round. ms is the range of the runs'
+median card time per token; a single slow run is given apart.
+
+| set | adaquant: top-1, median (p90), mean | activation-memory-planning | card ms / token | `pf_check.py` worst, rest / first |
+| --- | --- | --- | --- | --- |
+| Qwen3 layout 5 (`n5b`) | 43/48, 3.47% (6.00%), 3.85% | 43/48, 2.77% (3.68%), 3.09% | 68-74 | 8.7e-3 / 8.6e-3 |
+| Qwen3 layout 5 + offsets | 45/48, 2.85% (6.04%), 3.28% | 44/48, 2.24% (3.56%), 2.63% | 70-74 (one 86) | 8.7e-3 / 8.4e-3 |
+| Qwen3 layout 7 | 44/48, 3.55% (6.18%), 3.94% | 43/48, 2.81% (3.80%), 3.18% | 56-58 | 8.6e-3 / 8.2e-3 |
+| Qwen3 layout 7 + offsets | 45/48, 2.88% (6.01%), 3.37% | 45/48, 2.29% (3.81%), 2.73% | 56-57 | 8.8e-3 / 8.3e-3 |
+| Qwen3 layout 8 | 43/48, 3.52% (6.11%), 3.92% | 42/48, 2.81% (3.76%), 3.19% | 47-49 (one 60) | 1.1e-2 / 8.6e-3 |
+| **Qwen3 layout 8 + offsets** | **45/48, 2.91% (5.98%), 3.41%** | **45/48, 2.36% (3.95%), 2.80%** | **47-49** | 1.1e-2 / 8.8e-3 |
+| llama layout 3 (`l3`) | 46/47, 1.32% (1.86%), 1.54% | 46/47, 1.24% (1.48%), 1.40% | 36-40 | 7.5e-4 / 1.1e-2 |
+| llama layout 3 + offsets | 45/47, 1.23% (1.75%), 1.43% | 46/47, 1.14% (1.40%), 1.28% | 38-40 (one 53) | 1.1e-3 / 1.1e-2 |
+| llama layout 7 | 45/47, 1.26% (1.89%), 1.53% | 46/47, 1.25% (1.52%), 1.40% | 33-35 | 1.5e-3 / 1.2e-2 |
+| llama layout 7 + offsets | 45/47, 1.22% (1.75%), 1.45% | 46/47, 1.15% (1.44%), 1.30% | 33-34 | 1.7e-3 / 1.0e-2 |
+
+- **Qwen3.** Layout 8 with offsets beats layout 5 without them on every measure but
+  activation-memory-planning's p90 (3.95% against 3.68%): two more top-1 hits on each
+  passage, mean 3.41% / 2.80% against 3.85% / 3.09%, at 47 ms against about 70 ms.
+  In every layout the offsets fix adaquant 0 (and 17 where it was missed) and
+  activation-memory-planning 0 and 5 (layout 8 also 34); layout 5 with offsets misses
+  activation-memory-planning 7 instead. Layout 5 with offsets stays
+  the most accurate (3.28% / 2.63%), 0.1-0.2 points ahead of layout 8 with offsets, at
+  1.5x the card time. Free-running generation on the new default (4 prompts, 48 tokens)
+  agrees with the float model as long as layout 5's does (with or without offsets): 48,
+  1, 48 and 19 tokens, diverging at the same near ties (float gaps 0.18 and 0.19) into
+  continuations that stay fluent ("... girl named Lila who lived in a village. She had a
+  big garden"). The two complete prompts are token for token layout 5's.
+- **llama-160m.** No candidate meets the rule: every one misses adaquant position 30,
+  where the float top-1 / top-2 gap is 0.036, and layout 3 does not. The offsets take
+  0.1 points off the mean error in both layouts; layout 7 saves 3-5 ms. Layout 3 with
+  Pulsar2's offsets stays the default, now with the `nl` set, which changes no prose
+  step (the rows here) and fixes the newline steps. On the passages with their line
+  breaks, exact offsets with `nl` read 47/47 and 46/47 against 47/47 and 45/47 ("Newline
+  steps"), but the prose rule decides. The `nl` set regenerates byte for byte on this
+  code from the shared templates, with Pulsar2's offsets and with exact ones
+  (`--add-offset exact`, equal to `pf_add_offset.py`'s copy).
+- **The layout 7 sets.** Qwen3's layout 7 set regenerates byte for byte from master's
+  `pf_generate.py`. llama-160m's round-one layout 7 set (`aon2` from `alanorm768` v1, 47
+  steps 45/47 1.29% / 46/47 1.26%, the row above) does not. Master calibrates `aon2`'s
+  attention output at the union of the attention's and the linear's ranges (scale
+  6.1e-5 against 3.5e-5 at layer 0). The llama rows here are master's.
+- **The templates.** The templates layouts 6-8 need (`nrmqkr1024`, `slanormqkr3072`,
+  `alanorml2048x6144`, `lyrqkr2048`, `alyrqkr2048`; llama-160m `alanorm768`) are now in the
+  shared template root next to the others. From that root alone, layouts 3, 5 and 6
+  (Qwen3, layers 0-1 of both sets), 7 and 8 (Qwen3, both whole sets) and llama-160m's 3
+  and 7 (whole sets) all generate. Each set is byte-identical to its card-tested set with
+  Pulsar2's offsets, and to the `pf_add_offset.py` copy with exact ones: every `.axmodel`
+  and manifest entry. The one exception is a tie refusal's message in llama-160m's layout
+  3 manifest, which can name another tensor of the same tie.
+
 ### Free-running generation (`pf_plan.py --generate`)
 
 The rows above are teacher-forced: every step gets the passage's next token.
@@ -530,7 +607,8 @@ used: llama-160m layout 3, Qwen3-0.6B layout 5 with GPTQ.
 
 Qwen3-0.6B diverges only where the float model is near a tie (gaps 0.18 and 0.19).
 Both continuations then stay fluent ("... girl named Lila who lived in a village called
-Willowbrook"). It is the same for the sets patched by `pf_add_offset.py` (below).
+Willowbrook"). It is the same for the sets patched by `pf_add_offset.py` (below), and
+for the default since 2026-10-28, layout 8 with exact offsets (Defaults, above).
 
 llama-160m breaks at a newline. Both of its divergences come at the first token after a
 generated `\n`, and the float gap there is 1.87. The `\n` token makes a massive
@@ -661,7 +739,10 @@ give 43/48 3.04% and 43/48 2.77%. llama-160m goes from 1.22% / 1.16% to 1.30% / 
 `zp_y * 2^n - zp_a * A - zp_b * B`. `pf_add_offset.py` copies a generated set and
 rewrites each Add's four offset records (`0x1ef0..0x1f20`), found by Pulsar2's value.
 Nothing else changes, and the manifests mark the programs for `pf_check.py` and
-`pf_estimate.py`. Qwen3-0.6B: 179 programs and 286 Adds. Each program differs from
+`pf_estimate.py`. `pf_generate.py` applies the same patch to each program as it writes it
+when the model's `add_offset` is `exact` (Qwen3-0.6B's default since 2026-10-28;
+`--add-offset` / `LLM_PF_ADD_OFFSET` choose); `pf_add_offset.py` remains for sets
+generated with Pulsar2's offsets. Qwen3-0.6B: 179 programs and 286 Adds. Each program differs from
 Pulsar2's only in those records; in ten first-set `dnqk` programs a residual Add's exact
 offset is 0, so two writes are elided as Pulsar2 would elide them. llama-160m: 120
 programs and Adds.
@@ -879,14 +960,15 @@ after the changes above they take about 7.5 s of a 94 s serial set.
   (four per fused / Add shape, one per linear shape; llama-160m: 29).
 - **Layouts `4` to `6` and `8` need a per-head q / k norm** (`qkf`): llama-160m stops at layout `3`
   (`7` is layout 3 with `aon2` there).
-- **Layout 8 is opt-in.** Its mean logit error is layout 7's, 0.07 / 0.10 points above
-  layout 6's. The last layer keeps two programs (`aon2g` + `dn`, the final norm), and the
-  first set's split layers (0-2) and the layer after them keep their own programs.
+- **Layout 8 (the Qwen3 default) needs the exact Add offsets.** Without them its mean
+  logit error is layout 7's, 0.07 / 0.10 points above layout 6's, and it misses one more
+  near tie. The last layer keeps two programs (`aon2g` + `dn`, the final norm), and the
+  first set's split layers (0-2) and the layer after them keep their own programs. Its
+  `alyrqkr2048` templates are eight Pulsar2 builds, about 0.9 GB.
 - **Even tables only.** Pulsar2's uneven Sigmoid / Silu tables (above) would be more
   accurate on wide ranges; generating them is not done.
-- **Layout 6 is not the default yet.** It needs the `nrmqkr` / `slanormqkr` templates
-  (`pf_templates.py`). The first set's layers after a split layer (1-3) keep a `qkv5` of
-  7168 columns and `qk`.
+- **Layouts 6 and 8 keep layout 5's first-set programs after a split layer.** The first
+  set's layers 1-3 keep a `qkv5` of 7168 columns and `qk`.
 - **Not ported from the scratch run.** The per-program card-vs-host diagnostics and the
   attention calibration-margin experiment (`m = 1.0 / 1.2 / 1.414` on recorded inputs) are
   left out; the margin in use is sqrt(2).

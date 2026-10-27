@@ -483,3 +483,53 @@ def test_tied_ranges_follow_the_template():
     tq["x"] = (1e-4, 30000)
     with pytest.raises(ValueError, match="widen"):
         g._tied(rg, m, tq)
+
+
+#: ``pf_generate._run_one``'s layer functions, by layout
+LAYER_FNS = ("", "_fused", "_fused2", "_fused4", "_fused5", "_fused8")
+
+
+def test_generate_patches_add_offsets(monkeypatch):
+    """With ``add_offset="exact"`` (Qwen3-0.6B's default) ``pf_generate``
+    patches each layer's programs as it writes them
+    (``pf_add_offset.patch_entry`` in place); ``pulsar2`` (llama-160m's, and
+    a synthetic ``Config``'s) keeps Pulsar2's word."""
+    import types
+
+    import pf_add_offset
+    import pf_generate
+
+    assert pf_model.MODELS["qwen3_0.6b"]["add_offset"] == "exact"
+    assert pf_model.MODELS["qwen3_0.6b"]["fuse"] == 8
+    assert pf_model.MODELS["llama160m"]["add_offset"] == "pulsar2"
+    assert _config("qwen3_like", ".", 8).add_offset == "pulsar2"
+    with pytest.raises(ValueError, match="add_offset"):
+        pf_model.Config(ld.make_synthetic("qwen3_like"), add_offset="zero")
+
+    calls = []
+
+    def patch_entry(src, out, st, wh, k, e):
+        calls.append((src, out, st, wh, k))
+        e["add_offset"] = "exact"
+        return 1
+
+    def layer(st, li, man):
+        man[f"L{li}"] = {"alyr": {"kind": "fused"}, "lm": {"kind": "linear"}}
+
+    cfg = types.SimpleNamespace(fuse=8, qk_norm=True, out="/set")
+    gen = types.SimpleNamespace(cfg=cfg, **{f"layer{s}": layer for s in LAYER_FNS})
+    monkeypatch.setattr(pf_add_offset, "patch_entry", patch_entry)
+    monkeypatch.setattr(pf_generate, "_GEN", gen)
+    monkeypatch.setattr(pf_generate, "_ADD_OFFSET", "pulsar2")
+    assert pf_generate._run_one(("rest", 3)) == {
+        "alyr": {"kind": "fused"},
+        "lm": {"kind": "linear"},
+    }
+    assert calls == []
+    monkeypatch.setattr(pf_generate, "_ADD_OFFSET", "exact")
+    entry = pf_generate._run_one(("rest", 3))
+    assert entry["alyr"]["add_offset"] == "exact"
+    assert calls == [
+        ("/set", "/set", "rest", "L3", "alyr"),
+        ("/set", "/set", "rest", "L3", "lm"),
+    ]
