@@ -404,6 +404,37 @@ PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch> R=/data/loc
   --pieces msda_split_all8o16 --modes seq,pipe
 ```
 
+### Encoder and decoder from the tinygrad fork through onnx-remote (`msda_hvx/e2e_remote.py`)
+
+The int8 backbone stays on the HTP. The 3-layer encoder (`enc3.msda.onnx`) and the decoder (`decoder.msda.onnx`), from
+`export_msda_op.py`, are compiled by the tinygrad fork. That is fork commit `9edd28d9e`, where every kernel is generated
+(see `tools/onnx-remote/README.md`). They run on the cDSP through onnx-remote. Each piece is fed the previous piece's phone
+output, and the phone's own BEV is carried to the next frame, as in `e2e_msda.py`. Results for scene-0103 frames 0-5:
+
+| | backbone (HTP) | encoder | decoder | frame | GT matched |
+|---|---:|---:|---:|---:|---|
+| fp32 torch (CPU) | | | | | 106 / 190 |
+| previous best: `frame_run`, HTP pieces + hand HVX MSDA (above), seq | 21.3 | 55.1 | 24.9 | 101.8 | 107 / 190 |
+| **tinygrad encoder + decoder (cDSP DSP time)** | 21.4 | **29.6** | **22.7** | **73.8** | 106 / 190 |
+| same BEV, fp16 HTP decoder instead | | | 24.8 | | 107 / 190 |
+
+- **Accuracy:** the encoder alone is exact against fp32 torch on the phone's own inputs: cos 1.000000 on every frame. The
+  whole model has bev cos 0.9966-0.9980 and cls >= 0.99979, the int8 backbone's gap as before. Detections match the HTP
+  decoder's within one GT.
+- **Encoder and decoder times** are the program's DSP time (median of the 6 frames, 10 runs each).
+- **The frame time** is the sum of the backbone's HTP time and the two programs' DSP times. The pieces don't run in one
+  process yet.
+- **Through onnx-remote** (`run_compiled` RPC-inclusive, adb-forwarded TCP from the host), the encoder takes 268 ms and the
+  decoder 104 ms. That is the transport (about 12 MB of fp32 encoder inputs and BEV over USB), not the phone.
+  `frame_run` with the tinygrad artifacts loaded in-process is the next step for an app-level number.
+
+```sh
+CLIENT=<onnx-remote-client> WORKER=<onnx-remote-hexagon-worker> COMPILER_PORT=<compile_v69.sh service> \
+  PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch> \
+  python3 msda_hvx/e2e_remote.py --ckpt $C/bevformer_tiny_epoch_24.pth --data $C/nuscenes-mini --work $C/work \
+  --htp-decoder decoder.sim
+```
+
 ### Why not a `scripts/android/deploy` spec (yet)
 
 The deploy pipeline (#1853) takes one graph through fetch -> simplify -> quantize -> rewrite ->
