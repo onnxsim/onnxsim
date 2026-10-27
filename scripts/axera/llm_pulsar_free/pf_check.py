@@ -18,6 +18,9 @@ wrong record (scale, zero point, Add shift, weight table) reads 1e-1 or more.
 Without the card's Add (a float sum), llama-160m's layer-1 ``on2`` read 1.3e-2
 and Qwen3's first set up to 3.3e-2: that was the Add's bias, not the program.
 
+--set nl (llama-160m): the steps of the first passage with its line breaks,
+up to its first newline (which runs on the nl set).
+
 usage: MODEL=qwen3_0.6b pf_check.py [--steps 3] [--tol T] [--set rest]
        -> <out>/check_<set>.json; exit status 1 if any program is above --tol
 """
@@ -84,13 +87,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--steps", type=int, default=3)
     ap.add_argument("--tol", type=float, default=2e-2, help="default 2e-2 (both sets)")
-    ap.add_argument("--set", default="rest", choices=("first", "rest"))
+    ap.add_argument("--set", default="rest", choices=("first", "rest", "nl"))
     a = ap.parse_args()
     import axcl_session as A
 
     cfg = pf_model.load()
-    ids = cfg.passage_ids(lay.EVAL_DOCS[0])
+    ids = cfg.passage_ids(lay.EVAL_DOCS[0], lines=a.set == "nl")
     p0 = cfg.first_pos if a.set == "first" else cfg.first_pos + a.steps
+    if a.set == "nl":  # up to the passage's first newline at or after p0
+        p0 = next(p for p in range(p0, len(ids)) if ids[p] in cfg.nl_tokens)
     rows, bad = [], 0
     with A.AXSession() as sess:
         print("health before", A.health_check(sess), flush=True)

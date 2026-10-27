@@ -43,12 +43,17 @@ union); run ``rest`` before ``first``. With ``first_pos == 0`` the first set
 also shares the rest's ``rq`` / ``rk`` / ``kc`` / ``qk`` (sin = 0 at position 0
 degenerates their own calibration), which are then calibrated on both sets.
 
+The ``nl`` set (llama-160m's newline steps, ``pf_record.py``) is the
+``rest`` set generated from ``acts/nl`` (every read of the rest set's
+activations reads those); models without ``share_linears`` / ``first_pos ==
+0`` only.
+
 Writes ``<out>/<set>/L<l>/<program>.axmodel``, ``<out>/cal/<set>/...`` (the
 programs' float graphs and calibration samples) and
 ``<out>/manifest_<set>.json``.
 
 usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer] [--jobs N]
-       (SET: first | rest; the layers run in N worker processes, the files
+       (SET: first | rest | nl; the layers run in N worker processes, the files
        are the same for any N)
 """
 
@@ -146,11 +151,14 @@ def rng2(*arrs):
 class Generator:
     def __init__(self, cfg: pf_model.Config, root: str):
         self.cfg, self.root, self.out = cfg, root, cfg.out
+        #: acts set read for another (``nl``: its own samples for ``rest``'s)
+        self.acts_alias: dict = {}
 
     def _rel(self, p, base=None):
         return os.path.relpath(p, base or self.out)
 
     def _acts(self, st, where):
+        st = self.acts_alias.get(st, st)
         return np.load(os.path.join(self.out, "acts", st, f"{where}.npz"))
 
     def _manifest(self, st):
@@ -1509,7 +1517,7 @@ def _run_one(job):
 def main():
     global _GEN
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("set", choices=("first", "rest"))
+    ap.add_argument("set", choices=("first", "rest", "nl"))
     ap.add_argument("layers", nargs="*", type=int, help="first_layer last_layer")
     ap.add_argument("--templates", default=None, help="template root (pf_templates.py)")
     ap.add_argument(
@@ -1524,6 +1532,10 @@ def main():
     gen = Generator(cfg, a.templates or tpl.default_root(cfg))
     lo_l, hi_l = (a.layers[0], a.layers[1]) if len(a.layers) == 2 else (0, cfg.L - 1)
     st = a.set
+    if st == "nl":
+        if cfg.share_linears or cfg.first_pos == 0:
+            sys.exit("the nl set: models without share_linears / first_pos 0 only")
+        gen.acts_alias = {"rest": "nl"}
     mpath = os.path.join(cfg.out, f"manifest_{st}.json")
     man = json.load(open(mpath)) if os.path.exists(mpath) else {}
     t0 = time.time()

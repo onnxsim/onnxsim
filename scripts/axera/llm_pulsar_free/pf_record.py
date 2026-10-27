@@ -4,6 +4,9 @@ decode steps (the calibration data of ``pf_generate.py`` and ``pf_gptq.py``).
   rest  : positions first_pos+1 .. S-1 of each ``CAL_DOCS`` passage
   first : position first_pos with ``N_FIRST`` different tokens (the passages'
           tokens), the positions before it as in the first passage
+  nl    : with ``Config.nl_tokens`` (llama-160m), the rest set's positions of
+          each passage both as prose and with its line breaks kept
+          (``pf_layout.lines``): the first newline of a sequence is massive
 
 Per layer: x (layer input), a (n1 out), qp, kp, vp, att, op, x1, m (n2 out),
 gate, up, act, down, and the position p (for the RoPE tables); the attention
@@ -11,7 +14,7 @@ inputs (qr = RoPE'd q, K / V in the plan layout: the new row in slot p, row S
 zero) for about ``N_ATTN`` sampled steps. Post: the final hidden, xn, logits.
 Writes ``<out>/acts/<set>/L<l>.npz`` and ``post.npz``.
 
-usage: MODEL=llama160m pf_record.py [--n-first 512] [--n-attn 64]
+usage: MODEL=llama160m pf_record.py [--n-first 512] [--n-attn 64] [--[no-]nl]
 """
 
 from __future__ import annotations
@@ -37,8 +40,9 @@ KEYS = ("a", "qp", "kp", "vp", "att", "op", "x1", "m", "gate", "up", "act", "dow
 class Recorder:
     def __init__(self, cfg: pf_model.Config, n_attn: int, seed: int = 11):
         self.cfg, self.n_attn = cfg, n_attn
-        self.acc = {st: [dict() for _ in range(cfg.L)] for st in ("first", "rest")}
-        self.post = {st: {} for st in ("first", "rest")}
+        sets = ("first", "rest", "nl")
+        self.acc = {st: [dict() for _ in range(cfg.L)] for st in sets}
+        self.post = {st: {} for st in sets}
         self.cur: dict = {}
         self.rng = np.random.default_rng(seed)
 
@@ -102,6 +106,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--n-first", type=int, default=512)
     ap.add_argument("--n-attn", type=int, default=64)
+    ap.add_argument(
+        "--nl",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="also the nl set (default: when the model has nl_tokens)",
+    )
     a = ap.parse_args()
     cfg = pf_model.load()
     rec = Recorder(cfg, a.n_attn)
@@ -122,6 +132,15 @@ def main():
         if (i + 1) % 128 == 0:
             print("first", i + 1, f"{time.time() - t0:.0f}s", flush=True)
     rec.save("first")
+    if cfg.nl_tokens if a.nl is None else a.nl:
+        # after first: the rest / first sets' attention samples stay as without
+        passages = [(d, lines) for lines in (False, True) for d in lay.CAL_DOCS]
+        n_nl = len(passages) * (S - 1 - fp)
+        for doc, lines in passages:
+            ids = cfg.passage_ids(doc, lines=lines)
+            rec.steps(ids, set(range(fp + 1, S)), "nl", a.n_attn / n_nl)
+            print("nl", doc, "lines" if lines else "", f"{time.time() - t0:.0f}s")
+        rec.save("nl")
     print("done", f"{time.time() - t0:.0f}s", "first tokens", len(toks))
 
 

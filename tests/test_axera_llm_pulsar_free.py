@@ -249,6 +249,55 @@ def test_plan_wiring_matches_float_model(name, fuse, tmp_path):
     assert max(r["rel"] for r in est) < 1e-4
 
 
+@pytest.mark.parametrize("name", ["llama_gqa", "llama_mha"])
+def test_nl_set_runs_the_newline_steps(name, tmp_path):
+    """With an ``nl`` set (llama-160m's newline steps, ``pf_record.py``) the
+    plan loads three sets, runs every ``nl_tokens`` step on ``nl`` (the first
+    position still on ``first``) and still reproduces the float model: the
+    ``nl`` programs write the same K / V rows the ``rest`` ones read."""
+    cfg = _config(name, str(tmp_path), 3)
+    root = str(tmp_path / "float_set")
+    pf_plan.write_float_set(cfg, root)
+    assert cfg.sets(root) == ("first", "rest")
+    os.symlink(os.path.join(root, "rest"), os.path.join(root, "nl"))
+    with (
+        open(os.path.join(root, "manifest_rest.json")) as f,
+        open(os.path.join(root, "manifest_nl.json"), "w") as g,
+    ):
+        g.write(f.read())
+    assert cfg.sets(root) == ("first", "rest")  # the model has no nl_tokens
+    two = pf_plan.Plan(lay.FakeAX(str(tmp_path / "f2")), cfg, fake=True, root=root)
+    ids = [int(t) for t in np.random.default_rng(7).integers(1, cfg.vocab, 7)]
+    nl = ids[3]
+    ids[1] = ids[5] = nl
+    cfg.nl_tokens = (nl,)
+    assert cfg.sets(root) == ("first", "rest", "nl")
+    plan = pf_plan.Plan(lay.FakeAX(str(tmp_path / "fake")), cfg, fake=True, root=root)
+    assert plan.sets == ("first", "rest", "nl")
+    assert plan.n_programs > two.n_programs and plan.n_runs == two.n_runs
+    used = [cfg.set_of(t, p, plan.sets) for p, t in enumerate(ids) if p]
+    assert used == ["first", "rest", "nl", "rest", "nl", "rest"]
+    rows = pf_plan.decode(plan, cfg, ids)
+    assert max(r["rel"] for r in rows) < 1e-4
+    assert all(r["top1"] == r["float_top1"] for r in rows)
+    chains = {st: pf_estimate.Chain(cfg, st, exact=True, root=root) for st in plan.sets}
+    assert max(r["rel"] for r in pf_estimate.run(cfg, ids, chains)) < 1e-4
+
+
+def test_lines_keeps_the_line_breaks(tmp_path):
+    """``pf_layout.lines`` (the ``nl`` set's calibration text) keeps line
+    breaks, headings, lists and code; ``prose`` joins them into one line."""
+    md = tmp_path / "d.md"
+    md.write_text(
+        "# Title\n\n<p>html</p>\nSome [link](x.md) text.\n\n- item\n\n"
+        "```py\nx = 1\n```\n"
+    )
+    assert lay.lines(str(md)) == (
+        "# Title\n\nSome link text.\n\n- item\n\n```py\nx = 1\n```"
+    )
+    assert lay.prose(str(md)) == "Some link text. - item"
+
+
 @pytest.mark.parametrize("name,fuse", [("qwen3_like", 5), ("llama_mha", 3)])
 def test_free_running_greedy_matches_float_model(name, fuse, tmp_path):
     """``pf_plan.greedy`` (``--generate``) on the plan with float programs feeds
