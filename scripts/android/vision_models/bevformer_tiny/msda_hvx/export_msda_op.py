@@ -15,6 +15,9 @@ model.py's own forward on the saved frames. Compare a device run with onnxruntim
 (<piece>.sim.onnx from export.py), same inputs.
 
 usage: export_msda_op.py enc1|enc3|decoder --ckpt <pth> --work <work>   -> <work>/<piece>.msda.onnx (onnxsim-simplified)
+       export_msda_op.py frame --work <work>   -> <work>/frame.msda.onnx: enc3.msda.onnx and decoder.msda.onnx (both exported
+       first) as one graph, bev_embed kept as an output -- one program for frame_run's TG_ENC (two separate programs don't fit
+       the DSP process together)
 """
 
 from __future__ import annotations
@@ -103,12 +106,39 @@ def worst(a, b):
     )
 
 
+def merge_frame(work: Path) -> Path:
+    import onnx
+    from onnx import compose
+
+    e, d = (
+        onnx.load(str(work / "enc3.msda.onnx")),
+        onnx.load(str(work / "decoder.msda.onnx")),
+    )
+    for m in (
+        e,
+        d,
+    ):  # (onnxsim's own metadata differs between the two, which merge_models refuses)
+        del m.metadata_props[:]
+    d = compose.add_prefix(d, "dec_", rename_inputs=False, rename_outputs=False)
+    m = compose.merge_models(e, d, io_map=[("bev_embed", "bev_embed")])
+    m.graph.output.insert(0, next(o for o in e.graph.output if o.name == "bev_embed"))
+    out = work / "frame.msda.onnx"
+    onnx.save(m, str(out))
+    print(f"{out}: outputs {[o.name for o in m.graph.output]}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("piece")
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt")
     ap.add_argument("--work", default="work")
     a = ap.parse_args()
+    if a.piece == "frame":
+        merge_frame(Path(a.work))
+        return
+    if not a.ckpt:
+        raise SystemExit("--ckpt is required")
     torch.set_grad_enabled(False)
     work = Path(a.work)
     frames = [

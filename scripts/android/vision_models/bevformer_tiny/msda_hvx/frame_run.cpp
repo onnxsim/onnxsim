@@ -18,6 +18,13 @@
 //   (one execute) or batch 1 (backbone1.q8: one execute per camera).
 //   seq and pipe write <out dir>/f<i>_{bev,cls,bbox}.f32 for the last pass over the frames; pipe also
 //   prints the max |diff| to seq's outputs when those exist (the two must agree bit for bit).
+//   TG_ENC=<enc3.tghx> / TG_DEC=<decoder.tghx>: the encoder / decoder as tinygrad-compiled programs instead (the fork's
+//   examples/dsp_graph_onnx.py --artifact on export_msda_op.py's enc3.msda.onnx / decoder.msda.onnx; tg_prog.h). TG_ENC also
+//   reads shift.f32 (2) and bev_mask.f32 (6,2500,4) from each frame dir; the program's own inputs are staged in place. The two
+//   programs both take the HMX and VTCM, so their runs are serialized (TG_CONC=1: not). A TG_ENC program with three outputs
+//   (bev_embed, cls_scores, bbox_preds: the encoder and decoder merged into one graph) is the whole frame after the backbone;
+//   the decoder stage then only hands its outputs on. (Two separate programs didn't fit the DSP process together: the second's
+//   weight upload failed.)
 // env: MSDA_THREADS (default 4), QNN_PERF, QNN_EXTRA, ORT_LOG
 #include <cmath>
 #include <condition_variable>
@@ -25,12 +32,13 @@
 #include <thread>
 
 #include "chain.h"
+#include "tg_prog.h"
 
 namespace {
 
 struct Frame {
   std::vector<uint8_t> img, vis;
-  std::vector<float> has_prev, can_bus, tsa_ref, ref_cam;
+  std::vector<float> has_prev, can_bus, tsa_ref, ref_cam, shift, bev_mask;
   std::vector<int32_t> rot_idx;
 };
 
@@ -63,6 +71,22 @@ void stage_inputs(const Frame& fr, const float* prev_bev, const uint8_t* feats_q
   memcpy(get("tsa_ref").p, fr.tsa_ref.data(), fr.tsa_ref.size() * 4);
   memcpy(get("ref_cam").p, fr.ref_cam.data(), fr.ref_cam.size() * 4);
   memcpy(get("vis").p, fr.vis.data(), fr.vis.size());
+}
+
+// the same for a tinygrad encoder program (TG_ENC): straight into its packed input buffer, in its ONNX input order
+// (feats, prev_bev, has_prev, shift, can_bus, ref_cam, bev_mask)
+void stage_tg(TgProg& p, const Frame& fr, const float* prev_bev, const uint8_t* feats_q) {
+  float* feats = (float*)p.input(0);
+  for (size_t i = 0; i < FEATS; ++i) feats[i] = ((int)feats_q[i] - feats_zp) * feats_scale;
+  float* pb = (float*)p.input(1);
+  for (int q = 0; q < NQ; ++q) {
+    int s = fr.rot_idx[q];
+    if (s < 0 || !prev_bev) memset(pb + (size_t)q * E, 0, E * 4);
+    else memcpy(pb + (size_t)q * E, prev_bev + (size_t)s * E, E * 4);
+  }
+  const std::vector<float>* rest[] = {&fr.has_prev, &fr.shift, &fr.can_bus, &fr.ref_cam, &fr.bev_mask};
+  for (int i = 0; i < 5; ++i)
+    if (void* d = p.input(2 + i)) memcpy(d, rest[i]->data(), rest[i]->size() * 4);
 }
 
 double med(std::vector<double> v) {
@@ -137,11 +161,34 @@ int main(int argc, char** argv) {
         npu.push_back(d);
     if (npu.empty()) throw std::runtime_error("no QNN NPU ep device");
 
+    const char* tg_enc = getenv("TG_ENC");
+    const char* tg_dec = getenv("TG_DEC");
     std::map<std::string, Piece> pc;
     double create = 0, ms = 0;
     for (auto n : {"pre", "mid0", "post0", "mid1", "post1", "mid2", "post2"}) {
+      if (tg_enc) break;
       pc[n] = load(pdir, n, &ms);
       create += ms;
+    }
+    TgProg tenc, tdec;
+    std::mutex tg_mu;  // the two programs' runs (both take the HMX + VTCM) one at a time, unless TG_CONC=1
+    const bool tg_conc = getenv("TG_CONC") && atoi(getenv("TG_CONC"));
+    auto tg_run = [&](TgProg& p) {
+      if (tg_conc) return p.run();
+      std::lock_guard<std::mutex> l(tg_mu);
+      p.run();
+    };
+    if (tg_enc) {
+      double a = now_ms();
+      tenc.load(tg_enc, ".", "tg_enc.so");
+      create += now_ms() - a;
+      printf("tinygrad encoder %s: %d calls, %zu input bytes\n", tg_enc, tenc.ncalls, tenc.ibytes);
+    }
+    if (tg_dec) {
+      double a = now_ms();
+      tdec.load(tg_dec, ".", "tg_dec.so");
+      create += now_ms() - a;
+      printf("tinygrad decoder %s: %d calls\n", tg_dec, tdec.ncalls);
     }
     auto split_path = [](const std::string& p) {
       size_t s = p.rfind('/');
@@ -161,7 +208,7 @@ int main(int argc, char** argv) {
         dp[n] = load(pdir, n, &ms);
         create += ms;
       }
-    } else {
+    } else if (!tg_dec && !(tg_enc && tenc.out.size() == 3)) {
       dec = load(dd, dn, &ms);
       create += ms;
     }
@@ -170,7 +217,7 @@ int main(int argc, char** argv) {
       std::ifstream q(pdir + "/feats_q.txt");
       if (!(q >> feats_scale >> feats_zp)) throw std::runtime_error("missing " + pdir + "/feats_q.txt");
     }
-    if (bb.in.size() != 1 || bb.out.size() != 1 || (!dsplit && dec.in.size() != 1))
+    if (bb.in.size() != 1 || bb.out.size() != 1 || (dec.s && dec.in.size() != 1))
       throw std::runtime_error("backbone: 1 in / 1 out, decoder: 1 in expected");
 
     std::vector<Frame> frames;
@@ -184,6 +231,10 @@ int main(int argc, char** argv) {
       fr.tsa_ref = read_vec<float>(d + "/tsa_ref.f32", 2 * NQ * 2);
       fr.ref_cam = read_vec<float>(d + "/ref_cam.f32", 6 * NQ * 4 * 2);
       fr.rot_idx = read_vec<int32_t>(d + "/rot_idx.i32", NQ);
+      if (tg_enc) {
+        fr.shift = read_vec<float>(d + "/shift.f32", 2);
+        fr.bev_mask = read_vec<float>(d + "/bev_mask.f32", 6 * NQ * 4);
+      }
       frames.push_back(std::move(fr));
     }
     const int nf = (int)frames.size();
@@ -204,6 +255,16 @@ int main(int argc, char** argv) {
       buf("bev" + std::to_string(s), {NQ, E});
     }
     const int DQ = 900;
+    const bool tg_frame = tg_enc && tenc.out.size() == 3;
+    if (tg_dec || tg_frame) {
+      buf("cls_scores", {DQ, 10});
+      buf("bbox_preds", {DQ, 10});
+    }
+    if (tg_frame)
+      for (int s = 0; s < SL; ++s) {
+        buf("cls" + std::to_string(s), {DQ, 10});
+        buf("bbox" + std::to_string(s), {DQ, 10});
+      }
     if (dsplit) {  // layer 0's kernel inputs are constants (dec_split.py const)
       std::vector<std::pair<std::string, std::vector<int64_t>>> cs = {
           {"q1", {DQ, E}}, {"doff", {DQ, 64}}, {"dw", {DQ, 32}}, {"refp", {DQ, 3}}, {"dref", {DQ, 2}}};
@@ -241,12 +302,38 @@ int main(int argc, char** argv) {
     };
     auto do_enc = [&](int f, int s_in, int s_out, auto&& mark) {
       const Frame& fr = frames[f % nf];
-      stage_inputs(fr, fr.has_prev[0] > 0 ? last_bev.data() : nullptr, (const uint8_t*)get("fq" + std::to_string(s_in)).p);
-      mark(-1);  // host staging (dequantize + prev_bev gather)
-      encoder(pc, mark, "bev" + std::to_string(s_out));
+      const float* prev = fr.has_prev[0] > 0 ? last_bev.data() : nullptr;
+      const uint8_t* fq = (const uint8_t*)get("fq" + std::to_string(s_in)).p;
+      if (tg_enc) {
+        stage_tg(tenc, fr, prev, fq);
+        mark(-1);
+        tg_run(tenc);
+        mark(1);
+        memcpy(get("bev" + std::to_string(s_out)).p, tenc.output(0), NQ * E * 4);
+        if (tg_frame) {
+          memcpy(get("cls" + std::to_string(s_out)).p, tenc.output(1), DQ * 10 * 4);
+          memcpy(get("bbox" + std::to_string(s_out)).p, tenc.output(2), DQ * 10 * 4);
+        }
+      } else {
+        stage_inputs(fr, prev, fq);
+        mark(-1);  // host staging (dequantize + prev_bev gather)
+        encoder(pc, mark, "bev" + std::to_string(s_out));
+      }
       memcpy(last_bev.data(), get("bev" + std::to_string(s_out)).p, NQ * E * 4);
     };
     auto do_dec = [&](int s) {
+      if (tg_frame) {
+        memcpy(get("cls_scores").p, get("cls" + std::to_string(s)).p, DQ * 10 * 4);
+        memcpy(get("bbox_preds").p, get("bbox" + std::to_string(s)).p, DQ * 10 * 4);
+        return;
+      }
+      if (tg_dec) {
+        memcpy(tdec.input(0), get("bev" + std::to_string(s)).p, NQ * E * 4);
+        tg_run(tdec);
+        memcpy(get("cls_scores").p, tdec.output(0), DQ * 10 * 4);
+        memcpy(get("bbox_preds").p, tdec.output(1), DQ * 10 * 4);
+        return;
+      }
       if (!dsplit) {
         run(dec, {{dec.in[0], "bev" + std::to_string(s)}});
         return;
@@ -275,7 +362,7 @@ int main(int argc, char** argv) {
     do_dec(0);
 
     if (mode == "seq") {
-      std::vector<double> t_bb, t_st, t_enc, t_msda, t_dec, t_tot;
+      std::vector<double> t_bb, t_st, t_enc, t_msda, t_dec, t_tot, t_edsp, t_ddsp;
       for (int it = 0; it < warmup + reps; ++it)
         for (int f = 0; f < nf; ++f) {
           double t0 = now_ms();
@@ -293,11 +380,14 @@ int main(int argc, char** argv) {
           if (it >= warmup) {
             t_bb.push_back(t1 - t0); t_st.push_back(st); t_enc.push_back(t2 - t1 - st); t_msda.push_back(dsp);
             t_dec.push_back(t3 - t2); t_tot.push_back(t3 - t0);
+            if (tg_enc) t_edsp.push_back(tenc.last_dsp_ms);
+            if (tg_dec) t_ddsp.push_back(tdec.last_dsp_ms);
           }
           if (it == warmup + reps - 1) save(f, 0, odir);
         }
       printf("seq frame_ms median %.2f (n=%zu): backbone %.2f, host staging %.2f, encoder %.2f (msda calls %.2f), decoder %.2f\n",
              med(t_tot), t_tot.size(), med(t_bb), med(t_st), med(t_enc), med(t_msda), med(t_dec));
+      if (tg_enc || tg_dec) printf("tinygrad programs' own DSP time: encoder %.2f, decoder %.2f\n", med(t_edsp), med(t_ddsp));
     } else if (mode == "pipe") {
       const int N = (warmup + reps) * nf;
       Slots bb2enc(SL), enc2dec(SL);
@@ -412,6 +502,8 @@ int main(int argc, char** argv) {
       }
       if (have) printf("pipe vs seq outputs: max |diff| %g\n", m);
     }
+    tenc.close();
+    tdec.close();
     msda_rpc_close(h_msda);
     printf("PASS\n");
     fflush(stdout);
