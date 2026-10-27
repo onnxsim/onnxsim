@@ -45,6 +45,15 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
   (``y = yn @ w2``, ``[1, H] @ [H, n]``; ``fuse=4``);
   ``alanorm<k>`` / ``alanorml<k>x<n>`` (``fuse=7``): ``attn<k>`` whose output
   is the linear's input ``z`` of ``lanorm<k>`` / ``lanorml<k>x<n>``.
+* ``lyrqk<nh*hd>`` / ``lyrqkr<nh*hd>``: ``lanorm<nh*hd>`` (its tensors
+  suffixed ``_1``, the attention output ``att``), the gate / up linears from
+  its output, then ``slanormqk<I>`` / ``slanormqkr<I>`` on them, with the SiLU
+  written ``Mul(sigmoid(gate), gate)``: Pulsar2 fuses ``Mul(gate,
+  sigmoid(gate))`` after a FullyConnected into one onnx ``Silu`` op
+  (``u16_retarget.fuse_silu``) whose table is ~5x less accurate than the
+  Sigmoid table and the Mul; ``alyrqk<n>`` / ``alyrqkr<n>`` (``fuse=8``:
+  ``alyrqkr``, the whole layer) with ``alanorm<n>`` (the attention's tensors
+  suffixed ``_a``) in place of ``lanorm<n>``.
 
 usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [NAME...]
 (no NAME: every template the model needs that is not built yet; serial builds)
@@ -431,7 +440,8 @@ def graph(name: str, d: Dims):
     variant generators)`` of a fused template ``name``."""
     m = re.fullmatch(
         r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
-        r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk|alanorml?)"
+        r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk|alanorml?"
+        r"|a?lyrqkr?)"
         r"(\d+)(?:x(\d+))?(t?)",
         name,
     )
@@ -474,6 +484,8 @@ def graph(name: str, d: Dims):
             outs = [1, n2]
         ops = list(dict.fromkeys(["FullyConnected", "MatMul", *ops]))
         return ops, body, ins, outs, inits, gens
+    if kind in ("lyrqk", "lyrqkr", "alyrqk", "alyrqkr"):
+        return _lyr_graph(n, d, rot=kind.endswith("r"), attn=kind[0] == "a")
     eps = {"eps": np.array([d.eps], F)}
     heads = {
         "shh": np.array([n // d.hd, d.hd], np.int64),
@@ -663,6 +675,77 @@ def graph(name: str, d: Dims):
 
 #: the norm's tensors renamed in ``nrmqk`` / ``slanormqk`` (clashing with qkf's)
 NORM_QK_RENAME = {"sq": "sqn"}
+#: ``lyrqk``'s first half (``lanorm``): tensor -> name (the rest get ``_1``)
+LYR_RENAME = {"z": "att", "g": "g_1", "a": "a"}
+#: ``alyrqk``'s attention (``ATTN``): its tensors get ``_a``
+LYR_ATTN = ("q", "k", "v", "mask", "qh", "kh", "kt", "s", "sm", "p", "vh", "vt", "o")
+LYR_ATTN += ("shq", "shk", "sho")
+#: ``lyrqk``'s variants: (``lanorm`` variant, ``slanormqk`` variant, scale of
+#: k's RoPE tables; v7 / v8: v4 with the sin tables of q and k calibrated apart)
+LYR_VARIANTS = ((0, 0, 1), (1, 1, 1), (2, 2, 1), (3, 3, 1), (0, 1, 1), (0, 2, 1))
+LYR_VARIANTS += ((0, 3, 1), (0, 1, 0.8), (0, 1, 1.25))
+#: ``alyrqk``'s variants: ``lanorm``'s v1 (the residual Add cancels, so the
+#: norm's tensors tie) mis-assigned k's RoPE jobs on the card (yk 1 / sqrt(2)
+#: off); every variant keeps ``lanorm``'s v0 but the last two
+ALYR_VARIANTS = ((0, 0, 1), (0, 1, 1), (0, 1, 0.8), (0, 1, 1.25), (0, 2, 1))
+ALYR_VARIANTS += ((0, 3, 1), (2, 2, 1), (3, 3, 1))
+
+
+def lyr_name(t: str) -> str:
+    """The name in ``lyrqk`` / ``alyrqk`` of tensor ``t`` of its first half
+    (``lanorm`` / ``alanorm``)."""
+    if t in LYR_RENAME:
+        return LYR_RENAME[t]
+    return f"{t}_a" if t in LYR_ATTN else f"{t}_1"
+
+
+def _lyr_graph(n: int, d: Dims, rot: bool = False, attn: bool = False):
+    """``lyrqk<n>``: ``lanorm<n>`` + gate / up linears + ``slanormqk<I>``
+    (``lyrqkr<n>``: ``slanormqkr<I>``, q / k rotated in the program;
+    ``alyrqk<n>`` / ``alyrqkr<n>``: ``alanorm<n>``, the attention first)."""
+    if n != d.nh * d.hd:
+        raise ValueError(f"lyrqk{n}: the model's q width is {d.nh * d.hd}")
+    ops1, b1, ins1, _, in1, g1s = graph(f"{'a' if attn else ''}lanorm{n}", d)
+    ops2, b2, ins2, outs2, in2, g2s = graph(f"slanormqk{'r' if rot else ''}{d.I}", d)
+    b1 = re.sub(r"\b[A-Za-z_]\w*\b", lambda t: _lyr_word(t.group(0)), b1)
+    b2 = b2.replace("  x = Add(a, b)\n", "  x = Add(x_1, b)\n")
+    # Mul(sg, gate), not Mul(gate, sg): Pulsar2 then keeps the Sigmoid table and
+    # the Mul (a fused Silu's table interpolates x * sigmoid(x) ~5x coarser)
+    b2 = b2.replace("  sl = Mul(gate, sg)\n", "  sl = Mul(sg, gate)\n")
+    body = b1 + "  gate = MatMul(y_1, wg)\n  up = MatMul(y_1, wu)\n" + b2
+    ins = {lyr_name(k): v for k, v in ins1.items()} | {"g": [1, d.H]}
+    ins |= {t: ins2[t] for t in ("cq", "sq", "ck", "sk")}
+    inits = {lyr_name(k): v for k, v in in1.items()}
+    inits |= {"wg": template_weight(d.H, d.I, 11), "wu": template_weight(d.H, d.I, 12)}
+    inits |= in2
+    gens = []
+    # variant i: the halves' variants i; then lanorm's v0 (the residual Add at
+    # shift 15, as every real o_proj target) with slanormqk's v1..v3 (q / k
+    # RoPE Adds at lower shifts)
+    for i, j, ks in ALYR_VARIANTS if attn else LYR_VARIANTS:
+        ga, (gb, ws) = g1s[i], g2s[j]
+
+        def gen(r, ga=ga, gb=gb, ks=ks):
+            fa, fb = ga(r), gb(r)
+            out = {lyr_name(k): v for k, v in fa.items()} | {"g": fb["g"]}
+            out |= {t: fb[t] for t in ("cq", "sq")}
+            return out | {t: (fb[t] * F(ks)).astype(F) for t in ("ck", "sk")}
+
+        gens.append((gen, ws))
+    ops = [*ops1, "FullyConnected", "MatMul", "Sigmoid", "Mul", "Silu", *ops2]
+    if not attn:  # the order the lyrqk templates were built with
+        ops = ["FullyConnected", "MatMul", "Sigmoid", "Mul", "Silu", *ops2]
+    ops = list(dict.fromkeys(ops))
+    return ops, body, ins, outs2, inits, gens
+
+
+def _lyr_word(w: str) -> str:
+    """A word of the first half's body: a tensor gets ``lyr_name``, an op type,
+    an attribute name or a keyword stays."""
+    tensors = set(LYR_ATTN) | set(LYR_RENAME)
+    tensors |= {"b", "x", "sq0", "m0", "e0", "r0", "u", "sq", "m", "e", "r", "d", "y"}
+    tensors |= {"eps", "eps0", "w"}
+    return lyr_name(w) if w in tensors else w
 
 
 def qops_of(d: Dims) -> list[str]:
@@ -729,6 +812,8 @@ def needed(cfg) -> list[str]:
             names += [f"slanormqk{r}{inter}"]
         if cfg.fuse >= 7:
             names += [f"alanorml{qd}x{2 * inter}" if cfg.qk_norm else f"alanorm{qd}"]
+        if cfg.fuse >= 8 and cfg.qk_norm:
+            names += [f"alyrqk{r}{qd}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]

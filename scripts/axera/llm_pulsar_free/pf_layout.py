@@ -95,6 +95,11 @@ LAYER_FUSED5 = ["attn", "on2g", "dnqk"]
 #: split first-set layer keeps ``attn`` and ``on2``.
 LAYER_FUSED7 = ["aon2g", "dnqk"]
 LAYER_FUSED7_NO_QK_NORM = ["qkv5", "rq", "rk", "aon2", "gu", "dn"]
+#: ``fuse=8`` (Qwen3): the whole layer in one program, ``aon2g`` and ``dnqk``
+#: with the SiLU between them (``alyr``: the attention, ``o_proj`` + ``res1`` +
+#: the second norm, gate / up, SiLU, ``down_proj`` + ``res2`` + the next layer's
+#: norm, q / k / v and RoPE). The last layer keeps ``aon2g`` + ``dn``.
+LAYER_FUSED8 = ["alyr"]
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
@@ -103,6 +108,8 @@ def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
     if fuse >= 2:
         if not qk_norm and fuse >= 4:
             raise NotImplementedError(f"fuse={fuse} without a per-head q / k norm")
+        if fuse >= 7:
+            return list(LAYER_FUSED7)
         if fuse >= 5:
             return list(LAYER_FUSED5)
         if fuse >= 4:

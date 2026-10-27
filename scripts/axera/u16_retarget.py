@@ -88,9 +88,23 @@ import short_unit_codec as suc  # noqa: E402
 import width_retarget as wr  # noqa: E402
 
 F = np.float32
-OPS = ("Mul", "Add", "Div", "ReduceMean", "Sqrt", "Sigmoid", "Softmax", "MatMul")
+OPS = (
+    "Mul",
+    "Add",
+    "Div",
+    "ReduceMean",
+    "Sqrt",
+    "Sigmoid",
+    "Softmax",
+    "MatMul",
+    "Silu",
+)
 SIGMOID_TABLE = 0x1050  # 128 registers, two u16 entries each
 SIGMOID_TAIL = 0x1850
+#: the table's 16 segments: input codes per entry as ``65536 / step`` (``0x100``:
+#: 256) and each segment's first code ``<< 16``; Pulsar2 sometimes spaces them
+#: unevenly (a Silu over a wide range), the formulas assume the even layout
+TABLE_STEP, TABLE_START = 0x1860, 0x1960
 ADD_SHIFT = 0x1EA0
 
 
@@ -287,10 +301,15 @@ def candidates(
         c["mm_scale"] = _fbits(m)
         c["mm_scale256"] = _fbits(F(m * F(256)))
         c["mm_zp_f"] = _fbits(F(z[out]))
-    elif op == "Sigmoid":
+    elif op in ("Sigmoid", "Silu"):
         (x,) = inputs
-        xf = ((np.arange(257) * 256 - z[x]).astype(F) * F(s[x])).astype(F)
+        codes = np.arange(257) * 256
+        if op == "Silu":  # the last entry is the last code's (65535), not 65536's
+            codes[256] = 65535
+        xf = ((codes - z[x]).astype(F) * F(s[x])).astype(F)
         sg = (F(1) / (F(1) + np.exp(-xf).astype(F))).astype(F)
+        if op == "Silu":  # Pulsar2's fused x * sigmoid(x): the same table layout
+            sg = (xf * sg).astype(F)
         t = np.clip(np.rint((sg / F(s[out])).astype(F)) + z[out], 0, 65535).astype(int)
         for k in range(128):
             c[f"sig_t{k}@{SIGMOID_TABLE + 16 * k:#06x}"] = int(t[2 * k]) | (
@@ -467,7 +486,35 @@ def retarget(
 
 
 # ---- fused (multi-op) programs ---------------------------------------------------------
-UNARY = ("Sqrt", "Sigmoid", "Softmax", "ReduceMean")
+UNARY = ("Sqrt", "Sigmoid", "Softmax", "ReduceMean", "Silu")
+#: a node folded into another one's job (``fuse_silu``): no job, no formulas
+FOLDED = "Folded"
+
+
+def fuse_silu(nodes, q) -> list:
+    """``nodes`` (``graph_nodes``) with each ``sg = Sigmoid(x)``,
+    ``y = Mul(x, sg)`` pair whose ``sg`` has no calibration in ``q`` as one
+    ``Silu`` node. Pulsar2 fuses the pair into one onnx ``Silu`` op when ``x``
+    is a FullyConnected's output (a SiLU after the gate linear), and quantizes
+    ``x`` at U16 only with ``Silu`` in the build's U16 ``op_types`` (else U8).
+    Its job is a U16 Sigmoid-layout table of ``x * sigmoid(x)``. The Mul
+    becomes a ``FOLDED`` node (no job, no formulas)."""
+    out = list(nodes)
+    for i, (op, ins, sg, _) in enumerate(nodes):
+        if op != "Sigmoid" or sg in q:
+            continue
+        x = ins[0]
+        js = [
+            j
+            for j, n in enumerate(nodes)
+            if n[0] == "Mul" and sorted(n[1]) == sorted((x, sg))
+        ]
+        users = [n for n in nodes if sg in n[1]]
+        if len(js) == 1 and len(users) == 1:
+            j = js[0]
+            out[i] = ("Silu", (x,), nodes[j][2], {})
+            out[j] = (FOLDED, (), nodes[j][2], {})
+    return out
 
 
 def graph_nodes(model) -> list[tuple[str, tuple, str, dict]]:
@@ -505,6 +552,8 @@ def _graph_candidates(nodes, q) -> dict[str, int]:
     c = {}
     for i, (op, ins, out, attrs) in enumerate(nodes):
         sub = {t: q[t] for t in {*ins, out, *attrs.get("outputs", ())} if t in q}
+        if op == FOLDED:
+            continue
         if op in MOVES or op == "FullyConnected":
             got = _tensor_candidates(sub)
         else:
@@ -528,7 +577,7 @@ MIN_CALIB_REG = 0x0F00
 MAX_MERGED = 4
 
 
-def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
+def _assign_core_jobs(main, comp, ct, nodes=None, first=0) -> dict[int, str]:
     """CORE job j -> node ``n<i>``, one job per compute node. Pulsar2 orders
     the jobs topologically, not in ONNX node order (a fused q / k norm + RoPE
     runs ``x * x`` first). The assignment is the topological order of the
@@ -539,6 +588,7 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
     normalized values, ``d = u / r``: ``u`` and ``d`` alike, ``m``, ``e``
     and ``r`` alike): a score alone then puts a Div before its Sqrt."""
     cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
+    cores = cores[first:]
     by_node: dict[str, set[int]] = {}
     for k, v in ct.items():
         node, base = k.split("|", 1)
@@ -561,14 +611,19 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
     # tensor -> the compute node that produces it (through data-movement nodes)
     prod: dict[str, int | None] = {}
     for i, (op, ins, out, attrs) in enumerate(nodes or []):
+        if op == FOLDED:
+            continue
         if op in MOVES:  # a Concat's halves come from one node in practice
             src = next((prod[t] for t in ins if prod.get(t) is not None), None)
             for o in attrs.get("outputs", [out]):
                 prod[o] = src
         else:  # a FullyConnected runs outside the main engine's CORE jobs
             prod[out] = None if op == "FullyConnected" else i
+    in_comp = set(comp)  # (with ``first``, the earlier jobs' nodes are not in it)
     deps = {
-        i: {prod[t] for t in nodes[i][1] if prod.get(t) is not None} if nodes else set()
+        i: {prod[t] for t in nodes[i][1] if prod.get(t) is not None} & in_comp
+        if nodes
+        else set()
         for i in comp
     }
 
@@ -627,7 +682,84 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
     _, path = max(
         full.values(), key=lambda v: (v[0], [-c[0] if c else 1 for c in v[1]])
     )
-    return {j: "+".join(f"n{comp[c]}" for c in cs) for j, cs in enumerate(path)}
+    return {first + j: "+".join(f"n{comp[c]}" for c in cs) for j, cs in enumerate(path)}
+
+
+def _assign_after_attention(main, comp, ct, nodes) -> tuple[dict, set]:
+    """A whole layer with its attention first (``alyrqk``): Pulsar2 runs the
+    attention's jobs (a Softmax in two, data movement around them) before
+    the rest, whose nodes are then assigned strictly (``_assign_core_jobs``)
+    from the latest CORE job that fits; the attention's nodes may sit in any
+    job before it. ``({}, set())`` when no such split fits."""
+    fc = [i for i, n in enumerate(nodes) if n[0] == "FullyConnected"]
+    if not fc or not any(n[0] == "Softmax" for n in nodes):
+        return {}, set()
+    up, todo = set(), [nodes[fc[0]][1][0]]  # the nodes before the first linear
+    while todo:
+        t = todo.pop()
+        for i, (op, ins, out, attrs) in enumerate(nodes):
+            if (out == t or t in attrs.get("outputs", ())) and i not in up:
+                up.add(i)
+                todo += list(ins)
+    head = {f"n{i}" for i in comp if i in up}
+    rest = [i for i in comp if i not in up]
+    # the rest starts at the first CORE job holding a record that only one of
+    # its first nodes (no producer among the rest: the residual Add) explains
+    prod = {}
+    for i, (op, ins, out, attrs) in enumerate(nodes):
+        for o in attrs.get("outputs", [out]):
+            prod[o] = i
+    starts = {
+        f"n{i}"
+        for i in rest
+        if not any(prod.get(t) in rest for t in nodes[i][1] if t in prod)
+    }
+    owners: dict[int, set] = {}
+    for k, v in ct.items():
+        owners.setdefault(v, set()).add(k.split("|", 1)[0])
+    own = {v for v, o in owners.items() if len(o) == 1 and o <= starts}
+    cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
+    for first, (a, b) in enumerate(cores):
+        hit = any(
+            main[r][0] == gs.A1
+            and gs._reg(main[r]) >= MIN_CALIB_REG
+            and gs._val(main[r]) in own
+            for r in range(a, b)
+        )
+        if hit:
+            try:
+                return _assign_core_jobs(main, rest, ct, nodes, first=first), head
+            except ValueError:
+                return {}, set()
+    return {}, set()
+
+
+def _check_even_tables(main) -> None:
+    """Refuse a template whose Sigmoid / Silu table is not spaced evenly (one
+    entry per 256 input codes): its entries sit at other codes than the
+    formulas'. Pulsar2 picks uneven segments for some calibrations (seen on a
+    Silu over [-14, 16]); a retarget always writes the even table. A
+    Sigmoid / Silu job's steps stay near ``0x100`` (seen 0xe2..0x10c); a job with
+    other steps is another table op's (a Softmax in the same program)."""
+    for _, a, b, _ in le._jobs(main):
+        regs = {
+            gs._reg(main[r]): gs._val(main[r])
+            for r in range(a, b)
+            if main[r][0] == gs.A1
+        }
+        if SIGMOID_TABLE not in regs:
+            continue
+        steps = [regs.get(TABLE_STEP + 16 * k, 0x100) for k in range(16)]
+        if not all(0x80 <= v <= 0x200 for v in steps):
+            continue  # another table op's job (a Softmax's exp: steps of 1 and more)
+        for k in range(16):
+            step = regs.get(TABLE_STEP + 16 * k, 0x100)
+            start = regs.get(TABLE_START + 16 * k, k << 28)
+            if (step, start) != (0x100, k << 28):
+                raise ValueError(
+                    f"the template's table is not spaced evenly (segment {k}: "
+                    f"step {step:#x}, start {start:#x}); use another template"
+                )
 
 
 def _check_add_shift_writes(main, nodes, assign, cn) -> None:
@@ -673,6 +805,7 @@ def retarget_graph(
     target_q: Mapping[str, tuple[float, int]],
     out: str | None = None,
     weights=None,
+    attention_first: bool = False,
 ) -> onnx.ModelProto:
     """``retarget`` for a fused program (several ops in one native build).
     ``model`` is its float graph; the calibrations cover every tensor, inner
@@ -690,7 +823,9 @@ def retarget_graph(
     output's ``s`` and zero point (any graph output unless ``out`` names one); PARAM jobs and the other segments any
     node's. Records below ``MIN_CALIB_REG`` are never rewritten.
     Data-movement nodes (``MOVES``) contribute per-tensor formulas
-    only."""
+    only. ``attention_first``: a whole layer with its attention first
+    (``alyrqk``, too many jobs for the strict rule):
+    ``_assign_after_attention``."""
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     nodes = graph_nodes(m)
     consts = {i.name for i in m.graph.initializer}
@@ -706,10 +841,15 @@ def retarget_graph(
     graph_ins = [i.name for i in m.graph.input if i.name not in consts]
     outs = {out} if out else {o.name for o in m.graph.output}
     template_q, target_q = propagate(m, template_q), propagate(m, target_q)
+    nodes = fuse_silu(nodes, template_q)
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
     main = _segs(gs.load_model(template))[gs.MAIN]
+    if any(n[0] in ("Sigmoid", "Silu") for n in nodes):
+        _check_even_tables(main)
     comp = [
-        i for i, n in enumerate(nodes) if n[0] not in MOVES and n[0] != "FullyConnected"
+        i
+        for i, n in enumerate(nodes)
+        if n[0] not in MOVES and n[0] not in ("FullyConnected", FOLDED)
     ]
     # a CORE job per compute node, a few pairs of nodes run as one job, or a few
     # extra jobs without calibration records
@@ -722,6 +862,10 @@ def retarget_graph(
             assign = _assign_core_jobs_memo(main, comp, ct, nodes)
         except ValueError:  # e.g. a Softmax in two jobs: any node in any CORE job
             strict = False
+    head: set = set()  # the attention's nodes when only the rest is assigned
+    if attention_first and not strict:
+        assign, head = _assign_after_attention(main, comp, ct, nodes)
+        strict = bool(assign)
     if strict:
         _check_add_shift_writes(main, nodes, assign, cn)
 
@@ -732,7 +876,7 @@ def retarget_graph(
         if "@" in base and int(base.split("@")[1], 16) != reg:
             return False
         if tag == "QUANT":
-            if strict:
+            if strict and not head:
                 return base in {f"inv:{t}" for t in graph_ins} | {
                     f"zp:{t}" for t in graph_ins
                 }
@@ -740,7 +884,10 @@ def retarget_graph(
         if tag == "DEQUANT":
             return base in {f"{p}:{o}" for o in outs for p in ("s", "zp")}
         if tag.startswith("CORE") and strict:
-            return node in assign[int(tag[4:])].split("+")  # "": none
+            j = int(tag[4:])
+            if head and j not in assign:  # a job before the assigned ones
+                return node in head
+            return node in assign[j].split("+")  # "": none
         return True
 
     if not fc:
