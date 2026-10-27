@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `faecbf574` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `73f3ef25e` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1318,3 +1318,44 @@ table-to-address chain was 43 of 89 cycles per point. Changes:
 
 All pass against onnxruntime. The kernel's own hexagon-sim checks pass for all eight case kinds (fp32 / uint8, multi-level).
 Details and the dropped variants are in `scripts/android/msda_hvx/README.md`.
+
+**Closing tinygrad's modeling gaps.** The hand kernels had relied on seven things the fork's tinygrad couldn't express. Each
+was worked on in parallel on its own branch, then merged (fork commit `73f3ef25e`):
+- **A staging buffer inside one kernel** (`Tensor.stage`). Two loop nests share a register table: vector code builds per-query
+  tap rows and weights, and a scalar-indexed loop reads them back. This is the hand MSDA's structure. With it, the generated
+  MSDA beats the hand kernel on the encoder. Cross-attention per layer: generated 16.5 -> 2.4 ms, hand 3.3 ms. Temporal
+  attention: 11.3 -> 2.0 ms, hand 2.3 ms. MSDA now picks by query count: generated from 2048 queries (`MSDA_GEN_MIN_Q`), so
+  the encoder's 2500 use it, and hand below that. The decoder's 900 stay hand: generated, the decoder was 25.3 vs 23.5 ms.
+- **Multi-output kernels** (`MULTIOUT`). An elementwise consumer merges into its producer as an extra store. A LayerNorm or
+  bias add now writes the fp16, row-padded HMX operand itself. That drops the separate cast and pad kernels: 1.3 ms in the
+  decoder, about 3 ms in the 3-layer encoder.
+- **Layout and residency as buffer attributes.** The HMX raw-tile layout is now `ParamArg.layout`; before, it was marked by
+  an odd buffer size. Model code can request VTCM residency. The VTCM placer gets a refill pass that places regions it had
+  passed over, and MSDA reads its inputs in place instead of copying them.
+- **qf32 rules.** A qf32 subtract of nearly equal sf operands is not exact, so add-a-big-constant rounding tricks are unsafe in
+  vectors. Vector int <-> float conversion, by contrast, is already exact integer code. On top of these rules:
+  - a conversion-free LOG2;
+  - an inline half -> float;
+  - vectorization of strided transcendental kernels.
+
+  The decoder's reference-point updates went from 1.15 to 0.27 ms.
+- **A prefetch cost model.** Strided DDR streams get one l2fetch box per chunk of loop iterations, from a strip-mined loop.
+  Contiguous vector streams keep their dcfetches, because boxes were slower for them. LayerNorm statistics went from 150 to
+  49 us. The attention transposes went from 251 to 70 us: their cost was mostly a vector reciprocal per lane, now one
+  reciprocal of the row.
+- **fp16 weights.** GEMM weights are stored in fp16 instead of being cast on every run, and tiny-row pads use the hand row
+  copy.
+  - Overlapping HMX and HVX work is implemented, but behind `DSP_GRAPH_HMX_OVERLAP`, off by default. It is correct but saves
+    nothing: moved calls held VTCM longer, and an in-kernel helper-thread queue cost more in fences than it parallelized.
+- **Data-dependent work lists.** Measured, then dropped: the camera gate costs at most about 1.3 ms per layer, and a per-query
+  work list gained nothing on real data. The generated MSDA's real cost was per-tap weights computed as qf32 vector chains
+  over splats. `HVX_SPLAT_SCALAR` (off by default) keeps them scalar: 16.5 -> 8.7 ms per layer for the old generated
+  cross-attention path.
+
+| model | before | now |
+|---|---:|---:|
+| decoder | 27.7 ms | 23.5 ms |
+| encoder, 1 layer | 13.5 ms | 9.7 ms |
+| encoder, 3 layers | 40.0 ms | 29.6 ms |
+
+All pass against onnxruntime.
