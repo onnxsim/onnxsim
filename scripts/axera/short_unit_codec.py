@@ -203,12 +203,25 @@ def segment_streams(mc: bytes) -> list[tuple[int, int, dict, bool]]:
     return res
 
 
+#: ``decode_segments`` results by blob (a template's blob is decoded several times
+#: per retarget, and once per layer); a bounded memo of immutable results
+_DECODED: dict[bytes, tuple[bytes, ...]] = {}
+_DECODED_MAX = 64
+
+
 def decode_segments(mc: bytes) -> list[bytes]:
     """Decompressed bytes of every segment, compressed or not."""
-    return [
-        decode(mc[s : s + size]) if comp else mc[s : s + size]
-        for s, size, _, comp in segment_streams(mc)
-    ]
+    mc = bytes(mc)
+    got = _DECODED.get(mc)
+    if got is None:
+        got = tuple(
+            decode(mc[s : s + size]) if comp else mc[s : s + size]
+            for s, size, _, comp in segment_streams(mc)
+        )
+        if len(_DECODED) >= _DECODED_MAX:
+            _DECODED.pop(next(iter(_DECODED)))
+        _DECODED[mc] = got
+    return list(got)
 
 
 def records(data: bytes) -> list[dict]:

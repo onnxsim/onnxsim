@@ -47,7 +47,9 @@ Writes ``<out>/<set>/L<l>/<program>.axmodel``, ``<out>/cal/<set>/...`` (the
 programs' float graphs and calibration samples) and
 ``<out>/manifest_<set>.json``.
 
-usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer]   (SET: first | rest)
+usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer] [--jobs N]
+       (SET: first | rest; the layers run in N worker processes, the files
+       are the same for any N)
 """
 
 from __future__ import annotations
@@ -92,6 +94,48 @@ def signed_inputs(model) -> set:
     }
 
 
+def write_npy_tar(path, arrs):
+    """The tar ``pulsar2_docker.make_numpy_calibration_tar`` writes (one
+    ``<i>.npy`` per sample, the same headers but the time stamp), without the
+    temporary ``.npy`` files."""
+    import io
+    import tarfile
+
+    mode = 0o666 & ~_umask()
+    now = time.time()
+    with tarfile.open(path, "w") as tf:
+        for i, a in enumerate(arrs):
+            b = io.BytesIO()
+            np.save(b, a)
+            ti = tarfile.TarInfo(f"{i}.npy")
+            ti.size, ti.mode, ti.mtime = b.tell(), mode, now
+            ti.uid, ti.gid = os.getuid(), os.getgid()
+            ti.uname, ti.gname = _owner()
+            b.seek(0)
+            tf.addfile(ti, b)
+
+
+def _umask():
+    m = os.umask(0)
+    os.umask(m)
+    return m
+
+
+def _owner():
+    import grp
+    import pwd
+
+    try:
+        u = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        u = ""
+    try:
+        g = grp.getgrgid(os.getgid()).gr_name
+    except KeyError:
+        g = ""
+    return u, g
+
+
 def rng2(*arrs):
     """U16 MinMax of the arrays' range x2 (folded with 0)."""
     lo = min(float(np.min(a)) for a in arrs)
@@ -114,13 +158,13 @@ class Generator:
 
     @staticmethod
     def _tar(d, name, samples):
-        import pulsar2_docker as P
-
+        """``dataset/<name>.tar`` of the samples (as
+        ``pulsar2_docker.make_numpy_calibration_tar`` writes it, built in
+        memory); returns the float32 samples for the calibration."""
         os.makedirs(os.path.join(d, "dataset"), exist_ok=True)
-        P.make_numpy_calibration_tar(
-            os.path.join(d, "dataset", f"{name}.tar"),
-            [np.asarray(a, F32) for a in samples],
-        )
+        arrs = [np.asarray(a, F32) for a in samples]
+        write_npy_tar(os.path.join(d, "dataset", f"{name}.tar"), arrs)
+        return arrs
 
     # ---- one program ------------------------------------------------------------------
     def fused(self, d, dst, name, data):
@@ -129,10 +173,9 @@ class Generator:
         shutil.copy(
             os.path.join(tdir0, "v0", "model.onnx"), os.path.join(d, "model.onnx")
         )
-        for n, v in data.items():
-            self._tar(d, n, v)
+        arrs = {n: self._tar(d, n, v) for n, v in data.items()}
         model = os.path.join(d, "model.onnx")
-        q = ur.propagate(model, ur.calibrate_graph(d))
+        q = ur.propagate(model, ur.calibrate_graph(d, samples=arrs))
         return self._retarget_fused(dst, name, model, q)
 
     def _retarget_fused(self, dst, name, model, q, weights=None):
@@ -180,9 +223,11 @@ class Generator:
         n = n or self.cfg.H
         os.makedirs(d, exist_ok=True)
         onnx.save(tpl.add_model(n), os.path.join(d, "model.onnx"))
-        self._tar(d, "a", list(a) + list(a * F32(2)))
-        self._tar(d, "b", list(b) + list(b * F32(2)))
-        q = ur.calibrate(d, "Add")
+        arrs = {
+            "a": self._tar(d, "a", list(a) + list(a * F32(2))),
+            "b": self._tar(d, "b", list(b) + list(b * F32(2))),
+        }
+        q = ur.calibrate(d, "Add", samples=arrs)
         refused = []
         for i in range(4):
             tdir = os.path.join(tpl.template_dir(self.root, f"add{n}"), f"v{i}")
@@ -374,7 +419,7 @@ class Generator:
             u = self._union(*({t: rg[t]} for t in g))
             lo = min(r[0] for r in u.values())
             hi = max(r[1] for r in u.values())
-            for t in g:
+            for t in sorted(g):  # sorted: the refusal names one tensor every run
                 span = max(rg[t][1], 0) - min(rg[t][0], 0)
                 if (max(hi, 0) - min(lo, 0)) > self.TIE_MAX * max(span, 1e-30):
                     raise ValueError(
@@ -1293,11 +1338,71 @@ class Generator:
         man["post"] = ml
 
 
+#: host memory one worker of ``--jobs`` may take (Qwen3-0.6B layout 5: a layer's
+#: recorded activations, calibration samples and weight tables)
+JOB_BYTES = 3 << 30
+#: the generator the worker processes inherit (``fork``)
+_GEN = None
+
+
+def _mem_free() -> int:
+    """Bytes this process may still allocate: MemAvailable, and at most its
+    cgroup's ``memory.max`` headroom (``systemd-run -p MemoryMax=...``)."""
+    free = 0
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            free = int(line.split()[1]) * 1024
+    try:
+        cg = open("/proc/self/cgroup").read().split("::", 1)[1].strip()
+        base = os.path.join("/sys/fs/cgroup", cg.lstrip("/"))
+        mx = open(os.path.join(base, "memory.max")).read().strip()
+        if mx != "max":
+            cur = int(open(os.path.join(base, "memory.current")).read())
+            free = min(free, int(mx) - cur)
+    except (OSError, IndexError, ValueError):
+        pass
+    return max(free, 0)
+
+
+def default_jobs() -> int:
+    """Worker processes: ``LLM_PF_JOBS``, else bounded by the cores (4 threads
+    each, at most 8 workers) and by ``JOB_BYTES`` of free memory per worker."""
+    if os.environ.get("LLM_PF_JOBS"):
+        return max(1, int(os.environ["LLM_PF_JOBS"]))
+    cores = len(os.sched_getaffinity(0))
+    return max(1, min(8, cores // 4, _mem_free() // JOB_BYTES))
+
+
+def _run_one(job):
+    """One layer (``li``) or the post programs (``li`` None) of set ``st``;
+    returns its manifest entry."""
+    st, li = job
+    gen, cfg = _GEN, _GEN.cfg
+    man: dict = {}
+    if li is None:
+        post = [gen.post, gen.post_fused, gen.post_fused2, gen.post_fused2]
+        (post[cfg.fuse] if cfg.fuse < 4 else gen.post_fused2)(st, man)  # noqa
+        return man["post"]
+    layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
+    layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
+    layer += [gen.layer_fused5 if cfg.qk_norm else gen.layer_fused2]
+    layer[cfg.fuse](st, li, man)
+    return man[f"L{li}"]
+
+
 def main():
+    global _GEN
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("set", choices=("first", "rest"))
     ap.add_argument("layers", nargs="*", type=int, help="first_layer last_layer")
     ap.add_argument("--templates", default=None, help="template root (pf_templates.py)")
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="worker processes, one layer at a time each (default: LLM_PF_JOBS, "
+        "else by cores and free memory); every count writes the same files",
+    )
     a = ap.parse_args()
     cfg = pf_model.load()
     gen = Generator(cfg, a.templates or tpl.default_root(cfg))
@@ -1306,11 +1411,25 @@ def main():
     mpath = os.path.join(cfg.out, f"manifest_{st}.json")
     man = json.load(open(mpath)) if os.path.exists(mpath) else {}
     t0 = time.time()
-    for li in range(lo_l, hi_l + 1):
-        layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
-        layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
-        layer += [gen.layer_fused5 if cfg.qk_norm else gen.layer_fused2]
-        layer[cfg.fuse](st, li, man)
+    layers = [(st, li) for li in range(lo_l, hi_l + 1)]
+    post = [(st, None)] if hi_l == cfg.L - 1 else []
+    n_jobs = min(a.jobs or default_jobs(), len(layers) + len(post))
+    _GEN = gen
+    if n_jobs > 1:
+        import multiprocessing as mp
+
+        # the workers inherit the loaded checkpoint (fork); each writes its own
+        # layer's files and returns the layer's manifest entry, which is merged
+        # here in layer order. The post programs (lm_head) start first.
+        pool = mp.get_context("fork").Pool(n_jobs)
+        post_res = [pool.apply_async(_run_one, (j,)) for j in post]
+        results = pool.imap(_run_one, layers)
+        print(f"{st}: {n_jobs} workers", flush=True)
+    else:
+        pool, post_res = None, []
+        results = map(_run_one, layers)
+    for (_, li), entry in zip(layers, results):
+        man[f"L{li}"] = entry
         json.dump(man, open(mpath, "w"), indent=1)
         ml = man[f"L{li}"]
         tnames = sorted(
@@ -1329,11 +1448,13 @@ def main():
             f"{time.time() - t0:.0f}s",
             flush=True,
         )
-    if hi_l == cfg.L - 1:
-        post = [gen.post, gen.post_fused, gen.post_fused2, gen.post_fused2]
-        (post[cfg.fuse] if cfg.fuse < 4 else gen.post_fused2)(st, man)  # noqa
+    if post:
+        man["post"] = post_res[0].get() if post_res else _run_one(post[0])
         json.dump(man, open(mpath, "w"), indent=1)
         print(f"{st} post done, {time.time() - t0:.0f}s", flush=True)
+    if pool is not None:
+        pool.close()
+        pool.join()
 
 
 if __name__ == "__main__":

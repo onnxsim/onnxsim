@@ -24,7 +24,8 @@ export MODEL=qwen3_0.6b LLM_PF_OUT=/data/pf/qwen3_0.6b   # LLM_PF_TEMPLATES: def
 python pf_templates.py            # native U16 template builds (Pulsar2, Docker), 4 variants per shape
 python pf_record.py               # float decode over the calibration passages -> <out>/acts
 python pf_gptq.py --device cuda   # optional: GPTQ weights on the card's s8 grid -> <out>/gptq
-GPTQ=1 python pf_generate.py rest # every program of the `rest` set (rest before first)
+GPTQ=1 python pf_generate.py rest # every program of the `rest` set (rest before first); layers in
+                                  # parallel, --jobs / LLM_PF_JOBS (default: by cores and memory)
 GPTQ=1 python pf_generate.py first
 GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
@@ -572,6 +573,122 @@ nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 agai
   by a rounding step. Its host estimate is 44/48 and 45/48, 2.30% and 2.31%, against
   44/48 and 43/48, 2.38% and 2.42% for the scratch weights. On the card its programs
   give 43/48 and 44/48, 3.29% and 2.89% (the `pf_gptq.py` row of the results table).
+
+## Build time
+
+How long a checkpoint takes to become card programs (not decode speed), on the same
+32-core host, one heavy job at a time (2026-10-27). Wall time, CPU time and peak memory
+are systemd's for the job (Docker's container cgroup for `llm_build`).
+
+| stage | Qwen3-0.6B, layout 5 (GPTQ) | llama-160m, layout 3 |
+| --- | --- | --- |
+| Pulsar2 `llm_build` (s8, bf16, `--prefill_len 128 --kv_cache_len 255 --parallel 8`) | 7.7 min, CPU 19.4 min, 6.8 GB; 29 files, 666 MB | 119 s, CPU 344 s, 5.2 GB; 13 files, 158 MB |
+| `pf_templates.py` (one-off per shape, cached) | 22.1 min for the 15 shapes layout 5 uses (`k1024n151936` alone 4.8 min); 28.1 min for all 66 builds | 12.4 min, 37 builds |
+| `pf_record.py` | 84 s, CPU 255 s, 16.7 GB | 20 s, CPU 69 s, 4.6 GB |
+| `pf_gptq.py --device cuda` | 106 s, CPU 214 s, 13.9 GB | (not used) |
+| `pf_generate.py rest`, before | 7.6 min, CPU 7.6 min, 17.7 GB | 57 s, CPU 64 s, 3.8 GB |
+| `pf_generate.py first`, before | 6.8 min, CPU 6.8 min, 11.3 GB | 44 s, CPU 52 s, 3.6 GB |
+| `pf_generate.py rest`, now (7 workers) | 29 s, CPU 200 s, 14.6 GB | 4.1 s, CPU 32 s, 3.3 GB |
+| `pf_generate.py first`, now (7 workers) | 49 s, CPU 142 s, 13.2 GB | 5.6 s, CPU 27 s, 2.9 GB |
+| `pf_generate.py rest` / `first`, now, `--jobs 1` | 97 s / 95 s | 29 s / 25 s |
+| output | 198 programs, 1.34 GB (and 12.3 GB of `cal/`) | 172 programs, 336 MB (3.6 GB of `cal/`) |
+
+The "before" rows of `pf_generate.py` are master's serial code under the phase timer
+below, which adds 10-30% (without it: llama-160m's `rest` 43 s, and the shipped Qwen3
+set's log 6.2 / 5.3 min). Layout 6 (Qwen3, `nrmqkr` / `slanormqkr` templates), without
+the timer: `rest` 6.9 min -> 41 s, `first` 5.4 min -> 44 s.
+
+The templates are built once per program shape, so a new checkpoint of a known shape
+costs `pf_record.py` + `pf_gptq.py` + `pf_generate.py`: 4.5 min for Qwen3-0.6B (before:
+17.5 min), against 7.7 min for `llm_build`; llama-160m 30 s (before: 2 min), against
+2 min. `llm_build` cannot make these programs: it takes only `fp16` / `bf16` / `fp32` hidden states (no U16 activations), quantizes the
+weights itself (`s8` / `s4` / `fp8`; no externally rounded GPTQ weights), builds one
+program per layer (no merged layouts, no first / rest sets), and runs Pulsar2 for every
+layer of every checkpoint.
+
+**Where `pf_generate.py` spent its time** (Qwen3-0.6B layout 5, `rest`, serial;
+exclusive time per phase; the `first` set is alike):
+
+| phase | before | now (`--jobs 1`) |
+| --- | --- | --- |
+| retargeting: rewriting the records and `npu_params` (a Python scan of every 32-bit word of a 10 MB `npu_params`) | 170 s | 17 s |
+| retargeting: CORE job assignment (a DP per program, the same for every layer) | 87 s | 4 s |
+| weight tables: the U16 table layout (an index per byte), codes, requantization | 92 s | 7.5 s |
+| template load: weights, `quant_axmodel.json`, LZ77 decode of the blob | 28 s | 8 s |
+| recorded activations (`npz` reads) | 15 s | 12 s |
+| calibration math (staged ranges, fake-quant, ReferenceEvaluator) | 20 s | 17.5 s |
+| program encode (LZ77), float graphs, shape inference, file and tar writes, other | 38 s | 28 s |
+| total | 451 s | 94 s |
+
+llama-160m (many small fused programs) also spent 18 s of its 55 s writing the
+calibration tars and reading them back. CPU time about equalled wall time: the code ran
+on one core.
+
+**What changed** (all output byte-identical, below):
+
+- `u16_retarget._rewrite`: the `npu_params` scan finds the candidate words with numpy
+  and re-reads only the word after a rewrite (a rewrite changes the next, overlapping
+  word, which the old scan read rewritten).
+- `u16_retarget`: the CORE job assignment and the template's own weight table are
+  memoized (both depend on the template only); `short_unit_codec.decode_segments` keeps
+  the last 64 decoded blobs.
+- `linear_emit._u16_table`: the table is written through reshapes instead of an index
+  array per byte.
+- `pf_generate.py --jobs N` (`LLM_PF_JOBS`; default: the cores / 4, at most 8, and one
+  worker per 3 GB of free memory, the cgroup's `MemoryMax` included): the layers and the
+  post programs run in forked workers, each writing its own files; the manifest is
+  merged in layer order.
+- The calibration tars are written from memory (no temporary `.npy` files), and
+  `u16_retarget.calibrate` / `calibrate_graph` take the samples directly
+  (`samples=`) instead of reading the tars back.
+- `pf_model.Config.head_t` is computed on first use (a 0.6 GB strided copy that
+  `pf_generate.py` with GPTQ never needs).
+- `Generator._tied`'s refusal message names the first offending tensor in sorted order.
+  It iterated a set before, so the manifests of two runs differed in that one string.
+
+**Checked** on full sets (both sets each) against master's serial `pf_generate.py`:
+llama-160m layout 3 (`--jobs 7` and `--jobs 1`) and layout 7 (`--jobs 7`), Qwen3-0.6B
+layout 5 (`--jobs 7` and `--jobs 1`) and layout 6 (`--jobs 7`); Qwen3 layout 7 on
+layers 4-6. Every `.axmodel`, `model.onnx` and manifest is byte-identical (584 / 440 /
+624 / 624 files), with two exceptions that hold between two serial runs too. The
+calibration tars differ only in their time stamps: names, headers and data are equal,
+and `pulsar2_docker.make_numpy_calibration_tar` stores the temporary file's mtime, so no
+two runs ever wrote equal tars. And a tie refusal's message in the manifest can name
+another tensor of the same tie. Master's serial code reproduces the shipped `n5b` / `l3`
+sets the same way. `tests/test_axera_pf_build_time.py` checks each fast path against
+the code it replaced. No card run was needed.
+
+**What remains, ranked** (estimate, and how to check it):
+
+1. **Template builds in parallel** (`pf_templates.py`): the builds are independent Docker
+   runs of 20-30 s each (the lm_head linear 4.8 min), run one at a time. Four to six
+   at once should bring Qwen3's 22 min to about 5-6 min, bounded by the lm_head build.
+   Pulsar2's container names collide when builds start in the same millisecond, so
+   stagger the starts. Pulsar2 rebuilds are not always byte-equal (MatMul table order),
+   so check every parallel build against the serial one, and with `pf_check.py` on the
+   card where they differ.
+2. **`pf_record.py` on torch** (CUDA): 84 s and 16.7 GB of float decode through
+   `ReferenceEvaluator`; about 15-20 s expected. The activations would then differ in
+   the last bits, and so would the MinMax calibration: `pf_check.py` and the 48-step
+   accuracy on the card, back to back with the current set.
+3. **Longest jobs first and both sets in one run**: the `first` set (49 s) waits on its
+   split layers 0-2 and the lm_head. Starting those first, and a `first` layer as soon as
+   its `rest` layer is written (it reads only that layer's `rest` entry), saves an
+   estimated 20-30 s of the 78 s, and the checkpoint load and the worker warm-up of the
+   second run. Check: byte-identical as above.
+4. **Optional calibration tars**: 7.6 GB of Qwen3's 12.3 GB `cal/` are tars that only
+   the generator itself read. A switch to skip them saves the disk and about 10 s of
+   llama-160m's serial time. Check that `pf_check.py` / `pf_estimate.py` read only
+   `model.onnx`.
+5. **A program cache by content hash** (template bytes, float graph, calibration
+   samples, weights, code version): a rerun after one change would rebuild only what
+   changed. Check by perturbing each input in turn.
+6. **Templates named by their full dims** (eps, heads, head size, context): a checkpoint
+   whose dims match another's could reuse its templates without any Pulsar2 run.
+   Today the names carry the widths only, so a shared root is not safe.
+
+Moving the weight tables and the quantization parameters to CUDA is not on the list:
+after the changes above they take about 7.5 s of a 94 s serial set.
 
 ## Limits
 
