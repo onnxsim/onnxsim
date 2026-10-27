@@ -14,7 +14,11 @@ inputs (qr = RoPE'd q, K / V in the plan layout: the new row in slot p, row S
 zero) for about ``N_ATTN`` sampled steps. Post: the final hidden, xn, logits.
 Writes ``<out>/acts/<set>/L<l>.npz`` and ``post.npz``.
 
-usage: MODEL=llama160m pf_record.py [--n-first 512] [--n-attn 64] [--[no-]nl]
+``--device cuda`` runs the float steps on torch (``pf_float_torch``: the same
+graphs, about 5x faster); the activations then differ from the CPU's
+(``ReferenceEvaluator``) in the last bits.
+
+usage: MODEL=llama160m pf_record.py [--n-first 512] [--n-attn 64] [--[no-]nl] [--device cuda]
 """
 
 from __future__ import annotations
@@ -38,8 +42,9 @@ KEYS = ("a", "qp", "kp", "vp", "att", "op", "x1", "m", "gate", "up", "act", "dow
 
 
 class Recorder:
-    def __init__(self, cfg: pf_model.Config, n_attn: int, seed: int = 11):
+    def __init__(self, cfg: pf_model.Config, n_attn: int, seed: int = 11, fwd=None):
         self.cfg, self.n_attn = cfg, n_attn
+        self.fwd = fwd or cfg  # new_cache / float_step: the CPU's or pf_float_torch's
         sets = ("first", "rest", "nl")
         self.acc = {st: [dict() for _ in range(cfg.L)] for st in sets}
         self.post = {st: {} for st in sets}
@@ -71,7 +76,7 @@ class Recorder:
 
     def steps(self, ids, positions, st, attn_rate):
         cfg = self.cfg
-        Ks, Vs = cfg.new_cache()
+        Ks, Vs = self.fwd.new_cache()
         for p in range(max(positions) + 1):
             rec = p in positions
             self.cur.update(p=p, set=st, attn=rec and self.rng.random() < attn_rate)
@@ -79,7 +84,9 @@ class Recorder:
                 p == 0 and cfg.zero_pos0
             ):  # zero end to end: nothing to compute, caches stay zero
                 continue
-            logits, pn = cfg.float_step(Ks, Vs, ids[p], p, self.record if rec else None)
+            logits, pn = self.fwd.float_step(
+                Ks, Vs, ids[p], p, self.record if rec else None
+            )
             if rec:
                 pp = self.post[st]
                 self._put(pp, "x", pn["input"])
@@ -112,9 +119,15 @@ def main():
         default=None,
         help="also the nl set (default: when the model has nl_tokens)",
     )
+    ap.add_argument("--device", default="cpu", help="cpu (numpy) or a torch device")
     a = ap.parse_args()
     cfg = pf_model.load()
-    rec = Recorder(cfg, a.n_attn)
+    fwd = None
+    if a.device != "cpu":
+        import pf_float_torch
+
+        fwd = pf_float_torch.TorchFloat(cfg, a.device)
+    rec = Recorder(cfg, a.n_attn, fwd=fwd)
     S, fp = cfg.S, cfg.first_pos
     t0 = time.time()
     n_rest = len(lay.CAL_DOCS) * (S - 1 - fp)

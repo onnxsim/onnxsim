@@ -120,7 +120,8 @@ def test_streaming_mse_matches_exact_search():
     # candidates are 1/99 of the search span apart; the histogram version
     # may land on a neighbouring one
     step = (float(np.abs(allx).max()) - np.percentile(np.abs(allx), 50)) / 99
-    assert max(-lo, hi) == pytest.approx(exact, abs=2 * step)
+    # a Python float: pytest 9.2 refuses a numpy float32 tolerance
+    assert max(-lo, hi) == pytest.approx(exact, abs=float(2 * step))
 
 
 @pytest.mark.parametrize("method", ["entropy", "percentile"])
