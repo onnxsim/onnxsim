@@ -14,7 +14,7 @@ records are untouched; the manifests mark the patched programs
 (``"add_offset": "exact"``) for ``pf_check.py`` / ``pf_estimate.py``.
 
 usage: MODEL=... pf_add_offset.py <set dir> <out dir>
-       (<set dir>: a pf_generate output with manifest_{first,rest}.json)
+       (<set dir>: a pf_generate output with manifest_{first,rest[,nl]}.json)
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ for _p in (HERE, AXERA):
 
 import u16_retarget as ur  # noqa: E402
 
+#: the program sets a pf_generate output can hold (nl: llama-160m's newline steps)
+SETS = ("first", "rest", "nl")
 #: an Add program (residual Add, a split linear's Add): its tensor names
 ADD_NODES = [("Add", ("a", "b"), "y", {})]
 
@@ -45,10 +47,12 @@ def patch_set(src: str, out: str) -> dict:
     ``src``). Returns ``{"<set> <where> <program>": number of Adds changed}``."""
     os.makedirs(out, exist_ok=True)
     for f in os.listdir(src):  # cal/, acts/, gptq/: read only; no result files
-        if f not in ("first", "rest") and os.path.isdir(os.path.join(src, f)):
+        if f not in SETS and os.path.isdir(os.path.join(src, f)):
             _link(os.path.join(src, f), os.path.join(out, f))
     done = {}
-    for st in ("first", "rest"):
+    for st in SETS:
+        if not os.path.exists(os.path.join(src, f"manifest_{st}.json")):
+            continue  # nl: llama-160m only
         man = json.load(open(os.path.join(src, f"manifest_{st}.json")))
         for wh, ents in man.items():
             d = os.path.join(out, st, wh)

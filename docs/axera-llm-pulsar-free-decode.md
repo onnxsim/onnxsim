@@ -27,6 +27,7 @@ python pf_gptq.py --device cuda   # optional: GPTQ weights on the card's s8 grid
 GPTQ=1 python pf_generate.py rest # every program of the `rest` set (rest before first); layers in
                                   # parallel, --jobs / LLM_PF_JOBS (default: by cores and memory)
 GPTQ=1 python pf_generate.py first
+python pf_generate.py nl          # llama-160m only: the newline steps' set (below)
 GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
@@ -87,6 +88,7 @@ Two calibration sets cover the position whose activations are massive:
 
 - `first`: position `first_pos`, with up to 512 different tokens.
 - `rest`: every later position.
+- `nl` (llama-160m only): every newline token, see "Newline steps" below.
 
 llama-160m's BOS embedding is all zeros, so position 0 is zero end to end and is skipped.
 Position 1 carries residuals of about 1.7e3-2e3 at layers 3..10, against at most about 300
@@ -539,9 +541,78 @@ host estimate (`pf_estimate.Chain` on the same tokens) gives a 58% logit error a
 newline step, and the card gives the same 58%. The next steps are 30%, 16% and 11% off,
 because the clipped K / V row stays in the cache. The programs compute what their
 calibration says; the calibration does not cover the token. Prompts without a generated
-newline agree for all 48 tokens. The fix would be calibration text that keeps its line
-breaks (or a third program set for newline-like tokens); it is not done here. Qwen3-0.6B
-has no such token: its fibonacci continuation has ten newlines and agrees throughout.
+newline agree for all 48 tokens. Qwen3-0.6B has no such token: its fibonacci
+continuation has ten newlines and agrees throughout. llama-160m's newline steps now run
+on a third program set, below.
+
+### Newline steps (llama-160m's `nl` set)
+
+In llama-160m the first newline of a sequence (and a newline right after it) acts as a
+second attention sink, at any position. The residual reaches 400-560 at layers 3..9
+(1.2e3 for a second newline at position 3), against at most 38-140 there in the
+calibration prose. Layer 3's `down_proj` output reaches 27-31x its recorded maximum. A sweep of all 32000
+tokens at position 20 finds no other common token that does this: the only others are
+byte tokens and `<unk>`. Later newlines are ordinary. Qwen3-0.6B's newlines stay within
+1.1x of its rest set's recorded ranges (the calibration takes 2x). That was checked on the
+raw `README.md`, `docs/qat.md`, `docs/adaquant.md` and `pf_record.py`.
+
+Calibrating the `rest` set on text with line breaks covers the newline, but it costs
+ordinary text a lot. The residual ranges at layers 3..9 widen about 12x. In the host
+estimate, the mean logit error on the two passages goes from 1.56% / 1.42% to 2.23% /
+2.08%, and "The capital of France is" then diverges at its first token. So the newline
+gets its own set. `nl` holds the `rest` set's programs, calibrated on the calibration
+passages both as prose and with their line breaks kept (`pf_layout.lines`;
+`pf_record.py` records `acts/nl`, `pf_generate.py nl` emits it). The plan runs it for
+every `Config.nl_tokens` token (`"\n"`, id 13), and `rest` and `first` stay as they
+were. That adds 86 resident programs (258 against 172, 161 MB more, about 3.5 s more
+setup) but no executes: the per-token time is unchanged (44-46 ms of wall time).
+`pf_check.py --set nl` runs the first eval passage with its line breaks up to its first
+newline. `pf_add_offset.py` patches all three sets. Qwen3 does not need the set and has
+no `nl_tokens`.
+
+On the card, 2026-10-28 (layout 3, run back to back; health 0.0 before and after every
+run). Prose teacher-forced, 47 steps: the newline set never runs there, so the results
+are equal step for step.
+
+| set | adaquant | activation-memory-planning | `pf_check.py` worst (rest / first / nl) |
+| --- | --- | --- | --- |
+| layout 3 | 46/47, 1.32% (1.86%), mean 1.54% | 46/47, 1.24% (1.48%), mean 1.40% | |
+| layout 3 + `nl` | the same | the same | 7.5e-4 / 1.1e-2 / 9.3e-4 |
+| exact Add offsets | 45/47, 1.23% (1.75%), mean 1.43% | 46/47, 1.14% (1.40%), mean 1.28% | |
+| exact Add offsets + `nl` | the same | the same | nl 9.8e-4 |
+
+The same passages with their line breaks (`pf_plan.py --lines`; newlines at positions
+22 / 23 / 28 / 29 and 14 / 15 / 20 / 21 / 44), teacher-forced:
+
+| set | adaquant, lines | activation-memory-planning, lines |
+| --- | --- | --- |
+| layout 3 | 40/47, 7.43% (15.9%), mean 12.3% | 39/47, 7.82% (16.3%), mean 14.0% |
+| layout 3 + `nl` | 47/47, 1.54% (2.53%), mean 1.76% | 45/47, 1.55% (6.15%), mean 2.47% |
+| exact Add offsets | 40/47, 7.35% (16.4%), mean 12.4% | 39/47, 8.20% (16.6%), mean 14.2% |
+| exact Add offsets + `nl` | 47/47, 1.50% (2.22%), mean 1.65% | 46/47, 1.47% (5.42%), mean 2.32% |
+
+Without the set, the newline step is 120-180% off and the next ones 8-30%. With it,
+the newline steps are 2.6-2.8% off. The p90 of activation-memory-planning comes from
+four later steps (8-11%: `.`, `plan`, `ation`, `memory` inside a backticked
+identifier). They stay with an exact `nl` set, and leaving `dn` exact removes them. No
+`dn` tensor is near its range there, so this is `rest`'s own error on that text, not
+clipping.
+
+Free-running, 48 tokens, on the card. The host estimate gives the same agreement on
+every prompt, and exact Add offsets give the same as without them.
+
+| prompt | layout 3 | layout 3 + `nl` |
+| --- | --- | --- |
+| "The capital of France is" | 3 (after " Paris.\n", gap 1.87) | 5 (`is` for `of` after "\nThe city", gap 0.094) |
+| "Once upon a time, there was a little" | 48 | 48 |
+| "def fibonacci(n):" | 4 (after " 1.\n", gap 0.30) | 48 |
+| "Quantization makes a neural network smaller by" | 48 | 48 |
+| "Shopping list:\n1. Milk\n2." | 2 (gap 0.047) | 2 (gap 0.047) |
+| "def add(a, b):\n    return" | 4 (gap 0.084) | 48 |
+| "Q: What is the capital of France?\nA:" | 8 (after "Paris.\n", gap 1.57) | 48 |
+
+Every divergence left is at a float top-1 / top-2 gap below 0.1. Both newline
+divergences with gaps of 1.57 and 1.87 are gone.
 
 ### Where the error comes from
 
@@ -778,8 +849,9 @@ after the changes above they take about 7.5 s of a 94 s serial set.
   passages, and free-running generation was run for four prompts of 48 tokens. The
   context is 128 positions (the cache has 129 rows), and there is no prefill: a prompt
   goes through one token at a time.
-- **llama-160m's newline is not calibrated.** A generated `\n` makes a massive
-  activation past the rest set's ranges (free-running generation, above).
+- **llama-160m's newline set covers one token.** `nl_tokens` is `"\n"` alone, from a
+  sweep of the vocabulary at one position (position 20, layers 0..3). Other positions
+  and contexts were checked only through the calibration passages and the prompts above.
 - **Calibration covers positions 0..127 only.** Beyond that, ranges are unchecked.
 - **Not in the repository.** Templates, recorded activations and program sets stay local
   scratch. Qwen3-0.6B's program set is 827 MB, and its templates are 49 Pulsar2 builds

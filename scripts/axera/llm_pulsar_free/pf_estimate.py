@@ -3,7 +3,7 @@ program evaluated as the card runs it (``pf_fake_quant``: inputs / inner
 tensors / outputs rounded at their U16 calibrations, linears with s8
 weights), K / V caches in the plan layout, position 0 skipped when it is zero
 (``zero_pos0``), position ``first_pos`` on the ``first`` set, later positions
-on ``rest``; compared with the float model, teacher-forced.
+on ``rest`` (newline tokens on ``nl`` where it exists); compared with the float model, teacher-forced.
 
 --float: no rounding anywhere and float weights (a wiring check against
 ``Config.float_step``). Ablations: --exact KEYS leaves those programs exact,
@@ -386,7 +386,7 @@ def run(cfg, ids, chains) -> list[dict]:
         if p == 0 and cfg.zero_pos0:
             continue  # zero end to end (the float caches stay zero there too)
         flg, _ = cfg.float_step(fK, fV, tok, p)
-        c = chains["first" if p == cfg.first_pos else "rest"]
+        c = chains[cfg.set_of(tok, p, chains)]
         x = cfg.model.embed([int(tok)]).reshape(1, cfg.H).astype(F32)
         for li in range(cfg.L):
             x = c.layer(li, x, K[li], V[li], p)
@@ -420,8 +420,7 @@ def main():
     keys = set(filter(None, a.exact.split(",")))
     fw = set(filter(None, a.float_weights.split(",")))
     chains = {
-        st: Chain(cfg, st, a.float, keys, fw, card_add=a.card_add)
-        for st in ("first", "rest")
+        st: Chain(cfg, st, a.float, keys, fw, card_add=a.card_add) for st in cfg.sets()
     }
     rows = run(cfg, ids, chains)
     res = dict(

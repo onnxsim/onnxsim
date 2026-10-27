@@ -33,6 +33,14 @@ end to end (zero K / V rows, zero logits) and is skipped; position 1 carries
 the massive activations (residual ~1.7e3-2e3 at layers 3..10 for common first
 tokens vs <= ~300 later). Qwen3-0.6B: no BOS; position 0 (any first token)
 carries them (residual ~6.4e3-7e3 from layer ~4 on, <= ~400 later).
+
+llama-160m has a third set, ``nl`` (``nl_tokens``): the first newline(s) of a
+sequence make a massive activation too (residual ~450-650 at layers 3..9, up
+to ~1.2e3 for a second newline at position 3, against <= ~90 there in prose),
+at any position. The ``nl`` set is the ``rest`` set's programs calibrated on
+the calibration passages with and without their line breaks; it runs every
+newline step, so the ``rest`` set keeps its prose ranges. Qwen3-0.6B's
+newlines stay within its ``rest`` ranges.
 """
 
 from __future__ import annotations
@@ -66,6 +74,7 @@ MODELS = {
         first_pos=1,
         zero_pos0=True,
         fuse=3,
+        nl_tokens=(13,),  # "\n" (<0x0A>)
     ),
     # Per-head q / k RMSNorm before RoPE (qk_norm). The linears are shared by
     # both calibration sets (one copy of the weights on the card; calibration =
@@ -86,6 +95,8 @@ MODELS = {
 }
 #: share a linear between the sets when the first set's ranges are within this factor
 SHARE_MAX = 2.0
+#: the program sets every model has; ``nl`` is added where ``manifest_nl.json`` exists
+SETS = ("first", "rest")
 
 
 def snapshot(repo: str, revision: str) -> str:
@@ -115,8 +126,11 @@ class Config:
         tokenizer_dir: str | None = None,
         seq: int = lay.S,
         fuse: int = 0,
+        nl_tokens: tuple = (),
     ):
         self.model, self.name, self.out = model, name, out
+        #: tokens that run on the ``nl`` set (``pf_record.py``), when it exists
+        self.nl_tokens = tuple(int(t) for t in nl_tokens)
         self.L, self.H, self.hd = model.L, model.H, model.hd
         self.nh, self.nkv, self.kvd = model.nh, model.nkv, model.kvdim
         self.I = model.layer_weights(0)["gate"].shape[0]  # noqa: E741
@@ -331,6 +345,22 @@ class Config:
             )
         return self.linear_weight(key, li)
 
+    def sets(self, root=None) -> tuple:
+        """The program sets under ``root`` (default ``out``): ``first``, ``rest``
+        and, when ``pf_generate.py nl`` wrote its manifest, ``nl``."""
+        nl = os.path.exists(os.path.join(root or self.out, "manifest_nl.json"))
+        return SETS + (("nl",) if nl and self.nl_tokens else ())
+
+    def set_of(self, token, p, sets=SETS) -> str:
+        """The set that runs ``token`` at position ``p``: ``first`` at
+        ``first_pos``, ``nl`` for an ``nl_tokens`` token (when in ``sets``),
+        else ``rest``."""
+        if p == self.first_pos:
+            return "first"
+        if "nl" in sets and int(token) in self.nl_tokens:
+            return "nl"
+        return "rest"
+
     def is_split(self, st, li, key) -> bool:
         return (
             st == "first"
@@ -355,10 +385,12 @@ class Config:
             )
         return self._tok
 
-    def passage_ids(self, doc, n=None):
-        """The first ``n`` (default ``S``) tokens of a repo doc's running text."""
+    def passage_ids(self, doc, n=None, lines=False):
+        """The first ``n`` (default ``S``) tokens of a repo doc's running text
+        (``lines``: with its line breaks, ``pf_layout.lines``)."""
         n = n or self.S
-        ids = self.tokenizer().encode(lay.prose(os.path.join(REPO, doc))).ids
+        text = (lay.lines if lines else lay.prose)(os.path.join(REPO, doc))
+        ids = self.tokenizer().encode(text).ids
         if len(ids) < n:
             raise ValueError(f"{doc}: {len(ids)} tokens < {n}")
         return ids[:n]

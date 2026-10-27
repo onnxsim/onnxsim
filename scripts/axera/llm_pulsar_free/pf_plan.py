@@ -3,7 +3,8 @@ mode (``axcl_batch_runner``'s ``PLAN``: one plan per token, every tensor on
 the device).
 
 Both program sets stay resident (``first`` for position ``first_pos``,
-``rest`` after it), bound to shared buffers: x0 (the embedding row), the RoPE
+``rest`` after it; with llama-160m's ``nl`` set, ``nl`` for every newline
+token: ``pf_model.Config.set_of``), bound to shared buffers: x0 (the embedding row), the RoPE
 tables, the mask, and per layer a token-major K / V cache ``[S + 1, kvd]``.
 Per step and layer: rk's output is rebound onto K row p (no copy), v's slice
 of the merged qkv5 output is copied into V row p (one device copy),
@@ -22,8 +23,8 @@ program set: needs neither Pulsar2 nor the card.
 greedy decode of the same prompts: tokens agreed, the first divergence and
 both texts.
 
-usage: MODEL=llama160m pf_plan.py [--fake [--float-set]] [--doc 0] [--prompt 48]
-       -> <out>/plan_doc<d>[_fake].json
+usage: MODEL=llama160m pf_plan.py [--fake [--float-set]] [--doc 0] [--prompt 48] [--lines]
+       -> <out>/plan_doc<d>[_lines][_fake].json
        MODEL=llama160m pf_plan.py --generate 32 [--text "..."] -> <out>/gen[_fake].json
 """
 
@@ -70,12 +71,14 @@ class Plan:
         #: model id -> {("I" | "O", index): (buffer, byte offset)}, the latest binds
         self.binds: dict[int, dict] = {}
         self.M = {}
+        #: first, rest and (llama-160m's newline steps) nl, when generated
+        self.sets = cfg.sets(self.root)
         self.man = {
             st: json.load(open(os.path.join(self.root, f"manifest_{st}.json")))
-            for st in ("first", "rest")
+            for st in self.sets
         }
         loaded = {}
-        for st in ("first", "rest"):
+        for st in self.sets:
             for wh in [f"L{li}" for li in range(cfg.L)] + ["post"]:
                 for k in cfg.programs(st, wh):
                     e = self.man[st][wh][k]
@@ -118,7 +121,7 @@ class Plan:
             self.gain.append((b1, b2))
         self.gf = B(H * 4)
         self.write(self.gf, cfg.ln_f, "gf")
-        self.io = {st: self.bind_set(st) for st in ("first", "rest")}
+        self.io = {st: self.bind_set(st) for st in self.sets}
         self.run("setup")
 
     def _float_fn(self, wh, k, pk, e):
@@ -562,7 +565,7 @@ class Plan:
     def step(self, token, p):
         """One token at position p: returns (logits [V], the runner's timings)."""
         cfg = self.cfg
-        st = "first" if p == cfg.first_pos else "rest"
+        st = cfg.set_of(token, p, self.sets)
         kvd = cfg.kvd
         rows = []
         for li in range(self.trows):
@@ -881,6 +884,11 @@ def main():
     ap.add_argument("--doc", type=int, default=0)
     ap.add_argument("--prompt", type=int, default=48)
     ap.add_argument(
+        "--lines",
+        action="store_true",
+        help="the passage with its line breaks (pf_layout.lines) -> plan_doc<d>_lines",
+    )
+    ap.add_argument(
         "--generate",
         type=int,
         default=0,
@@ -891,7 +899,7 @@ def main():
     ap.add_argument("--text", action="append", help="a --generate prompt (repeatable)")
     a = ap.parse_args()
     cfg = pf_model.load()
-    ids = cfg.passage_ids(lay.EVAL_DOCS[a.doc])[: a.prompt]
+    ids = cfg.passage_ids(lay.EVAL_DOCS[a.doc], lines=a.lines)[: a.prompt]
     root, sess, A = None, None, None
     if a.float_set:
         a.fake = True
@@ -943,7 +951,11 @@ def main():
     json.dump(
         res,
         open(
-            os.path.join(cfg.out, f"plan_doc{a.doc}{'_fake' if a.fake else ''}.json"),
+            os.path.join(
+                cfg.out,
+                f"plan_doc{a.doc}{'_lines' if a.lines else ''}"
+                f"{'_fake' if a.fake else ''}.json",
+            ),
             "w",
         ),
         indent=1,

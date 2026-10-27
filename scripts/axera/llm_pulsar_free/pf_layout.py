@@ -237,6 +237,21 @@ def prose(path: str, max_chars: int = 4000) -> str:
     return " ".join(out)[:max_chars]
 
 
+def lines(path: str, max_chars: int = 4000) -> str:
+    """The text of a Markdown file with its line structure kept: line breaks,
+    blank lines, headings, list items and code blocks (llama-160m's first
+    newline of a sequence makes a massive activation, which text without line
+    breaks never calibrates). HTML / image lines are dropped and link targets
+    removed, as in ``prose``."""
+    out = []
+    for line in open(path, encoding="utf-8"):
+        s = line.rstrip()
+        if s.lstrip().startswith(("<", "![")):
+            continue
+        out.append(re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s))
+    return "\n".join(out).strip("\n")[:max_chars]
+
+
 # ---- a numpy stand-in for the runner's plan mode -----------------------------------
 class _IO:
     def __init__(self, name: str, shape):
