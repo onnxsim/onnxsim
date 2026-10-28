@@ -1028,9 +1028,63 @@ canonical signature and says which templates a model needs and which are missing
   (from their Hugging Face configs), the signatures of every key of the shipped models and of
   Qwen3-4B at every layout, and the reuse records. Directories `resolve` builds carry a
   `signature.json`; the shared directories are not edited.
-- **Not wired yet.** `pf_generate.py` still resolves templates by name (`template_dir`). A
-  model served by a verified reuse needs that call changed to the registry; this section does
-  not do it.
+- **Resolution in `pf_generate.py`** (`resolve_templates`, which calls `pf_registry.plan`).
+  Before anything is generated, each key of the model at its layout is resolved in this order:
+  1. **exact**: a directory with a `signature.json` of the key's signature (an overlay built by
+     `pf_registry build`, e.g. `R/templates`);
+  2. **by name**: a directory of the key's name in a shared root whose owner gives the same
+     signature. A shipped root is `templates` (Qwen3-0.6B) or `templates_llama` (llama-160m),
+     recognised by the real path, so a symlink into them counts. Another unsigned root needs
+     `--owner DIR=MODEL`;
+  3. **reuse**: a stored `equal` verdict in `template_registry.json` whose source directory
+     (its `from`) is in the roots;
+  4. otherwise **missing**: nothing is used in its place (a directory of the name with another
+     signature, or with no signature file outside a shared root, is named as the reason).
+
+  The log has one line per key (`exact`, `by name` or `reuse`, and the directory). The model
+  spec is `MODEL`'s name, or `--spec` (a manifest name or a `config.json` path; its dims must be
+  the checkpoint's). Generation reads a template only through the resolved map (`Generator.tdir`).
+  The `<name>t` alternative directory is no longer looked up: no such directory exists in any
+  root.
+- **Missing keys fail loudly.** With a key that has no record, `pf_generate` prints the keys,
+  their reasons and the build line to stderr and exits 2:
+  `pf_registry.py build --model M --layout N --out ROOT [--root DIR=OWNER]`. `--out` is an
+  overlay: a shared root is not written, and the shared directories a run reuses are symlinked
+  into the overlay.
+- **Not reused yet.** No reuse record is stored (none has been built with `compare_jobs` against
+  another signature), so the reuse step is exercised only by the host tests. `pf_registry build`
+  of a `check` key writes one. The manifest of each program set is unchanged: the resolution is
+  in the log only. `pf_plan`, `pf_check`, `pf_record` and `pf_gptq` still resolve by name.
+  `--spec` checks the dims, not the layer count (no template depends on it).
+
+**Qwen3-4B at the template level (not generated).** `pf_model.MODELS` has `qwen3_4b`
+(Qwen3-4B's dims; the split first set as Qwen3-0.6B's, assumed). No float checkpoint is cached
+(only `Qwen/Qwen3-4B-AWQ`, packed int4), so the runs use a synthetic 2-layer checkpoint with
+Qwen3-4B's dims and random float16 weights (`LLM_PF_SNAPSHOT`); its outputs test the plumbing,
+not the model. What is verified:
+- **Built:** the 20 layout-8 keys exist in `R/templates` (overlay), each with a `signature.json`
+  of the key's signature, so all 20 resolve as `exact`.
+- **Weight-table check (`pf_generate --verify-tables`, `template_table_error`):** 5 of the 20
+  fail it: `k9728n2560`, `lanorm9728`, `slanorm9728`, `slanormqkr9728`, `alyrqkr4096`. Each one's
+  own weights, retargeted onto its own graph (fused variants) or emitted (linears), do not find
+  their table in the compiled `npu_params` ("the template's weight table is not found once"; for
+  the linear, the table is short of its tail). The shipped K=3072 linear and the
+  `slanorm3072` template pass the same checks. The four `slanorm9728` variants of `R/templates`
+  fail; a fresh single-key rebuild of `slanorm9728` (`pf_registry build --name`, `W/T2`) fails
+  the same way. The likely cause is the table format for K=9728 (the pattern is that
+  every failing key has the 9728 width), not a damaged build. This is a hypothesis: not
+  checked against Pulsar2's table layout.
+- **Generation:** not reached. With the check on, `pf_generate both 0 1` exits 2 at
+  resolution, naming the 5 keys. Without the check (default), the run fails at
+  `rest/L1/dn` ("no usable template", the same weight-table error), so layers 0-1 do not
+  generate. Layers 0 and 1 are not produced for Qwen3-4B.
+
+**Shipped byte-identity under the registry** (this branch vs pristine master or the shipped
+sets; `F/cmpset.py`, `pf_generate.py both 0 1`, the shared templates, `LLM_PF_CAL_TARS=0`):
+Qwen3-0.6B layouts 3, 5, 6, 7, 8, 9, 10, 11 and llama-160m layouts 3 and 7 are byte-identical
+on layers 0-1 of both sets. Layout 8 matches `F/n8o`, llama layout 3 matches `l3`, the others
+match pristine master's output (the `n5b` set is gone; layout 5 is compared with pristine).
+Every shipped key resolves as `by name` (the shared directories have no signature file).
 
 Third model: Qwen3-4B's dims (`config.json` of its AWQ repository in the HF cache; the
 template builds need no checkpoint), layout 8, split first set as Qwen3-0.6B's (assumed). It

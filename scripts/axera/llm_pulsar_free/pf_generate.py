@@ -59,8 +59,14 @@ model's ``add_offset``): ``exact`` (Qwen3-0.6B) patches every program as
 entry (``"add_offset": "exact"``); ``pulsar2`` (llama-160m) keeps Pulsar2's
 word, with its zero-point bias, as the sets before 2026-10-28 did.
 
+Templates: every key is resolved through the registry first (``pf_registry.plan``:
+exact signature, then by name in a shared root, then a verified reuse record); a
+key with no record stops the run (exit 2) with the ``pf_registry.py build`` line.
+``--spec`` (a registry name or a config.json path) and ``--owner DIR=MODEL`` for an
+unsigned root that is not a shared one.
+
 usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer] [--jobs N]
-       [--add-offset exact|pulsar2]
+       [--add-offset exact|pulsar2] [--spec NAME|CONFIG] [--owner DIR=MODEL]
        (SET: first | rest | nl | both; the layers run in N worker processes, the
        files are the same for any N. ``both`` writes the same files as
        ``rest`` then ``first`` in one run: the longest programs (the post
@@ -90,6 +96,7 @@ for _p in (HERE, AXERA):
 import linear_emit as le  # noqa: E402
 import pf_fake_quant as fqm  # noqa: E402
 import pf_model  # noqa: E402
+import pf_registry  # noqa: E402
 import pf_templates as tpl  # noqa: E402
 import u16_retarget as ur  # noqa: E402
 from pf_fake_quant import FusedEval  # noqa: E402
@@ -170,6 +177,15 @@ class Generator:
         self.cfg, self.root, self.out = cfg, root, cfg.out
         #: acts set read for another (``nl``: its own samples for ``rest``'s)
         self.acts_alias: dict = {}
+        #: template name -> directory, resolved by ``pf_registry.plan`` (``resolve_templates``)
+        self.tmap: dict = {}
+
+    def tdir(self, name: str) -> str:
+        """The directory of template ``name``: only a key the registry resolved
+        for this model and layout (no lookup by name in the root)."""
+        if name not in self.tmap:
+            raise RuntimeError(f"{name}: not a template key of this model and layout")
+        return self.tmap[name]
 
     def _rel(self, p, base=None):
         return os.path.relpath(p, base or self.out)
@@ -197,7 +213,7 @@ class Generator:
     # ---- one program ------------------------------------------------------------------
     def fused(self, d, dst, name, data):
         os.makedirs(d, exist_ok=True)
-        tdir0 = tpl.template_dir(self.root, name)
+        tdir0 = self.tdir(name)
         shutil.copy(
             os.path.join(tdir0, "v0", "model.onnx"), os.path.join(d, "model.onnx")
         )
@@ -212,15 +228,12 @@ class Generator:
         variant (``<name>/v*``, then ``<name>t/v*``) that accepts it."""
         refused = []
         tdirs = []
-        for nm in (name, name + "t"):
-            base = tpl.template_dir(self.root, nm)
-            if os.path.isdir(base):
-                vs = sorted(
-                    v for v in os.listdir(base) if v[:1] == "v" and v[1:].isdigit()
-                )
-                tdirs += [
-                    os.path.join(base, v) for v in sorted(vs, key=lambda v: int(v[1:]))
-                ]
+        base = self.tdir(name)
+        if os.path.isdir(base):
+            vs = sorted(v for v in os.listdir(base) if v[:1] == "v" and v[1:].isdigit())
+            tdirs += [
+                os.path.join(base, v) for v in sorted(vs, key=lambda v: int(v[1:]))
+            ]
         for tdir in tdirs:
             axm = os.path.join(tdir, "out", "compiled.axmodel")
             if not os.path.exists(axm):
@@ -263,7 +276,7 @@ class Generator:
         q = ur.calibrate(d, "Add", samples=arrs)
         refused = []
         for i in range(4):
-            tdir = os.path.join(tpl.template_dir(self.root, f"add{n}"), f"v{i}")
+            tdir = os.path.join(self.tdir(f"add{n}"), f"v{i}")
             try:
                 m = ur.retarget(
                     os.path.join(tdir, "out", "compiled.axmodel"),
@@ -288,7 +301,7 @@ class Generator:
 
     def linear(self, dst, w, x, ys):
         k, n = w.shape
-        tdir = tpl.template_dir(self.root, f"k{k}n{n}")
+        tdir = self.tdir(f"k{k}n{n}")
         sx, sy = rng2(x), rng2(*ys)
         m = le.emit_linear_u16(
             os.path.join(tdir, "out", "compiled.axmodel"),
@@ -1658,12 +1671,117 @@ def run_both(cfg, layers: list, post: bool, n_jobs: int, t0: float) -> None:
                 )
 
 
+def template_table_error(d, name=None):
+    """``None`` when template directory ``d`` passes the weight-table check (its
+    own weights, retargeted onto its own graph at its own calibration: a fused
+    variant ``v*`` that passes, or a linear's ``emit_linear_u16``), else why not.
+    A ``single`` add has no table: always ``None``."""
+    grp = os.path.basename(os.path.dirname(d))
+    if grp == "single":
+        return None
+    if grp == "linear":
+        g = onnx.load(os.path.join(d, "model.onnx")).graph
+        w = onnx.numpy_helper.to_array(g.initializer[0])
+        x, y = g.node[0].input[0], g.node[0].output[0]
+        q = ur.quant_of(d)
+        try:
+            le.emit_linear_u16(
+                os.path.join(d, "out", "compiled.axmodel"), w,
+                {x: q[x][0], y: q[y][0]}, {x: q[x][1], y: q[y][1]},
+            )  # fmt: skip
+            return None
+        except Exception as e:  # noqa: BLE001
+            return str(e)[:200]
+    errs = []
+    vs = sorted((v for v in os.listdir(d) if v[:1] == "v" and v[1:].isdigit()),
+                key=lambda v: int(v[1:]))  # fmt: skip
+    for v in vs:
+        vd = os.path.join(d, v)
+        try:
+            ur.retarget_graph(
+                os.path.join(vd, "out", "compiled.axmodel"),
+                os.path.join(vd, "model.onnx"), ur.quant_of(vd), ur.quant_of(vd),
+            )  # fmt: skip
+            return None
+        except ValueError as e:
+            errs.append(f"{v}: {str(e)[:120]}")
+    return "; ".join(errs) or "no variant"
+
+
+def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None):
+    """``{template name: directory}`` of the keys of ``cfg``'s program set,
+    resolved by ``pf_registry.plan`` in its order (exact signature, then by name
+    in a shared root, then a verified reuse record; never a guess). Logged per
+    key. A key with no record: the missing keys and the ``pf_registry.py build``
+    line that makes them, on stderr, and exit 2 (nothing is generated)."""
+    R = pf_registry
+    spec = R.model_spec(spec_arg or cfg.name)
+    # the layer count is not compared: no template depends on it
+    got = (spec.H, spec.I, spec.nh, spec.nkv, spec.hd, spec.eps, spec.vocab,
+           spec.qk_norm, spec.S)  # fmt: skip
+    want = (cfg.H, cfg.I, cfg.nh, cfg.nkv, cfg.hd, cfg.eps, cfg.vocab,
+            cfg.qk_norm, cfg.S)  # fmt: skip
+    if got != want:
+        sys.exit(f"pf_generate: spec {spec.name} {got} is not the checkpoint {want}")
+    if tpl.needed(cfg) != R.keys_for(spec, cfg.fuse):
+        sys.exit(
+            f"pf_generate: the key list of {spec.name} at layout {cfg.fuse} differs"
+        )
+    root = os.path.abspath(root)
+    owner = (owners or {}).get(root)
+    roots = [R.Root(root, owner)]
+    ch = R.plan(spec, cfg.fuse, roots, R.load_manifest().get("reuse", {}), verify)
+    missing = [c for c in ch if c.how == "missing"]
+    if missing:
+        lines = [
+            f"pf_generate: {len(missing)} template key(s) of {spec.name} at layout "
+            f"{cfg.fuse} have no record in {root}:"
+        ]
+        lines += [f"  {c.name} ({c.sig}): {c.reason}" for c in missing]
+        lines += [
+            "build them with (into an overlay directory: a shared root is not written;",
+            "symlink the shared directories you reuse into it):",
+            "  " + R.build_command(spec, cfg.fuse, root, roots if owner else ()),
+        ]
+        print("\n".join(lines), file=sys.stderr)
+        sys.exit(2)
+    counts = {h: sum(c.how == h for c in ch) for h in ("exact", "by name", "reuse")}
+    print(
+        f"templates {spec.name} layout {cfg.fuse} in {root}: "
+        + ", ".join(f"{v} {k}" for k, v in counts.items()),
+        flush=True,
+    )
+    for c in ch:
+        print(f"  {c.name:24s} {c.how:8s} {c.dir}", flush=True)
+    return {c.name: c.dir for c in ch}
+
+
 def main():
     global _GEN, _ADD_OFFSET
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("set", choices=("first", "rest", "nl", "both"))
     ap.add_argument("layers", nargs="*", type=int, help="first_layer last_layer")
     ap.add_argument("--templates", default=None, help="template root (pf_templates.py)")
+    ap.add_argument(
+        "--spec",
+        default=None,
+        help="the model's registry spec: a name of template_registry.json or a "
+        "config.json path (default: MODEL); its dims must be the checkpoint's",
+    )
+    ap.add_argument(
+        "--verify-tables",
+        action="store_true",
+        help="an exact template whose weight table fails the identity check is "
+        "missing (a check per template: slower; off by default)",
+    )
+    ap.add_argument(
+        "--owner",
+        action="append",
+        default=[],
+        metavar="DIR=MODEL",
+        help="the model an unsigned template root (no signature.json) was built "
+        "for; repeatable. Shared roots (templates, templates_llama) need none",
+    )
     ap.add_argument(
         "--jobs",
         type=int,
@@ -1682,6 +1800,14 @@ def main():
     a = ap.parse_args()
     cfg = pf_model.load()
     gen = Generator(cfg, a.templates or tpl.default_root(cfg))
+    owners = {}
+    for o in a.owner:
+        d, _, m = o.partition("=")
+        owners[os.path.abspath(d)] = pf_registry.model_spec(m)
+    gen.tmap = resolve_templates(
+        cfg, gen.root, a.spec, owners,
+        template_table_error if a.verify_tables else None,
+    )  # fmt: skip
     _ADD_OFFSET = a.add_offset or cfg.add_offset
     lo_l, hi_l = (a.layers[0], a.layers[1]) if len(a.layers) == 2 else (0, cfg.L - 1)
     st = a.set

@@ -95,6 +95,19 @@ MODELS = {
     # linears: s8 weights x a huge activation put K / V row 0 (the attention
     # sink) off, so their first-set programs get ~16-bit weights as two s8
     # linears (W ~ Q8 + R8) and an Add.
+    # Qwen3-4B's dims (its template keys: pf_registry.SPECS). No float checkpoint
+    # is cached (only the AWQ int4 one): LLM_PF_SNAPSHOT must name a local
+    # checkpoint with these dims. Layer 0 / 1 handling is assumed as Qwen3-0.6B's.
+    "qwen3_4b": dict(
+        repo="Qwen/Qwen3-4B",
+        revision="",
+        first_pos=0,
+        zero_pos0=False,
+        share_linears=True,
+        split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
+        fuse=8,
+        add_offset="exact",
+    ),
     "qwen3_0.6b": dict(
         repo="Qwen/Qwen3-0.6B",
         revision="c1899de289a04d12100db370d81485cdf75e47ca",
@@ -458,7 +471,11 @@ def load(name: str | None = None, out: str | None = None) -> Config:
         raise ValueError(f"MODEL={name!r}: one of {', '.join(MODELS)}")
     spec = dict(MODELS[name])
     repo, revision = spec.pop("repo"), spec.pop("revision")
-    snap = os.environ.get("LLM_PF_SNAPSHOT") or snapshot(repo, revision)
+    snap = os.environ.get("LLM_PF_SNAPSHOT")
+    if not snap:
+        if not revision:
+            raise ValueError(f"MODEL={name}: no pinned revision; set LLM_PF_SNAPSHOT")
+        snap = snapshot(repo, revision)
     out = (
         out or os.environ.get("LLM_PF_OUT") or os.path.join("llm_pulsar_free_out", name)
     )
