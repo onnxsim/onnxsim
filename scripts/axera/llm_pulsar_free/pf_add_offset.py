@@ -33,6 +33,7 @@ for _p in (HERE, AXERA):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import pf_ksplit  # noqa: E402
 import u16_retarget as ur  # noqa: E402
 
 #: the program sets a pf_generate output can hold (nl: llama-160m's newline steps)
@@ -61,9 +62,14 @@ def patch_entry(src: str, out: str, st: str, wh: str, k: str, e: dict) -> int:
         parts[k] = (ur.graph_nodes(os.path.join(src, e["model"])), e["calibration"])
     elif e["kind"] == "add":
         parts[k] = (ADD_NODES, e["calibration"])
-    elif e["kind"] == "split":
-        parts = {f"{k}_{p}": None for p in ("hi", "lo")}
-        parts[f"{k}_add"] = (ADD_NODES, e["split"]["add"]["calibration"])
+    elif e["kind"] in ("split", "ksplit"):
+        # every program of the tree: its Adds (``add`` leaves) are patched, the
+        # linears are linked
+        parts = {}
+        for pk, le_ in pf_ksplit.leaves(e, k):
+            parts[pk] = (
+                (ADD_NODES, le_["calibration"]) if le_["kind"] == "add" else None
+            )
     n_all = 0
     for pk, spec in parts.items():
         path = os.path.join(src, st, wh, f"{pk}.axmodel")

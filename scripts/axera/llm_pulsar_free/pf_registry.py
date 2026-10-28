@@ -256,13 +256,15 @@ class _Cfg:
         self.fuse = int(layout)  # fmt: skip
 
 
-def keys_for(spec: ModelSpec, layout: int) -> list[str]:
+def keys_for(spec: ModelSpec, layout: int, man: dict | None = None) -> list[str]:
     """The template names (``fused`` / ``add<n>`` / ``k<K>n<N>``) a model needs
     at ``layout``: ``pf_templates.needed`` for the spec (the same list, so the
-    shipped sets' names are unchanged)."""
+    shipped sets' names are unchanged). With ``man`` (a manifest), a linear whose
+    width is absent is replaced by its split parts and Add (``split_keys``)."""
     if layout not in LAYOUTS:
         raise ValueError(f"layout {layout}: one of {LAYOUTS}")
-    return tpl.needed(_Cfg(spec, layout))
+    names = tpl.needed(_Cfg(spec, layout))
+    return names if man is None else split_keys(names, man)[0]
 
 
 # ---- signatures -----------------------------------------------------------------------
@@ -471,14 +473,16 @@ class Need:
     candidates: list = field(default_factory=list)  # same name, other signature
 
 
-def status(spec: ModelSpec, layout: int, found: dict, reuse: dict) -> list[Need]:
+def status(
+    spec: ModelSpec, layout: int, found: dict, reuse: dict, man: dict | None = None
+) -> list[Need]:
     """Each template key of ``spec`` at ``layout`` and its state (see above)."""
     by_name: dict[str, list[dict]] = {}
     for sid, dirs in found.items():
         for d in dirs:
             by_name.setdefault(d["name"], []).append(dict(d, sig=sid))
     out = []
-    for name in keys_for(spec, layout):
+    for name in keys_for(spec, layout, man):
         sid, _ = name_sig(name, spec)
         if sid in found:
             out.append(Need(name, sid, "exact", found[sid]))
@@ -540,6 +544,58 @@ def linear_split(k: int, n: int, man: dict) -> dict | None:
     raise ValueError(
         f"k{k}n{n}: no equal split into measured-present widths {sorted(safe)}"
     )
+
+
+#: a single-op Add's name (``add<n>``)
+_ADD = re.compile(r"add(\d+)")
+
+
+def widths_add(man: dict) -> dict:
+    """The manifest's ``add_widths``: each Add width's ``measured`` verdict (card
+    against the host model of the Add, ``pf_registry`` docs), like ``linear_widths``."""
+    return man.get("add_widths", {}).get("measured", {})
+
+
+def add_split(n: int, man: dict) -> dict | None:
+    """``None`` when Add width ``n`` is not measured absent, else the plan: the smallest
+    equal split of ``n`` into measured-present widths, ``parts``, ``width`` and the
+    ``names`` (one Add per part, over its column slice). ``ValueError`` when none exists."""
+    meas = widths_add(man)
+    if str(n) not in meas or meas[str(n)].get("present"):
+        return None
+    safe = sorted(int(k) for k, v in meas.items() if v.get("present"))
+    for parts in range(2, n + 1):
+        if n % parts == 0 and n // parts in safe:
+            w = n // parts
+            return dict(parts=parts, width=w, names=[f"add{w}"] * parts)
+    raise ValueError(f"add{n}: no equal split into measured-present widths {safe}")
+
+
+def split_keys(names: list[str], man: dict) -> tuple[list[str], dict]:
+    """``(names, plans)``: each linear name whose width is absent (``linear_split``
+    is a plan) replaced, in place, by its parts' names and its Add; each Add name
+    whose width is absent (``add_split``) by its column parts' names. ``plans`` maps
+    each split name to its plan. Other names, and their order, are unchanged. The
+    names are deduplicated in order (a part may already be a key of the list)."""
+    out, plans = [], {}
+    for name in names:
+        m = _LINEAR.fullmatch(name)
+        if m:
+            p = linear_split(int(m[1]), int(m[2]), man)
+            if p is None:
+                out.append(name)
+            else:
+                plans[name] = p
+                out += p["names"] + [p["add"]]
+            continue
+        a = _ADD.fullmatch(name)
+        p = add_split(int(a[1]), man) if a else None
+        if p is None:
+            out.append(name)
+        else:
+            plans[name] = p
+            out += p["names"]
+    return list(dict.fromkeys(out)), plans
 
 
 def split_report(spec: ModelSpec, layout: int, man: dict) -> list[str]:
@@ -612,7 +668,7 @@ def resolve(
     ``names``: only these keys. Returns the summary and the needs."""
     man = manifest if manifest is not None else load_manifest()
     found = scan(roots + [Root(out_root)])
-    needs = status(spec, layout, found, man.get("reuse", {}))
+    needs = status(spec, layout, found, man.get("reuse", {}), man)
     todo = [n for n in needs if n.state in ("missing", "check")]
     if names:
         todo = [n for n in todo if n.name in names]
@@ -677,6 +733,7 @@ def manifest_for(specs=None, layouts=LAYOUTS) -> dict:
         "signatures": dict(sorted(sigs.items())),
         "reuse": old.get("reuse", {}),
         "linear_widths": old.get("linear_widths", {}),
+        "add_widths": old.get("add_widths", {}),
     }
     return json.loads(json.dumps(man))  # tuples as lists: what a reload gives
 
@@ -703,6 +760,7 @@ def plan(
     roots: list[Root],
     reuse: dict | None = None,
     verify=None,
+    names: list[str] | None = None,
 ) -> list[Choice]:
     """Each template key of ``spec`` at ``layout``, resolved in this order:
 
@@ -718,6 +776,7 @@ def plan(
     check fails is ``missing`` too, with the error as the reason."""
     reuse = reuse or {}
     owner_sids: dict = {}
+    names = keys_for(spec, layout) if names is None else names
 
     def entries(name: str):
         for root in roots:
@@ -741,7 +800,7 @@ def plan(
                        "owner": owner.name}  # fmt: skip
 
     out = []
-    for name in keys_for(spec, layout):
+    for name in names:
         sid, _ = name_sig(name, spec)
         ents = list(entries(name))
         hit = [e for e in ents if e["how"] == "exact" and e["sid"] == sid]
@@ -835,12 +894,16 @@ def main(argv=None):
         print("\n".join(split_report(spec, a.layout, load_manifest())))
         return
     if a.cmd == "keys":
-        for n in keys_for(spec, a.layout):
+        for n in keys_for(spec, a.layout, load_manifest()):
             print(n, name_sig(n, spec)[0])
         return
     roots = _roots_from(a)
     if a.cmd == "report":
-        ch = plan(spec, a.layout, roots, load_manifest().get("reuse", {}))
+        man = load_manifest()
+        ch = plan(
+            spec, a.layout, roots, man.get("reuse", {}),
+            names=keys_for(spec, a.layout, man),
+        )  # fmt: skip
         counts = {
             h: sum(c.how == h for c in ch)
             for h in ("exact", "by name", "reuse", "missing")
