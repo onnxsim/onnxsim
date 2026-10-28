@@ -17,7 +17,11 @@ Then, on the phone (every adb call under PHONE_RUN's lock):
   the outputs bit-compared with seq's;
 - `conc`: backbone / decoder alone, the 6 sampling calls alone, then each pair at once.
 
+--tg-enc / --tg-dec: the encoder / decoder as tinygrad-compiled programs (.tghx: the fork's examples/dsp_graph_onnx.py
+--artifact on export_msda_op.py's enc3.msda.onnx / decoder.msda.onnx) instead of the HTP pieces (frame_run's TG_ENC / TG_DEC).
+
 usage: frame_e2e.py --ckpt <pth> --data <nuscenes-mini> --work <work> [--build build] [--modes seq,pipe,conc]
+       [--tg-enc enc3.tghx] [--tg-dec decoder.tghx]
 """
 
 from __future__ import annotations
@@ -83,6 +87,8 @@ def main():
         help="the encoder's HTP pieces: a <work> subdirectory of <piece>.sim.onnx (e.g. quantize_split.py's)",
     )
     ap.add_argument("--modes", default="seq,pipe,conc")
+    ap.add_argument("--tg-enc", default="", help="a tinygrad encoder program (.tghx)")
+    ap.add_argument("--tg-dec", default="", help="a tinygrad decoder program (.tghx)")
     ap.add_argument(
         "--reps",
         type=int,
@@ -126,6 +132,8 @@ def main():
             "can_bus": can_bus,
             "tsa_ref": tsa_ref,
             "ref_cam": ref_cam_h,
+            "shift": shift,
+            "bev_mask": bev_mask,
         }.items():
             f32(v).tofile(d / f"{k}.f32")
         np.ascontiguousarray(vis.numpy().astype(np.uint8)).tofile(d / "vis.u8")
@@ -194,6 +202,15 @@ def main():
     )
     # a phone / host output directory per configuration: runs of different configs can't collide
     fr = "fr_" + f"{a.backbone}_{a.decoder}".replace(".", "_")
+    tg = ""
+    for flag, path, name in (
+        ("TG_ENC", a.tg_enc, "tg_enc.tghx"),
+        ("TG_DEC", a.tg_dec, "tg_dec.tghx"),
+    ):
+        if path:
+            subprocess.run([*E.ADB, "push", "-q", path, f"{R}/{name}"], check=True)
+            tg += f"{flag}={name} "
+            fr += "_" + flag.lower()
     if a.pieces != "msda_split":
         fr += "_" + a.pieces.replace(".", "_")
     sh(
@@ -203,7 +220,7 @@ def main():
         [*E.ADB, "push", "-q", *[str(d) for d in frames], f"{R}/{fr}/"], check=True
     )
     env = (
-        f"cd {R} && LD_LIBRARY_PATH={R} QNN_PERF=burst "
+        f"cd {R} && {tg}LD_LIBRARY_PATH={R} QNN_PERF=burst "
         f"ADSP_LIBRARY_PATH='{R};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' "
     )
     names = " ".join(f"{fr}/{d.name}" for d in frames)

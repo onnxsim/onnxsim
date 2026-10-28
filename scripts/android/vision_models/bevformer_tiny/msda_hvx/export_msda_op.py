@@ -15,11 +15,19 @@ model.py's own forward on the saved frames. Compare a device run with onnxruntim
 (<piece>.sim.onnx from export.py), same inputs.
 
 usage: export_msda_op.py enc1|enc3|decoder --ckpt <pth> --work <work>   -> <work>/<piece>.msda.onnx (onnxsim-simplified)
+       export_msda_op.py frame --work <work>   -> <work>/frame.msda.onnx: enc3.msda.onnx and decoder.msda.onnx (both exported
+       first) as one graph, bev_embed kept as an output -- one program for frame_run's TG_ENC (two separate programs don't fit
+       the DSP process together)
+       export_msda_op.py frame --work <work> --resident <backbone1.q8.json>   -> <work>/frame_res.msda.onnx: the same, with
+       the backbone's uint8 feats as the input (feats_q, dequantized in the graph) and the previous BEV kept on the DSP: input
+       bev_state is output next_bev_state (the fork's dsp_graph_onnx.py recurrent state), prev_bev = its rows gathered by
+       rot_idx (float, -1 = zero; frame_e2e.py's) times has_prev
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -103,12 +111,100 @@ def worst(a, b):
     )
 
 
+def merge_frame(work: Path, resident: str | None = None) -> Path:
+    import onnx
+    from onnx import compose
+
+    e, d = (
+        onnx.load(str(work / "enc3.msda.onnx")),
+        onnx.load(str(work / "decoder.msda.onnx")),
+    )
+    for m in (
+        e,
+        d,
+    ):  # (onnxsim's own metadata differs between the two, which merge_models refuses)
+        del m.metadata_props[:]
+    d = compose.add_prefix(d, "dec_", rename_inputs=False, rename_outputs=False)
+    m = compose.merge_models(e, d, io_map=[("bev_embed", "bev_embed")])
+    m.graph.output.insert(0, next(o for o in e.graph.output if o.name == "bev_embed"))
+    out = work / "frame.msda.onnx"
+    if resident is not None:
+        m = resident_io(m, json.loads(Path(resident).read_text())["feats"])
+        out = work / "frame_res.msda.onnx"
+    onnx.save(m, str(out))
+    print(
+        f"{out}: inputs {[i.name for i in m.graph.input if i.name not in {x.name for x in m.graph.initializer}]}, "
+        f"outputs {[o.name for o in m.graph.output]}"
+    )
+    return out
+
+
+def resident_io(m, fq: dict):
+    """frame.msda.onnx with uint8 feats in and the BEV kept on the DSP (see the usage above)."""
+    import onnx
+    from onnx import TensorProto, compose, helper, numpy_helper
+
+    NQ, E = M.NQ, M.EMBED
+    pre = helper.make_graph(
+        [
+            helper.make_node("DequantizeLinear", ["feats_q", "fq_scale", "fq_zp"], ["feats"]),
+            helper.make_node("Max", ["rot_idx", "zero"], ["rot_c"]),
+            helper.make_node("Cast", ["rot_c"], ["rot_i"], to=TensorProto.INT64),
+            helper.make_node("Gather", ["bev_state", "rot_i"], ["rows"], axis=0),
+            helper.make_node("Greater", ["rot_idx", "minus_half"], ["valid_b"]),
+            helper.make_node("Cast", ["valid_b"], ["valid"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", ["valid", "has_prev"], ["keep0"]),
+            helper.make_node("Unsqueeze", ["keep0", "ax1"], ["keep"]),
+            helper.make_node("Mul", ["rows", "keep"], ["prev_bev"]),
+        ],
+        "frame_res_in",
+        [
+            helper.make_tensor_value_info("feats_q", TensorProto.UINT8, [6, 256, 15, 25]),
+            helper.make_tensor_value_info("bev_state", TensorProto.FLOAT, [NQ, E]),
+            helper.make_tensor_value_info("rot_idx", TensorProto.FLOAT, [NQ]),
+            helper.make_tensor_value_info("has_prev", TensorProto.FLOAT, [1]),
+        ],
+        [
+            helper.make_tensor_value_info("feats", TensorProto.FLOAT, [6, 256, 15, 25]),
+            helper.make_tensor_value_info("prev_bev", TensorProto.FLOAT, [NQ, E]),
+            helper.make_tensor_value_info("has_prev_o", TensorProto.FLOAT, [1]),
+        ],
+        [
+            numpy_helper.from_array(np.array(fq["scale"], np.float32), "fq_scale"),
+            numpy_helper.from_array(np.array(fq["zero_point"], np.uint8), "fq_zp"),
+            numpy_helper.from_array(np.array(0, np.float32), "zero"),
+            numpy_helper.from_array(np.array(-0.5, np.float32), "minus_half"),
+            numpy_helper.from_array(np.array([1], np.int64), "ax1"),
+        ],
+    )
+    pre.node.append(helper.make_node("Identity", ["has_prev"], ["has_prev_o"]))
+    pm = helper.make_model(pre, opset_imports=list(m.opset_import), ir_version=m.ir_version)
+    r = compose.merge_models(
+        pm, m, io_map=[("feats", "feats"), ("prev_bev", "prev_bev"), ("has_prev_o", "has_prev")]
+    )
+    # the BEV output as next_bev_state: the state that feeds bev_state on the next run
+    r.graph.node.append(helper.make_node("Identity", ["bev_embed"], ["next_bev_state"]))
+    o = next(o for o in r.graph.output if o.name == "bev_embed")
+    o.name = "next_bev_state"
+    onnx.checker.check_model(r)
+    return r
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("piece")
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt")
     ap.add_argument("--work", default="work")
+    ap.add_argument(
+        "--resident",
+        help="frame: the backbone's quantize.py qparams (backbone1.q8.json) -> frame_res.msda.onnx",
+    )
     a = ap.parse_args()
+    if a.piece == "frame":
+        merge_frame(Path(a.work), a.resident)
+        return
+    if not a.ckpt:
+        raise SystemExit("--ckpt is required")
     torch.set_grad_enabled(False)
     work = Path(a.work)
     frames = [

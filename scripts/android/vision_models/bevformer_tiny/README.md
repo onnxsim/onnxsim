@@ -435,6 +435,55 @@ CLIENT=<onnx-remote-client> WORKER=<onnx-remote-hexagon-worker> COMPILER_PORT=<c
   --htp-decoder decoder.sim
 ```
 
+### The tinygrad programs in the frame runner (`frame_run` TG_ENC, `frame_e2e.py --tg-enc`)
+
+`frame_run` can load tinygrad-compiled programs in-process (`tg_prog.h`). A program is a `.tghx` artifact, the container
+onnx-remote's worker loads. `frame_run` writes its skel next to the binary and opens it over FastRPC. The program's packed
+input and output buffers live in rpcmem, and the frame's inputs are staged straight into them: dequantized feats, the
+prev_bev gather, and the host geometry. `frame_e2e.py` now also writes each frame's `shift.f32` and `bev_mask.f32`.
+- **Two separate programs** (TG_ENC and TG_DEC) don't fit the DSP process together: the second program's weight upload
+  fails (encoder 9.3 MB weights + 36.6 MB scratch, decoder 11.8 + 12.9 MB).
+- **One program instead:** `export_msda_op.py frame` merges `enc3.msda.onnx` and `decoder.msda.onnx` into one graph, with
+  `bev_embed` kept as an output. The emitter reuses scratch across both parts: 21.1 MB weights, 36.7 MB scratch. A TG_ENC
+  program with three outputs is the whole frame after the backbone.
+- **Output packing:** that program first ran at 64.2 ms of DSP time, against 52.3 ms for the two programs separately. One
+  generated kernel concatenated the three outputs into the output buffer, a select per element over all 658 K floats,
+  16.4 ms. The fork (`b5eb951ad`) now stores each output into its own slice: 48.9 ms.
+
+Phone, scene-0103 frames 0-5 x 5 passes, backbone1.q8 x 6 on the HTP, under the phone lock:
+
+| configuration | backbone | encoder + decoder | seq ms/frame | pipe ms/frame (FPS) | pipe latency | GT matched |
+|---|---|---|---|---|---|---|
+| `frame_run`, HTP pieces + hand HVX MSDA + fp16 HTP decoder (above) | 21.3 | 55.1 + 24.9 | 101.8 | 90.5 (11.1) | 208 ms | 107 / 190 |
+| **`frame_run`, one tinygrad program (TG_ENC=frame)** | 21.4 | **54.5** (DSP 48.9) | **76.3** | **71.9 (13.9)** | 128 ms | 106 / 190 |
+| same, BEV kept on the DSP (`frame --resident`) | 21.5 | 55.5 (DSP 50.0) | 77.0 | 72.9 (13.7) | 130 ms | 106 / 190 |
+| same, its BEV output left on the DSP too (`TG_OMIT_STATE_OUT=1`) | 21.2 | 52.4 (DSP 50.0) | 73.7 | 72.0 (13.9) | 125 ms | (cls / bbox as above) |
+
+- **Accuracy:** bev cos 0.9965-0.9980 and cls >= 0.99979 on every frame, the int8 backbone's gap as before. Pipe outputs
+  are bit-identical to seq's. fp32 torch also matches 106 GT.
+- **FastRPC call cost:** the call costs 5.6 ms over the program's own DSP time, from about 5.6 MB of fp32 inputs and 2.6 MB
+  of outputs going through FastRPC.
+- **Pipelining:** it gains less than with the HTP pieces (76 -> 72 ms). The backbone (QNN HTP, about 21 ms) and the
+  tinygrad program (about 50 ms) share the cDSP, so a pipelined frame costs their sum. Only DSP compute time moves the
+  throughput now.
+- **The call's overhead isn't the input size.** `export_msda_op.py frame --resident <backbone1.q8.json>` takes the
+  backbone's uint8 feats as they are (dequantized in the graph). It keeps the previous BEV on the DSP as recurrent state:
+  the fork's `dsp_graph_onnx.py` treats an output `next_bev_state` as input `bev_state`'s next value, and `rot_idx` gathers
+  it there. That cuts the input from 5.6 to 1.3 MB per frame, but the call costs the same: the in-graph gather adds 1.1 ms of
+  DSP time.
+- **The BEV output is.** Leaving it on the DSP (`TG_OMIT_STATE_OUT=1`: tg_graph.idl's flag bit 16 + k, only cls / bbox
+  come back) saves 3.1 ms. That is the skel's copy of 2.6 MB plus FastRPC's cache maintenance. About 2.2 ms per call
+  remains: the skel takes VTCM and the HMX for every run and releases them, which the HTP backbone needs.
+
+```sh
+python3 export_msda_op.py frame --work $C/work           # after enc3 / decoder (+ --resident $C/work/backbone1.q8.json)
+python3 <tinygrad>/examples/dsp_graph_onnx.py $C/work/frame.msda.onnx <out> --arch v69 --artifact frame.tghx  # GEMM_FP16=1 HMX=1 ...
+TINYGRAD_ROOT=<tinygrad> OUT=<build> ./build.sh
+PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch> R=/data/local/tmp/<dir> \
+  python3 frame_e2e.py --ckpt ... --data ... --work $C/work --build <build> --backbone backbone1.q8 --tg-enc frame.tghx \
+  --modes seq,pipe
+```
+
 ### Why not a `scripts/android/deploy` spec (yet)
 
 The deploy pipeline (#1853) takes one graph through fetch -> simplify -> quantize -> rewrite ->
