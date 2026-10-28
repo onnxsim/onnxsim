@@ -1102,6 +1102,92 @@ and llama layout 3 equals the shipped `l3` set. The references named in the brie
 (`n5b`, `A/n6`, `B/n8`, `C/n7`, `C/l6`) are gone from the work directory, so those layouts
 have only the pristine-master comparison.
 
+## Split linears (Qwen3-4B's down projection, K = 9728)
+
+Pulsar2's U16 linear at N = 2560 compiles without its weight table for some input widths.
+The check that tells is `linear_emit.linear_table_present`: the compiled `npu_params` holds
+the table of the template's own weights (at its calibrated scales) exactly once. (A check
+that only looks for the right size, or that the output is mostly nonzero, passes these
+builds; the table bytes differ.) Measured with `pulsar2:7.0-lite`:
+
+| K (N = 2560) | table | present | source |
+|---|---|---|---|
+| 3072, 4096 | 8.4, 11.2 MB | yes | pulsar-confirm control |
+| 4864 | 13.4 MB | yes | this branch |
+| 5456 | 15.0 MB | **no** | this branch |
+| 5888 | 16.2 MB | yes | this branch |
+| 6014, 6016 | 16.4 MB | **no** | this branch |
+| 6144, 8192, 9728 | 16.8, 22.4, 26.6 MB | **no** | pulsar-confirm control |
+
+The width rule is not the table size: `k1024n151936` (a 166 MB table) is present, and a
+two-linear program (two K = 4864 MatMuls and an Add, `npu_params` 26.7 MB) has both tables
+present. The absent widths all have a first segment (`linear_emit.u16_layout`) of 280 pairs
+or more, the present ones 256 or less. That is a hypothesis: only the widths above are
+measured.
+
+**The split (the design used).** `y = x1 W1 + x2 W2` with x split along K at 4864. The
+input keeps one grid `(s_x, 32768)`. The two halves and the sum share one output grid
+`(s, 32768)` with `s = max(|y|, |y1|, |y2|) / 32767` (calibrated on passage 1). Then
+`Add(y1, y2)` has both ratios exactly 1, so the card's Add is `q = q1 + q2 - 32768`:
+integer, exact, no requantization. Its output is the `down` tensor on the unsplit grid, so
+the residual Add and the next norm are unchanged. Rejected: a separate scale per half with a
+requantizing Add (`pf_fake_quant.card_add`): the same error as the equal grid on 3 of 5 layers
+(within 0.02%), worse on layer 17 (1.02% against 1.00%, max error 780 against 375 steps) and
+better on layer 35 (0.98% against 1.01%), and it adds a rounding that the equal grid does not
+have. A separate Add program with its own scales costs an execute for no accuracy either.
+
+Host error against the float linear, on the real Qwen3-4B down inputs (AWQ int4 dequantized,
+a float forward on two repo passages; `S/split_host.py`; relative RMS over passage 2):
+
+| layer | unsplit (K = 9728, control) | split, equal grid | split, separate scales + Add |
+|---|---|---|---|
+| 0 | 1.03% | 0.81% | 0.81% |
+| 8 | 1.08% | 0.92% | 0.91% |
+| 17 | 1.20% | 1.00% | 1.02% |
+| 26 | 1.38% | 1.20% | 1.20% |
+| 35 | 1.21% | 1.01% | 0.98% |
+
+The error is the s8 weight codes (about 1%, the same in both designs). The split is lower,
+probably because each half's per-channel weight scale covers 4864 inputs, not 9728 (not
+isolated). The unsplit
+program cannot be built, so it is a host control only.
+
+Card (layers 8 and 35, passage 2, 128 tokens, `S/card_split.py`; health 0.0 before and after):
+the card's split output is within 2 LSB of the host model (mean 0.01 LSB) and its error
+against the float linear is the host's (0.92% rel. RMS at layer 8; 1.01% at 35).
+
+Execute time per token of the down projection, layer 8, back to back (median of 3):
+
+| chain | execute us / token |
+|---|---|
+| `h1`, `h2`, Add | 2100 |
+| `h1`, `h2` | 1846 |
+| Add alone | 296 |
+
+Estimated, not measured: the unsplit program is one execute of K = 9728, about 0.27 ms of
+floor plus 2 x 0.65 ms of body, about 1.6 ms. Three executes (two halves and an Add,
+with the residual and norm folded into the Add) add about 0.5 ms per layer, about 20 ms
+per token over Qwen3-4B's 36 layers. Two linears in one program (verified to build with
+both tables present) would keep the unsplit execute count (0 extra executes, an estimated
+~1.6 ms); that program's emitter is not written, so it is not on the card.
+
+**Registry.** `template_registry.json` holds `linear_widths` (per N: each K's measured
+verdict and its source). A width is used only if measured present at its N (absence is not
+monotone in K: 5456 absent, 5888 present). `pf_registry.linear_split(K, N, manifest)` plans
+a K that is not measured present into the smallest equal number of measured-present parts
+(K = 9728 at N = 2560: 2 x `k4864n2560` + `add2560`).
+`pf_registry.py split --model qwen3_4b --layout 8` prints the plan. Generation does not use
+the plan yet: `pf_generate` still asks for `k9728n2560` and reports it missing. A linear
+template whose table check fails is written with `ok: false` (`pf_templates.build_linear`),
+and `pf_registry` skips such a directory as a template.
+
+**Byte-identity of the registry change** (`pf_generate.py both 0 1`, `--add-offset exact`,
+`LLM_PF_CAL_TARS=0`, the shared templates; every `.axmodel` of layers 0-1, both sets): Qwen3-0.6B
+layouts 3, 5, 6, 7, 8, 9, 10, 11 equal pristine `origin/master`. Layout 8 also equals `F/n8o`.
+llama-160m layouts 3 and 7 equal pristine `origin/master`. Llama layout 3 does not equal the
+shipped `l3` set (10 of its axmodels and the `on2` calibration differ), but it equals pristine
+`origin/master`, so the difference predates this change.
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two

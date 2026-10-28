@@ -1047,8 +1047,22 @@ def build_linear(root: str, name: str, memory=None) -> None:
     ok = bool(res.success) and os.path.exists(
         os.path.join(W, "out", "compiled.axmodel")
     )
+    err = (res.error or "")[-500:]
+    if ok:
+        # builder-side table check: a linear whose table is absent from its compiled
+        # npu_params is a failed template (pf_registry skips it; see the docs)
+        import linear_emit as le
+        import u16_retarget as ur
+
+        q = ur.quant_of(W)
+        if not le.linear_table_present(
+            os.path.join(W, "out", "compiled.axmodel"), w,
+            q["x"][0], q["x"][1], q["y"][0], q["y"][1],
+        ):  # fmt: skip
+            ok = False
+            err = "weight table absent from npu_params (linear_table_present)"
     json.dump(
-        dict(ok=ok, error=(res.error or "")[-500:], seconds=time.time() - t0),
+        dict(ok=ok, error=err, seconds=time.time() - t0),
         open(os.path.join(W, "result.json"), "w"),
         indent=1,
     )
