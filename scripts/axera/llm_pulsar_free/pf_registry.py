@@ -347,6 +347,68 @@ class Root:
     owner: ModelSpec | None = None
 
 
+#: the shipped template roots, by directory name, and the model each was built
+#: for. An unsigned directory whose real root has one of these names is that
+#: model's (by name: a symlink into the shared root counts); any other unsigned
+#: directory has no record and is not used.
+SHIPPED_OWNERS = {"templates": "qwen3_0.6b", "templates_llama": "llama160m"}
+#: the dims that decide whether a config.json is one of the manifest's models
+DIMS_FIELDS = ("H", "I", "nh", "nkv", "hd", "eps", "vocab", "qk_norm")
+
+
+def model_specs(man: dict | None = None) -> dict[str, ModelSpec]:
+    """The model specs of ``template_registry.json`` (its ``models`` table)."""
+    man = man if man is not None else load_manifest()
+    out = {}
+    for k, v in man.get("models", {}).items():
+        v = dict(v, split_layers=tuple(v.get("split_layers", ())))
+        v["split_keys"] = tuple(v.get("split_keys", ()))
+        out[k] = ModelSpec(**v)
+    return out
+
+
+def model_spec(arg: str, man: dict | None = None) -> ModelSpec:
+    """A model's spec from its name in ``template_registry.json``, or from a
+    Hugging Face ``config.json`` path: the manifest's model with the same dims
+    (``ValueError`` when no manifest model has them)."""
+    specs = model_specs(man)
+    if arg in specs:
+        return specs[arg]
+    if os.path.isfile(arg):
+        c = ModelSpec.from_config("config", json.load(open(arg)))
+        for s in specs.values():
+            if all(getattr(s, f) == getattr(c, f) for f in DIMS_FIELDS):
+                return s
+        raise ValueError(
+            f"{arg}: its dims (H={c.H} I={c.I} heads={c.nh}/{c.nkv} hd={c.hd} "
+            f"layers={c.layers}) match no model of template_registry.json "
+            f"({', '.join(sorted(specs))}); add it to pf_registry.SPECS and run "
+            "pf_registry.py manifest"
+        )
+    raise ValueError(
+        f"{arg}: neither a model of template_registry.json "
+        f"({', '.join(sorted(specs))}) nor a config.json path"
+    )
+
+
+def shipped_owner(d: str, specs: dict | None = None) -> ModelSpec | None:
+    """The model a shipped root built ``d`` for, when ``d`` (``<root>/<group>/
+    <name>``) really lives in one (its symlink target, if it is one)."""
+    real_root = os.path.dirname(os.path.dirname(os.path.realpath(d)))
+    name = SHIPPED_OWNERS.get(os.path.basename(real_root))
+    if name is None:
+        return None
+    return (specs or model_specs())[name]
+
+
+def owner_of(root: "Root", d: str) -> ModelSpec | None:
+    """The model whose dims a directory without a signature file was built
+    with: the root's declared owner, else the shipped owner of its real root."""
+    if root.owner is not None:
+        return root.owner
+    return shipped_owner(d)
+
+
 def scan(roots: list[Root]) -> dict[str, list[dict]]:
     """``sig_id`` -> the directories of that signature, over the roots."""
     found: dict[str, list[dict]] = {}
@@ -364,12 +426,13 @@ def scan(roots: list[Root]) -> dict[str, list[dict]]:
                 except ValueError:
                     continue
                 sf = os.path.join(d, SIG_FILE)
+                owner = owner_of(root, d)
                 if os.path.exists(sf):
                     sid = json.load(open(sf))["sig_id"]
                     how = "signature.json"
-                elif root.owner is not None:
-                    sid, _ = name_sig(name, root.owner)
-                    how = f"owner {root.owner.name}"
+                elif owner is not None:
+                    sid, _ = name_sig(name, owner)
+                    how = f"owner {owner.name}"
                 else:
                     continue
                 found.setdefault(sid, []).append(
@@ -550,11 +613,126 @@ def manifest_for(specs=None, layouts=LAYOUTS) -> dict:
     return json.loads(json.dumps(man))  # tuples as lists: what a reload gives
 
 
+# ---- resolution for pf_generate ----------------------------------------------------------
+@dataclass
+class Choice:
+    """How one template key is served: ``how`` is ``exact`` (a directory with a
+    signature file of the same signature), ``by name`` (a shared root's
+    directory of that name, built for an owner whose signature is the same),
+    ``reuse`` (a stored equal verdict against a directory that exists) or
+    ``missing`` (``reason`` says what is there instead)."""
+
+    name: str
+    sig: str
+    how: str
+    dir: str | None = None
+    reason: str = ""
+
+
+def plan(
+    spec: ModelSpec,
+    layout: int,
+    roots: list[Root],
+    reuse: dict | None = None,
+    verify=None,
+) -> list[Choice]:
+    """Each template key of ``spec`` at ``layout``, resolved in this order:
+
+    1. exact: a signature file with the key's signature;
+    2. by name: a directory of the key's name in a shared root, built for an
+       owner whose dims give the key's signature;
+    3. reuse: a stored ``equal`` record of the key's signature, whose source
+       directory (the record's ``from``) exists in the roots.
+
+    Anything else is ``missing``: a directory of the name with another
+    signature, or without a record, is never used in its place. ``verify``
+    (optional, ``verify(dir, name) -> error or None``): an exact directory whose
+    check fails is ``missing`` too, with the error as the reason."""
+    reuse = reuse or {}
+    owner_sids: dict = {}
+
+    def entries(name: str):
+        for root in roots:
+            for grp in GROUPS:
+                d = os.path.join(root.path, grp, name)
+                if not os.path.isdir(d):
+                    continue
+                sf = os.path.join(d, SIG_FILE)
+                if os.path.exists(sf):
+                    sid = json.load(open(sf))["sig_id"]
+                    yield {"dir": d, "sid": sid, "how": "exact", "owner": None}
+                    continue
+                owner = owner_of(root, d)
+                if owner is None:
+                    yield {"dir": d, "sid": None, "how": "unsigned", "owner": None}
+                    continue
+                key = (name, owner.name)
+                if key not in owner_sids:
+                    owner_sids[key] = name_sig(name, owner)[0]
+                yield {"dir": d, "sid": owner_sids[key], "how": "by name",
+                       "owner": owner.name}  # fmt: skip
+
+    out = []
+    for name in keys_for(spec, layout):
+        sid, _ = name_sig(name, spec)
+        ents = list(entries(name))
+        hit = [e for e in ents if e["how"] == "exact" and e["sid"] == sid]
+        if hit:
+            err = verify(hit[0]["dir"], name) if verify else None
+            if err is None:
+                out.append(Choice(name, sid, "exact", hit[0]["dir"]))
+            else:
+                out.append(Choice(name, sid, "missing", None,
+                    f"{hit[0]['dir']} has the signature but fails its weight-table check: {err}"))  # fmt: skip
+            continue
+        hit = [e for e in ents if e["how"] == "by name" and e["sid"] == sid]
+        if hit:
+            out.append(Choice(name, sid, "by name", hit[0]["dir"],
+                              f"built for {hit[0]['owner']}"))  # fmt: skip
+            continue
+        reason = ""
+        rec = reuse.get(sid)
+        if rec and rec.get("verdict") == "equal":
+            src = [e for e in entries(rec.get("name", name)) if e["sid"] == rec["from"]]
+            if src:
+                out.append(Choice(name, sid, "reuse", src[0]["dir"],
+                                  f"equal to signature {rec['from']}"))  # fmt: skip
+                continue
+            reason = (
+                f"reuse record {rec['from']}: its source directory is not in the roots"
+            )
+        elif rec:
+            reason = f"reuse record says {rec.get('verdict')}"
+        others = [e for e in ents if e["sid"] != sid]
+        if others:
+            o = others[0]
+            what = "no signature" if o["sid"] is None else f"signature {o['sid']}"
+            reason = "; ".join(
+                x for x in (reason, f"{o['dir']} has {what}, not {sid}") if x
+            )
+        out.append(
+            Choice(name, sid, "missing", None, reason or "no directory of this name")
+        )
+    return out
+
+
+def build_command(spec: ModelSpec, layout: int, out: str, owners=()) -> str:
+    """The ``pf_registry.py build`` line that makes the missing keys of ``spec``
+    at ``layout`` in ``out`` (an overlay: shared roots are not written)."""
+    parts = [
+        "python3", os.path.abspath(__file__), "build",
+        "--model", spec.name, "--layout", str(layout), "--out", out,
+    ]  # fmt: skip
+    for r in owners:
+        parts += ["--root", f"{r.path}={r.owner.name}"]
+    return " ".join(parts)
+
+
 def _roots_from(args) -> list[Root]:
     roots = []
     for r in args.root or []:
         path, _, model = r.partition("=")
-        roots.append(Root(os.path.abspath(path), SPECS[model] if model else None))
+        roots.append(Root(os.path.abspath(path), model_spec(model) if model else None))
     return roots
 
 
@@ -563,7 +741,11 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("keys", "report", "build"):
         p = sub.add_parser(c)
-        p.add_argument("--model", required=True, choices=sorted(SPECS))
+        p.add_argument(
+            "--model",
+            required=True,
+            help="a model of template_registry.json, or a config.json path",
+        )
         p.add_argument("--layout", type=int, required=True)
         p.add_argument("--root", action="append", help="DIR[=MODEL] (repeatable)")
     sub.choices["build"].add_argument("--out", required=True)
@@ -577,19 +759,21 @@ def main(argv=None):
         dump_manifest(man)
         print(f"{MANIFEST}: {len(man['signatures'])} signatures")
         return
-    spec = SPECS[a.model]
+    spec = model_spec(a.model)
     if a.cmd == "keys":
         for n in keys_for(spec, a.layout):
             print(n, name_sig(n, spec)[0])
         return
     roots = _roots_from(a)
     if a.cmd == "report":
-        needs = status(spec, a.layout, scan(roots), load_manifest().get("reuse", {}))
-        print(json.dumps(summary(needs)))
-        for n in needs:
-            print(
-                f"{n.state:9s} {n.name:24s} {n.sig} {n.dirs[0]['dir'] if n.dirs else ''}"
-            )
+        ch = plan(spec, a.layout, roots, load_manifest().get("reuse", {}))
+        counts = {
+            h: sum(c.how == h for c in ch)
+            for h in ("exact", "by name", "reuse", "missing")
+        }
+        print(json.dumps({"keys": len(ch), **counts}))
+        for c in ch:
+            print(f"{c.how:9s} {c.name:24s} {c.sig} {c.dir or ''} {c.reason}".rstrip())
         return
     out = os.path.abspath(a.out)
     man = load_manifest()
