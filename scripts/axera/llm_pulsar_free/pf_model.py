@@ -107,6 +107,7 @@ MODELS = {
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
         fuse=8,
         add_offset="exact",
+        ksplit=True,
     ),
     "qwen3_0.6b": dict(
         repo="Qwen/Qwen3-0.6B",
@@ -158,6 +159,7 @@ class Config:
         fuse: int = 0,
         nl_tokens: tuple = (),
         add_offset: str = "pulsar2",
+        ksplit: bool = False,
     ):
         self.model, self.name, self.out = model, name, out
         #: tokens that run on the ``nl`` set (``pf_record.py``), when it exists
@@ -181,6 +183,9 @@ class Config:
         if add_offset not in ADD_OFFSETS:
             raise ValueError(f"add_offset={add_offset!r}: one of {ADD_OFFSETS}")
         self.add_offset = add_offset
+        #: the down linear (K = I) split along K in the fused programs that hold it
+        #: (``pf_templates.ksplit_name``); its width is absent at its N
+        self.ksplit = bool(ksplit)
         self.layer_programs = lay.layer_programs(self.qk_norm, self.fuse)
         self.post_programs = lay.post_programs(self.fuse)
         self.k_program = lay.k_program(self.qk_norm, self.fuse)
@@ -234,11 +239,37 @@ class Config:
         t = self._lg[li].run(None, feeds, intermediate=True)
         return {k: np.asarray(v, F32) for k, v in t.items()}
 
+    def embed_row(self, token) -> np.ndarray:
+        """The embedding of one token as the layer graphs' input ``[1, H]``."""
+        return self.model.embed([int(token)]).reshape(1, self.H).astype(F32)
+
+    def drop_layers(self, layers) -> None:
+        """Release the float graphs of ``layers`` (``layer_graph`` copies every weight
+        of a layer into its evaluator; ``pf_record``'s layer groups use this)."""
+        for li in layers:
+            self._lg.pop(li, None)
+        import ctypes
+        import gc
+
+        gc.collect()  # the evaluators' graphs can be in reference cycles
+        try:  # glibc keeps the freed graph copies' pages; give them back
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
+
+    def post_of(self, x):
+        """The final norm and the logits of hidden state ``x`` ``[1, H]``: ``(logits [V],
+        post intermediates incl. ``input``)``."""
+        pn = self._post.run(None, {"input": x}, intermediate=True)
+        pn = {k: np.asarray(v, F32) for k, v in pn.items()}
+        pn["input"] = x
+        return (pn["xn"].reshape(1, self.H) @ self.head_t).reshape(-1), pn
+
     def float_step(self, Ks, Vs, token, p, record=None):
         """Float decode step (all layers + post); writes slot ``p`` of every cache;
         ``record(li, t)`` sees each layer's intermediates. Returns (logits [V],
         post intermediates incl. ``input``)."""
-        x = self.model.embed([int(token)]).reshape(1, self.H).astype(F32)
+        x = self.embed_row(token)
         for li in range(self.L):
             t = self.float_layer(li, x, Ks[li], Vs[li], p)
             if record:
@@ -246,10 +277,7 @@ class Config:
             Ks[li][p] = t["K_cache_out"][self.S]
             Vs[li][p] = t["V_cache_out"][self.S]
             x = t["output"].reshape(1, self.H)
-        pn = self._post.run(None, {"input": x}, intermediate=True)
-        pn = {k: np.asarray(v, F32) for k, v in pn.items()}
-        pn["input"] = x
-        return (pn["xn"].reshape(1, self.H) @ self.head_t).reshape(-1), pn
+        return self.post_of(x)
 
     def kv_producer(self, st: str, li: int) -> tuple[str, str]:
         """``(where, program)`` that computes layer ``li``'s K row (and, with

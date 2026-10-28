@@ -1254,6 +1254,65 @@ Qwen3-0.6B also equals the shipped `F/n8o` set (first 23, rest 3 axmodels, 0 dif
 Since no width of these models is measured absent, `pf_registry.split_keys` returns their
 key lists unchanged, and the generation path is the pre-existing one.
 
+## Fused K-split (Qwen3-4B layout 8): status 2026-10-29, not working end to end
+
+**Status: the templates, the registry and the recorder are done; the layout-8 generation
+for 36 layers fails at layer 5, and no card check was run for Qwen3-4B's fused layers.**
+Everything below is measured; nothing here is a card result for the fused 4B path.
+
+**Which fused programs hold the absent K = 9728 table** (`tablecheck` on the compiled
+`npu_params` of each variant, its own weights and calibrated scales): `lanorm9728`,
+`slanorm9728`, `slanormqkr9728` and `alyrqkr4096` (the whole layer) hold the down linear
+with the table absent in every variant; their other linears are present. So the fused
+layers cannot use the unsplit down projection.
+
+**The K-split fused program.** The down linear is split along K into two K = 4864 linears
+(`KSPLIT_DOWN` in `pf_templates.py`: `Split` of the input, two `MatMul`s, one `Add`), both
+on one output grid as the standalone split (`pf_generate.ksplit_grids`). One execute per
+layer is kept: layout 8 still runs `alyrqkrk4096` per rest layer, `slanormk9728` for the
+last layer. The split is inside the program, so the execute count does not change. Names:
+`pf_templates.KSPLIT_BASE` / `ksplit_name` (`alyrqkrk`, `alyrfk`, `lanormk`, `slanormk`,
+`slanormqkk`, `slanormqkrk`); `ModelSpec.ksplit_down` (only `qwen3_4b`) and `Config.ksplit`
+switch them on. Shipped specs are unchanged (`ksplit_down` false; their signatures in
+`template_registry.json` are unchanged).
+
+**Builds** (`pf_registry.py build --model qwen3_4b --layout 8`, heavy lock):
+`k4864n2560`, `add9728`, `lanormk9728` (4 variants), `slanormk9728` (4),
+`slanormqkrk9728` (4) built. `alyrqkrk4096` (6 variants) failed in the parallel pass
+(Pulsar2 `Killed` inside the 2 GB container); each variant then built alone and passed.
+The build exited 0. The 20-key overlay for `pf_generate` is `U/tpl` (all exact).
+
+**The stale `k9728n2560`.** R's `k9728n2560` build says ok with its npu_params table
+absent (hits 0). `pf_registry.failed` now treats a linear whose width is measured absent
+at its N as not a template (`measured_absent`); the registry no longer counts it.
+
+**The 36-layer recording fits.** `pf_record.py` now runs layer-major in groups of layers
+(`--layers-per-group`, default 4; each layer's records go to disk when its group ends).
+Qwen3-0.6B: the staged recorder's output equals the pristine recorder's bit for bit
+(58 files, 1014 arrays). The 36-layer Qwen3-4B recording under the heavy lock with
+`MemoryMax=24G`: rc 0, peak 14.7 GB (per group: rest 3.6 -> 11.3 GB, then the first set
+flat near 13.3 GB). The growth is the `ref.Model` weight cache filling to its 3 GB cap
+(`llm_reference.DEFAULT_CACHE_BYTES`), confirmed with `tracemalloc` on 0.6B (245 MB of
+widened weights, then flat); the rest is allocator-held memory. The earlier kill at 24 GB
+was the per-layer records accumulating, not the graphs.
+
+**Layout-8 generation fails at layer 5.** `pf_generate.py both 0 35 --add-offset exact`
+(`LLM_PF_TEMPLATES` = the overlay) stops at `rest/L5/alyr.axmodel`, "no usable template":
+`alyrqkrk4096` variants 0 and 3 refuse the tie of the first norm's `d`/`u`/`x` (`d_1`'s range
+would widen past 4.0x), variants 1 and 2 need the `n32` Add shift 14 where the register
+holds 15, variants 4 and 5 refuse the RoPE tie (`cq` widens past 4.0x). The peak during
+that run was 23.9 GB (two workers). Log: `U/q4b/gen/gen.log`. Not fixed: the ties are
+Pulsar2 register sharing in the template, so a fix needs new variants whose calibration
+keeps those tensors' ranges within 4x at this layer.
+
+**Byte-identity of the shipped sets** (new code vs `origin/master`, layers 0-1, both sets,
+shared templates, `F/cmpset.py`): Qwen3-0.6B layouts 3, 5, 6, 7, 8, 9, 10, 11: 0 differing
+axmodels each (layout 8 vs `F/n8o`: not compared). llama-160m layouts 3 and 7: 0 differing.
+
+**Not measured:** host `FusedEval` checks of the K-split programs; the card checks
+(`pf_check` on layers 0, a middle fused layer and 35; the 48-step `pf_plan` decode against
+float); any Qwen3-4B ms per token. Estimates are not given here.
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two

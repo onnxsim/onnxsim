@@ -78,6 +78,7 @@
    "default_layout": 3,
    "eps": 1e-06,
    "hd": 64,
+   "ksplit_down": false,
    "layers": 12,
    "name": "llama160m",
    "nh": 12,
@@ -94,6 +95,7 @@
    "default_layout": 8,
    "eps": 1e-06,
    "hd": 128,
+   "ksplit_down": false,
    "layers": 28,
    "name": "qwen3_0.6b",
    "nh": 16,
@@ -117,6 +119,7 @@
    "default_layout": 8,
    "eps": 1e-06,
    "hd": 128,
+   "ksplit_down": true,
    "layers": 36,
    "name": "qwen3_4b",
    "nh": 32,
@@ -137,53 +140,6 @@
  "reuse": {},
  "schema": 1,
  "signatures": {
-  "01bf5db1f563abf2": {
-   "name": "alyrf4096",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "I": 9728,
-     "S": 128,
-     "eps": 1e-06,
-     "hd": 128,
-     "nh": 32,
-     "nkv": 8
-    },
-    "kind": "alyrf",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "MatMul",
-      "Add",
-      "Softmax",
-      "Transpose",
-      "Reshape",
-      "FullyConnected",
-      "Mul",
-      "ReduceMean",
-      "Sqrt",
-      "Div",
-      "Sigmoid",
-      "Silu"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {
-     "qk_norm": true
-    },
-    "widths": {
-     "n": 4096
-    }
-   }
-  },
   "0314c241cb9ac337": {
    "name": "rms768",
    "signature": {
@@ -213,41 +169,6 @@
     "variant": {},
     "widths": {
      "n": 768
-    }
-   }
-  },
-  "044015336c1e0227": {
-   "name": "lanorm9728",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "eps": 1e-06
-    },
-    "kind": "lanorm",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "FullyConnected",
-      "MatMul",
-      "Mul",
-      "ReduceMean",
-      "Add",
-      "Sqrt",
-      "Div"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {},
-    "widths": {
-     "n": 9728
     }
    }
   },
@@ -1094,6 +1015,96 @@
     }
    }
   },
+  "3724ad6d214d1b68": {
+   "name": "slanormk9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "slanormk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Split"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "ksplit": true
+    },
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
+  "3f81906688f5aae4": {
+   "name": "alyrqkrk4096",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "I": 9728,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alyrqkrk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 6
+    },
+    "schema": 1,
+    "variant": {
+     "ksplit": true,
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
   "41cd93367e61c3ab": {
    "name": "alyrf2048",
    "signature": {
@@ -1197,41 +1208,6 @@
     "variant": {},
     "widths": {
      "n": 2560
-    }
-   }
-  },
-  "49573cb45bceee57": {
-   "name": "nrml11264",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "eps": 1e-06
-    },
-    "kind": "nrml",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "FullyConnected",
-      "MatMul",
-      "Mul",
-      "ReduceMean",
-      "Add",
-      "Sqrt",
-      "Div"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {},
-    "widths": {
-     "n": 11264
     }
    }
   },
@@ -1538,6 +1514,52 @@
     }
    }
   },
+  "6754e052717562a8": {
+   "name": "slanormqkrk9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "slanormqkrk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "ksplit": true,
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
   "677854d62e5cd0d2": {
    "name": "nrmqkr1024",
    "signature": {
@@ -1797,57 +1819,6 @@
     }
    }
   },
-  "8e132b696db05e48": {
-   "name": "alyrqkrs4096",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "I": 9728,
-     "S": 128,
-     "eps": 1e-06,
-     "hd": 128,
-     "nh": 32,
-     "nkv": 8
-    },
-    "kind": "alyrqkrs",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "MatMul",
-      "Add",
-      "Softmax",
-      "Transpose",
-      "Reshape",
-      "FullyConnected",
-      "Mul",
-      "ReduceMean",
-      "Sqrt",
-      "Div",
-      "Sigmoid",
-      "Silu",
-      "Split",
-      "Concat"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 6
-    },
-    "schema": 1,
-    "variant": {
-     "qk_norm": true,
-     "rot": true,
-     "split": true
-    },
-    "widths": {
-     "n": 4096
-    }
-   }
-  },
   "9131dc60678eab34": {
    "name": "slanorm3072",
    "signature": {
@@ -1913,56 +1884,6 @@
     "variant": {},
     "widths": {
      "n": 1024
-    }
-   }
-  },
-  "a1f856d7aac7e246": {
-   "name": "alyrqkr4096",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "I": 9728,
-     "S": 128,
-     "eps": 1e-06,
-     "hd": 128,
-     "nh": 32,
-     "nkv": 8
-    },
-    "kind": "alyrqkr",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "MatMul",
-      "Add",
-      "Softmax",
-      "Transpose",
-      "Reshape",
-      "FullyConnected",
-      "Mul",
-      "ReduceMean",
-      "Sqrt",
-      "Div",
-      "Sigmoid",
-      "Silu",
-      "Split",
-      "Concat"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 8
-    },
-    "schema": 1,
-    "variant": {
-     "qk_norm": true,
-     "rot": true
-    },
-    "widths": {
-     "n": 4096
     }
    }
   },
@@ -2098,6 +2019,50 @@
     "widths": {
      "n": 3072,
      "n2": 3840
+    }
+   }
+  },
+  "b037d062d6da9d8b": {
+   "name": "slanormqkk9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "slanormqkk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape",
+      "Split"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "ksplit": true,
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 9728
     }
    }
   },
@@ -2336,6 +2301,44 @@
     }
    }
   },
+  "bf5ea4bdf9b2530a": {
+   "name": "lanormk9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "lanormk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Split"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "ksplit": true
+    },
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
   "c03e974fcdf3d1d3": {
    "name": "qkrope4096",
    "signature": {
@@ -2372,51 +2375,6 @@
     }
    }
   },
-  "c7e75bed22d73032": {
-   "name": "slanormqkr9728",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "eps": 1e-06,
-     "hd": 128,
-     "nh": 32,
-     "nkv": 8
-    },
-    "kind": "slanormqkr",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "FullyConnected",
-      "MatMul",
-      "Sigmoid",
-      "Mul",
-      "ReduceMean",
-      "Add",
-      "Sqrt",
-      "Div",
-      "Reshape",
-      "Split",
-      "Concat"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {
-     "qk_norm": true,
-     "rot": true
-    },
-    "widths": {
-     "n": 9728
-    }
-   }
-  },
   "c83b01af2410eae1": {
    "name": "attn2048",
    "signature": {
@@ -2449,42 +2407,6 @@
     "variant": {},
     "widths": {
      "n": 2048
-    }
-   }
-  },
-  "c8f5a0baccc442ab": {
-   "name": "slanorm9728",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "eps": 1e-06
-    },
-    "kind": "slanorm",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "FullyConnected",
-      "MatMul",
-      "Sigmoid",
-      "Mul",
-      "ReduceMean",
-      "Add",
-      "Sqrt",
-      "Div"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {},
-    "widths": {
-     "n": 9728
     }
    }
   },
@@ -2679,17 +2601,19 @@
     }
    }
   },
-  "d6afa17dc941691e": {
-   "name": "slanormqk9728",
+  "d56a259e28209073": {
+   "name": "alyrfk4096",
    "signature": {
     "dims": {
      "H": 2560,
+     "I": 9728,
+     "S": 128,
      "eps": 1e-06,
      "hd": 128,
      "nh": 32,
      "nkv": 8
     },
-    "kind": "slanormqk",
+    "kind": "alyrfk",
     "pulsar2": {
      "calibration_method": "MinMax",
      "draws": {
@@ -2699,25 +2623,30 @@
      "dtype": "U16",
      "image": "pulsar2:7.0-lite",
      "layer_ops": [
-      "FullyConnected",
       "MatMul",
-      "Sigmoid",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
       "Mul",
       "ReduceMean",
-      "Add",
       "Sqrt",
       "Div",
-      "Reshape"
+      "Sigmoid",
+      "Silu",
+      "Split"
      ],
      "npu_mode": "NPU1",
      "variants": 4
     },
     "schema": 1,
     "variant": {
+     "ksplit": true,
      "qk_norm": true
     },
     "widths": {
-     "n": 9728
+     "n": 4096
     }
    }
   },
@@ -2777,91 +2706,6 @@
     "widths": {
      "K": 768,
      "N": 3840
-    }
-   }
-  },
-  "de48bc01084db1b6": {
-   "name": "slanorml9728x11264",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "eps": 1e-06
-    },
-    "kind": "slanorml",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "FullyConnected",
-      "MatMul",
-      "Sigmoid",
-      "Mul",
-      "ReduceMean",
-      "Add",
-      "Sqrt",
-      "Div"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {},
-    "widths": {
-     "n": 9728,
-     "n2": 11264
-    }
-   }
-  },
-  "e78b068a00b9d63e": {
-   "name": "alyrf4096x151936",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "I": 9728,
-     "S": 128,
-     "eps": 1e-06,
-     "hd": 128,
-     "nh": 32,
-     "nkv": 8
-    },
-    "kind": "alyrf",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "MatMul",
-      "Add",
-      "Softmax",
-      "Transpose",
-      "Reshape",
-      "FullyConnected",
-      "Mul",
-      "ReduceMean",
-      "Sqrt",
-      "Div",
-      "Sigmoid",
-      "Silu"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 4
-    },
-    "schema": 1,
-    "variant": {
-     "qk_norm": true
-    },
-    "widths": {
-     "n": 4096,
-     "n2": 151936
     }
    }
   },

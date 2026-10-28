@@ -187,6 +187,26 @@ def ksplit_grids(x, w, y, kp):
     return sx, [g, g], g
 
 
+def ksplit_ranges(z, w, b, zr):
+    """The ranges of a down linear split along K inside a fused program (``norm2``'s
+    ``ksplit``): ``z`` at ``zr``, and ``b`` (the Add's output) and its parts ``bh``,
+    ``bl`` on the one grid of ``ksplit_grids`` (``(s, 32768)``), as the range
+    ``[-32768 s, 32767 s]`` that ``unsigned_minmax`` maps to that grid."""
+    z2 = np.asarray(z, F32).reshape(len(z), -1)
+    b2 = np.asarray(b, F32).reshape(len(b), -1)
+    kp = w.shape[0] // 2
+    _, _, (s, _) = ksplit_grids(z2, w, b2, kp)
+    g = [-32768.0 * s, 32767.0 * s]
+    return {"z": zr, "b": g, "bh": g, "bl": g}
+
+
+def wdown(w):
+    """The down linear's weights of a K-split program: the parts ``w`` (rows
+    ``0..K/2``) and ``wl`` (the rest), the template's initializers."""
+    kp = w.shape[0] // 2
+    return {"w": w[:kp].astype(F32), "wl": w[kp:].astype(F32)}
+
+
 class Generator:
     def __init__(self, cfg: pf_model.Config, root: str):
         self.cfg, self.root, self.out = cfg, root, cfg.out
@@ -655,6 +675,7 @@ class Generator:
         qkv=None,
         attn=None,
         ranges=False,
+        ksplit=False,
     ):
         """The two-pass RMSNorm as one program (``nrm<H>``), or with the
         residual Add before it (``anorm<H>``: ``x = a + b``, outputs ``x`` and
@@ -683,6 +704,8 @@ class Generator:
         H = self.cfg.H
         inits = tpl.graph(f"nrm{H}", tpl.Dims.of(self.cfg))[4]
         rgs = []
+        if ksplit and post is not None:
+            raise NotImplementedError("ksplit: a linear after the norm (layout 4)")
         if z is not None:
             rgs.append(
                 {
@@ -690,6 +713,8 @@ class Generator:
                     for t, v in (("z", z), ("b", b))
                 }
             )
+            if ksplit:  # the parts and their sum share one grid (``ksplit_ranges``)
+                rgs[-1] = ksplit_ranges(z, w, b, rgs[-1]["z"])
         if a is not None:
             rg, _ = self._stage(
                 "  x = Add(a, b)\n",
@@ -721,7 +746,7 @@ class Generator:
         name = f"anorm{H}" if a is not None else f"nrm{H}"
         if z is not None:
             name = f"lanorm{z.shape[-1]}"
-        weights = w
+        weights = wdown(w) if ksplit else w
         if post is not None:
             w2, x2, ys = post
             for r in rgs:  # the norm's own output is ``yn`` now
@@ -748,7 +773,7 @@ class Generator:
                 "k_rot": "kr",
                 "v_proj": "v",
             }
-            weights = {} if w is None else {"w": w}
+            weights = {} if w is None else (wdown(w) if ksplit else {"w": w})
             for part, n in cfg.QKV:
                 if cfg.fuse >= 6 and part in ("q_rot", "k_rot"):
                     continue  # rotated in the program (``nrmqkr`` / ``slanormqkr``)
@@ -842,6 +867,8 @@ class Generator:
             # the union of the attention's output and the linear's input range
             u_["o"] = u_["z"] = self._union({"t": u_["o"]}, {"t": u_["z"]})["t"]
             rgs = [u_]
+        if ksplit:
+            name = tpl.ksplit_name(name, self.cfg.I)
         if ranges:
             return rgs, name, weights, u, signed
         return self.merged(
@@ -1025,6 +1052,7 @@ class Generator:
                 z=r2("act"),
                 w=cfg.merged_weight("down_proj", li),
                 silu=(r2("gate"), r2("up")),
+                ksplit=cfg.ksplit,
             )
         elif split:
             ml["down_proj"] = self.lin(
@@ -1048,6 +1076,7 @@ class Generator:
                 b=dn,
                 z=r2("act"),
                 w=cfg.merged_weight("down_proj", li),
+                ksplit=cfg.ksplit,
             )
         man[w] = ml
 
@@ -1160,6 +1189,7 @@ class Generator:
                 w=cfg.merged_weight("down_proj", li),
                 silu=(r2(A, "gate"), r2(A, "up")),
                 post=nxt,
+                ksplit=cfg.ksplit,
             )
         for k in ("gu", "qkv5"):
             if k in ml:
@@ -1279,6 +1309,7 @@ class Generator:
                 w=cfg.merged_weight("down_proj", li),
                 silu=(r2(A, "gate"), r2(A, "up")),
                 qkv=li + 1 if "dnqk" in progs else None,
+                ksplit=cfg.ksplit,
             )
         for k in ("gu", "qkv5"):
             if k in ml:
@@ -1342,6 +1373,7 @@ class Generator:
             qkv=None if last else li + 1,
             post=head,
             ranges=True,
+            ksplit=cfg.ksplit,
         )
         rgs += [{("x_1" if t == "a" else t): r for t, r in rg.items()} for rg in rg2]
         wgu = cfg.merged_weight("gu", li)
@@ -1356,6 +1388,8 @@ class Generator:
             name, key = f"alyrf{cfg.nh * cfg.hd}", "alyrf"
             if head is not None:
                 name, key = f"{name}x{cfg.vocab}", "alyrfh"
+        if cfg.ksplit:  # the down linear split along K (``pf_templates.ksplit_name``)
+            name = tpl.ksplit_name(name, cfg.I)
         if split:
             name, key = f"alyrqkrs{cfg.nh * cfg.hd}", "alyrs"
             sw = cfg.merged_weight("gu", li, gptq=False)
@@ -1856,6 +1890,7 @@ def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None, plans=
         spec,
         split_layers=tuple(cfg.split_first["layers"]),
         split_keys=tuple(cfg.split_first["keys"]),
+        ksplit_down=bool(cfg.ksplit),
     )
     # the layer count is not compared: no template depends on it
     got = (spec.H, spec.I, spec.nh, spec.nkv, spec.hd, spec.eps, spec.vocab,

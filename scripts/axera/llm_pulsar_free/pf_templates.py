@@ -441,9 +441,75 @@ ADD_RANGES = [
 ]
 
 
+#: a fused program whose down linear (K = I) is absent from Pulsar2's npu_params
+#: (``linear_emit.table_in_params``; K = 9728 at N = 2560) splits it along K into two
+#: linears of K / 2 and an Add, both on one output grid (``pf_generate.ksplit_grids``):
+#: ``zk0, zk1`` are the input's halves (``Split``, data movement, calibrated as ``z``),
+#: ``w`` and ``wl`` the parts' weights. The Add is the exact integer sum (both ratios 1).
+KSPLIT_DOWN = """
+  zk0, zk1 = Split<axis=1>(z)
+  bh = MatMul(zk0, w)
+  bl = MatMul(zk1, wl)
+  b = Add(bh, bl)
+"""
+#: the K-split name (``ksplit_name``) of each kind whose down linear is K = I, and its
+#: unsplit kind (``graph``: ``<kind>k<n>`` is ``<kind><n>`` with the down linear split)
+KSPLIT_BASE = {
+    "alyrqkrk": "alyrqkr",
+    "alyrfk": "alyrf",
+    "lanormk": "lanorm",
+    "slanormk": "slanorm",
+    "slanormqkk": "slanormqk",
+    "slanormqkrk": "slanormqkr",
+}
+#: the kinds of ``KSPLIT_BASE`` (``pf_registry``: the K-split kinds)
+KSPLIT_KINDS = frozenset(KSPLIT_BASE)
+_KSPLIT_OF = {v: k for k, v in KSPLIT_BASE.items()}
+
+
+def ksplit_name(name: str, inter: int) -> str:
+    """The K-split name of template ``name`` when the down linear's K is ``inter`` (I):
+    ``alyrqkr<n>`` and ``alyrf<n>`` always (their down linear is the layer's), the
+    ``lanorm`` / ``slanorm`` / ``slanormqk(r)`` kinds of width ``inter`` only (their
+    width is the linear's K). Any other name is returned unchanged."""
+    m = re.fullmatch(r"(alyrqkr|alyrf|lanorm|slanormqkr|slanormqk|slanorm)(\d+)", name)
+    if not m:
+        return name
+    kind, n = m.group(1), int(m.group(2))
+    if not kind.startswith("alyr") and n != inter:
+        return name
+    return f"{_KSPLIT_OF[kind]}{n}"
+
+
+def ksplit_graph(base, d: Dims):
+    """``graph`` of a K-split kind: the unsplit graph ``base`` (``(ops, body, ins, outs,
+    inits, gens)``) with its down linear ``b = MatMul(z, w)`` as ``KSPLIT_DOWN``. The
+    parts' weights are the halves of the unsplit ``w`` (the generators keep the whole
+    ``w``: their ``b`` is the sum of the halves)."""
+    ops, body, ins, outs, inits, gens = base
+    old = "  b = MatMul(z, w)\n"
+    if body.count(old) != 1:
+        raise ValueError(f"ksplit: {body.count(old)} down linears, one expected")
+    w = inits["w"]
+    if w.shape[0] != d.I or w.shape[0] % 2:
+        raise ValueError(f"ksplit: the down linear's K {w.shape[0]} is not I = {d.I}")
+    kp = w.shape[0] // 2
+    inits = {**inits, "w": w[:kp].copy(), "wl": w[kp:].copy()}
+    ops = list(dict.fromkeys([*ops, "Split"]))
+    return ops, body.replace(old, KSPLIT_DOWN), ins, outs, inits, gens
+
+
 def graph(name: str, d: Dims):
     """``(op types, body, inputs {name: shape}, output shape, initializers,
     variant generators)`` of a fused template ``name``."""
+    mk = re.fullmatch(
+        r"(alyrqkrk|alyrfk|lanormk|slanormk|slanormqkk|slanormqkrk)(\d+)", name
+    )
+    if mk and mk.group(1) == "alyrqkrk":  # its variants as ``alyrqkr``'s split ones
+        return _lyr_graph(int(mk.group(2)), d, rot=True, attn=True, ksplit=True)
+    if mk:  # the unsplit graph of the same width, its down linear split
+        base = KSPLIT_BASE[mk.group(1)] + mk.group(2)
+        return ksplit_graph(graph(base, d), d)
     m = re.fullmatch(
         r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
         r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk|alanorml?"
@@ -740,6 +806,7 @@ def _lyr_graph(
     attn: bool = False,
     tail: str | None = None,
     split: bool = False,
+    ksplit: bool = False,
 ):
     """``lyrqk<n>``: ``lanorm<n>`` + gate / up linears + ``slanormqk<I>``
     (``lyrqkr<n>``: ``slanormqkr<I>``, q / k rotated in the program;
@@ -763,6 +830,10 @@ def _lyr_graph(
     if split:
         mid = SPLIT_MID
         b2 = b2.replace("  b = MatMul(z, w)\n", SPLIT_DOWN)
+    if ksplit:  # the down linear as two halves of K (``KSPLIT_DOWN``)
+        if b2.count("  b = MatMul(z, w)\n") != 1:
+            raise ValueError(f"ksplit: the tail {tail} has no down linear")
+        b2 = b2.replace("  b = MatMul(z, w)\n", KSPLIT_DOWN)
     body = b1 + mid + b2
     ins = {lyr_name(k): v for k, v in ins1.items()} | {"g": [1, d.H]}
     if qk:
@@ -770,6 +841,11 @@ def _lyr_graph(
     inits = {lyr_name(k): v for k, v in in1.items()}
     inits |= {"wg": template_weight(d.H, d.I, 11), "wu": template_weight(d.H, d.I, 12)}
     inits |= in2
+    if ksplit:  # the parts' weights: the halves of the down linear's ``w``
+        inits["w"], inits["wl"] = (
+            inits["w"][: d.I // 2].copy(),
+            inits["w"][d.I // 2 :].copy(),
+        )
     if split:  # the second parts: about a weight rounding step (~1 / 256)
         for t, (k, m), seed in (("wgl", (d.H, d.I), 13), ("wul", (d.H, d.I), 14)):
             inits[t] = (template_weight(k, m, seed) * F(SPLIT_LO)).astype(F)
@@ -779,7 +855,9 @@ def _lyr_graph(
     # shift 15, as every real o_proj target) with slanormqk's v1..v3 (q / k
     # RoPE Adds at lower shifts)
     variants = ALYR_VARIANTS if attn else LYR_VARIANTS
-    if split:  # lanorm's v2 / v3 halves (v6, v7) gave wrong x / yq / v on the card
+    if (
+        split or ksplit
+    ):  # lanorm's v2 / v3 halves (v6, v7) gave wrong x / yq / v on the card
         variants = [v for v in variants if v[0] == 0]
     for i, j, ks in variants if qk else ALYRF_VARIANTS:
         ga, gb = g1s[i], g2s[j]
@@ -797,6 +875,8 @@ def _lyr_graph(
     ops = [*ops1, "FullyConnected", "MatMul", "Sigmoid", "Mul", "Silu", *ops2]
     if not attn:  # the order the lyrqk templates were built with
         ops = ["FullyConnected", "MatMul", "Sigmoid", "Mul", "Silu", *ops2]
+    if ksplit:
+        ops = [*ops, "Split"]
     ops = list(dict.fromkeys(ops))
     return ops, body, ins, outs2, inits, gens
 
@@ -896,6 +976,10 @@ def needed(cfg) -> list[str]:
     qkv = sum(n for _, n in cfg.QKV)
     names += [f"k{H}n{qkv}", f"k{qd}n{H}", f"k{H}n{2 * inter}", f"k{inter}n{H}"]
     names += [f"k{H}n{cfg.vocab}"]
+    if getattr(cfg, "ksplit", False) and getattr(cfg, "fuse", 0):
+        if cfg.fuse == 4 or cfg.fuse >= 10:  # layout 4: a linear after the norm
+            raise NotImplementedError(f"ksplit: layout {cfg.fuse} is not wired")
+        names = [ksplit_name(n, inter) for n in names]
     return list(dict.fromkeys(names))
 
 

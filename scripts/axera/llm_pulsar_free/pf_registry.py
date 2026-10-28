@@ -109,15 +109,33 @@ DEPS = {
     "alyrqkr": LAYER,
     "alyrqkrs": LAYER,
     "alyrf": LAYER,
+    # the K-split kinds (``pf_templates.KSPLIT_BASE``): the down linear as two halves
+    "lanormk": NORM,
+    "slanormk": NORM,
+    "slanormqkk": NORM + QK,
+    "slanormqkrk": NORM + QK,
+    "alyrqkrk": LAYER,
+    "alyrfk": LAYER,
 }
 #: kinds that exist only with a per-head q / k norm (``rope``: without one)
 QK_KINDS = {
     "qkrope", "hcrms", "qkf", "nrmqk", "nrmqkr", "slanormqk", "slanormqkr",
     "lyrqk", "lyrqkr", "alyrqk", "alyrqkr", "alyrqkrs", "alyrf",
+    "slanormqkk", "slanormqkrk", "alyrqkrk", "alyrfk",
 }  # fmt: skip
 #: rotate_half made in the program (Split / Concat), not by two linears
-ROT_KINDS = {"nrmqkr", "slanormqkr", "lyrqkr", "alyrqkr", "alyrqkrs"}
+ROT_KINDS = {"nrmqkr", "slanormqkr", "lyrqkr", "alyrqkr", "alyrqkrs",
+             "slanormqkrk", "alyrqkrk"}  # fmt: skip
 SPLIT_KINDS = {"alyrqkrs"}
+#: the down linear split along K in two (``pf_templates.KSPLIT_BASE``; variant ``ksplit``)
+KSPLIT_KINDS = {
+    "lanormk",
+    "slanormk",
+    "slanormqkk",
+    "slanormqkrk",
+    "alyrqkrk",
+    "alyrfk",
+}
 
 _NAME = re.compile(r"([a-z]+?)(\d+)(?:x(\d+))?(t?)")
 _LINEAR = re.compile(r"k(\d+)n(\d+)")
@@ -175,6 +193,9 @@ class ModelSpec:
     split_layers: tuple = ()
     split_keys: tuple = ()
     default_layout: int = 0
+    #: the down linear (K = I) is absent at its N: the fused programs that hold it
+    #: split it along K (``pf_templates.ksplit_name``); the shipped models: False
+    ksplit_down: bool = False
 
     @property
     def kvd(self) -> int:
@@ -231,7 +252,7 @@ SPECS = {
     "qwen3_4b": ModelSpec(
         "qwen3_4b", H=2560, I=9728, nh=32, nkv=8, hd=128, eps=1e-06,
         vocab=151936, layers=36, qk_norm=True, split_layers=(0, 1, 2),
-        split_keys=("gu", "down_proj"), default_layout=8,
+        split_keys=("gu", "down_proj"), default_layout=8, ksplit_down=True,
     ),
 }  # fmt: skip
 
@@ -254,6 +275,7 @@ class _Cfg:
             "keys": list(spec.split_keys),
         }
         self.fuse = int(layout)  # fmt: skip
+        self.ksplit = bool(spec.ksplit_down)
 
 
 def keys_for(spec: ModelSpec, layout: int, man: dict | None = None) -> list[str]:
@@ -318,6 +340,8 @@ def signature(name: str, d: tpl.Dims) -> dict:
         variant["rot"] = True
     if p.kind in SPLIT_KINDS:
         variant["split"] = True
+    if p.kind in KSPLIT_KINDS:
+        variant["ksplit"] = True
     widths = {"n": p.n} | ({"n2": p.n2} if p.n2 is not None else {})
     return {
         "schema": SCHEMA,
@@ -411,10 +435,30 @@ def owner_of(root: "Root", d: str) -> ModelSpec | None:
     return shipped_owner(d)
 
 
+@functools.lru_cache(maxsize=1)
+def _default_manifest() -> dict:
+    return load_manifest()
+
+
+def measured_absent(name: str, man: dict | None = None) -> bool:
+    """A linear ``k<K>n<N>`` whose width is measured absent at its N (the manifest's
+    ``linear_widths``). Its build is no template, whatever its ``result.json`` says: a
+    build made before the table check ran can say ok with the table missing."""
+    m = _LINEAR.fullmatch(name)
+    if not m:
+        return False
+    e = widths_entry(man if man is not None else _default_manifest(), int(m[2]))
+    rec = e.get("measured", {}).get(m[1])
+    return rec is not None and not rec.get("present")
+
+
 def failed(d: str) -> bool:
     """A template whose build failed (``result.json`` ok false: Pulsar2, or the
-    builder-side weight-table check of a linear). Such a directory is no template."""
+    builder-side weight-table check of a linear), or a linear whose width is measured
+    absent (``measured_absent``). Such a directory is no template."""
     rj = os.path.join(d, "result.json")
+    if measured_absent(os.path.basename(os.path.normpath(d))):
+        return True
     return os.path.exists(rj) and json.load(open(rj)).get("ok") is False
 
 
@@ -724,7 +768,11 @@ def manifest_for(specs=None, layouts=LAYOUTS) -> dict:
     sigs = {}
     for spec in specs.values():
         for layout in layouts:
-            for name in keys_for(spec, layout):
+            try:
+                names = keys_for(spec, layout)
+            except NotImplementedError:  # a layout the spec's K-split is not wired for
+                continue
+            for name in names:
                 sid, sig = name_sig(name, spec)
                 sigs.setdefault(sid, {"name": name, "signature": sig})
     man = {
