@@ -1,0 +1,3019 @@
+{
+ "models": {
+  "llama160m": {
+   "H": 768,
+   "I": 3072,
+   "S": 128,
+   "default_layout": 3,
+   "eps": 1e-06,
+   "hd": 64,
+   "layers": 12,
+   "name": "llama160m",
+   "nh": 12,
+   "nkv": 12,
+   "qk_norm": false,
+   "split_keys": [],
+   "split_layers": [],
+   "vocab": 32000
+  },
+  "qwen3_0.6b": {
+   "H": 1024,
+   "I": 3072,
+   "S": 128,
+   "default_layout": 8,
+   "eps": 1e-06,
+   "hd": 128,
+   "layers": 28,
+   "name": "qwen3_0.6b",
+   "nh": 16,
+   "nkv": 8,
+   "qk_norm": true,
+   "split_keys": [
+    "gu",
+    "down_proj"
+   ],
+   "split_layers": [
+    0,
+    1,
+    2
+   ],
+   "vocab": 151936
+  },
+  "qwen3_4b": {
+   "H": 2560,
+   "I": 9728,
+   "S": 128,
+   "default_layout": 8,
+   "eps": 1e-06,
+   "hd": 128,
+   "layers": 36,
+   "name": "qwen3_4b",
+   "nh": 32,
+   "nkv": 8,
+   "qk_norm": true,
+   "split_keys": [
+    "gu",
+    "down_proj"
+   ],
+   "split_layers": [
+    0,
+    1,
+    2
+   ],
+   "vocab": 151936
+  }
+ },
+ "reuse": {},
+ "schema": 1,
+ "signatures": {
+  "01bf5db1f563abf2": {
+   "name": "alyrf4096",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "I": 9728,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alyrf",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "0314c241cb9ac337": {
+   "name": "rms768",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "rms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "044015336c1e0227": {
+   "name": "lanorm9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "lanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
+  "054c9d123bf9d772": {
+   "name": "k2560n151936",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 2560,
+     "N": 151936
+    }
+   }
+  },
+  "08dd464edd682609": {
+   "name": "slanorm3072",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06
+    },
+    "kind": "slanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "0992f8cb8ef23aaf": {
+   "name": "add19456",
+   "signature": {
+    "dims": {},
+    "kind": "add",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "ends": 2,
+      "seed": 100
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Add"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 19456
+    }
+   }
+  },
+  "0a58c7d9297c3d55": {
+   "name": "k768n32000",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 768,
+     "N": 32000
+    }
+   }
+  },
+  "0c10c49c228b0234": {
+   "name": "anorm1024",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "anorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "100280c90203b6f7": {
+   "name": "add768",
+   "signature": {
+    "dims": {},
+    "kind": "add",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "ends": 2,
+      "seed": 100
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Add"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "1113fb18c4d857ee": {
+   "name": "nrmqkr2560",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "nrmqkr",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "13782eb39ca06ca0": {
+   "name": "add1024",
+   "signature": {
+    "dims": {},
+    "kind": "add",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "ends": 2,
+      "seed": 100
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Add"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "140ff66fddd3c6fd": {
+   "name": "k2560n19456",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 2560,
+     "N": 19456
+    }
+   }
+  },
+  "14eac1e8f674dfc9": {
+   "name": "slanormqkr3072",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "slanormqkr",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "1707fb54adf79a1d": {
+   "name": "nrmqk1024",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "nrmqk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "1b7ad198cf314f67": {
+   "name": "nrmqk2560",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "nrmqk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "1c69e12fdeb69e76": {
+   "name": "attn4096",
+   "signature": {
+    "dims": {
+     "S": 128,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "attn",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "20556a91983523f3": {
+   "name": "lanorm2048",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06
+    },
+    "kind": "lanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "217981a71f36acc2": {
+   "name": "qkrope2048t",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "qkrope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "alt": true,
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "22b3bf7a1aa22e68": {
+   "name": "qkrope2048",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "qkrope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "287f6367d8dbecee": {
+   "name": "add2560",
+   "signature": {
+    "dims": {},
+    "kind": "add",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "ends": 2,
+      "seed": 100
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Add"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "2ae095cc818a0a7c": {
+   "name": "attn768",
+   "signature": {
+    "dims": {
+     "S": 128,
+     "hd": 64,
+     "nh": 12,
+     "nkv": 12
+    },
+    "kind": "attn",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "2bd614e2b00ef036": {
+   "name": "alanorml2048x6144",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "alanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2048,
+     "n2": 6144
+    }
+   }
+  },
+  "2bde11d5a25edc7c": {
+   "name": "k2560n11264",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 2560,
+     "N": 11264
+    }
+   }
+  },
+  "2ca4b3d7456ed7e5": {
+   "name": "qkf4096",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "qkf",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "2f87e1e2bd3d331b": {
+   "name": "anorm2560",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "anorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "30f7110d2d8b5ba2": {
+   "name": "alanorml4096x19456",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 4096,
+     "n2": 19456
+    }
+   }
+  },
+  "34b90e651c7483df": {
+   "name": "k3072n768",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 3072,
+     "N": 768
+    }
+   }
+  },
+  "35e829ef9780157c": {
+   "name": "k2048n1024",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 2048,
+     "N": 1024
+    }
+   }
+  },
+  "41cd93367e61c3ab": {
+   "name": "alyrf2048",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "I": 3072,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "alyrf",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "4311d2491bf5658d": {
+   "name": "k4096n2560",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 4096,
+     "N": 2560
+    }
+   }
+  },
+  "46c985e5f8bccc85": {
+   "name": "crms2560",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "crms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "49573cb45bceee57": {
+   "name": "nrml11264",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "nrml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 11264
+    }
+   }
+  },
+  "4c0a3d07984b7c63": {
+   "name": "lanorm4096",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "lanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "4d746755b96d3ca0": {
+   "name": "rms2560",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "rms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "537fef28c9df4d0d": {
+   "name": "rope768",
+   "signature": {
+    "dims": {},
+    "kind": "rope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "Add"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": false
+    },
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "566e186fd1343359": {
+   "name": "rms1024",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "rms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "63fc712a64e7812f": {
+   "name": "anorm768",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "anorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "647d7e84d3c002b1": {
+   "name": "qkrope4096t",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "qkrope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "alt": true,
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "656a48674431a2d2": {
+   "name": "qkrope1024",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "qkrope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "6650c2fb41ad7061": {
+   "name": "nrm2560",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "nrm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2560
+    }
+   }
+  },
+  "66b6c28dc2bf3542": {
+   "name": "qkf2048",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "qkf",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "677854d62e5cd0d2": {
+   "name": "nrmqkr1024",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "nrmqkr",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "6bf20d19daa688c7": {
+   "name": "lanorm3072",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06
+    },
+    "kind": "lanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "6ed10ac2223ba067": {
+   "name": "alyrqkr2048",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "I": 3072,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "alyrqkr",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 8
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "7d61e4064fc86709": {
+   "name": "k3072n1024",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 3072,
+     "N": 1024
+    }
+   }
+  },
+  "7e5e01125b7922e1": {
+   "name": "lanorml768x6144",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "eps": 1e-06
+    },
+    "kind": "lanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768,
+     "n2": 6144
+    }
+   }
+  },
+  "8d9514bb74ea3a14": {
+   "name": "nrml3840",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "eps": 1e-06
+    },
+    "kind": "nrml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3840
+    }
+   }
+  },
+  "8def8bbd810fd429": {
+   "name": "crms768",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "crms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "8e132b696db05e48": {
+   "name": "alyrqkrs4096",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "I": 9728,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alyrqkrs",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 6
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true,
+     "split": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "9131dc60678eab34": {
+   "name": "slanorm3072",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "eps": 1e-06
+    },
+    "kind": "slanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "9e62bc589923ca3e": {
+   "name": "crms1024",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "crms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "a1f856d7aac7e246": {
+   "name": "alyrqkr4096",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "I": 9728,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alyrqkr",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 8
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "a4abbd33a7f6bba5": {
+   "name": "lanorm768",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "eps": 1e-06
+    },
+    "kind": "lanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "a64823c2bc1022e8": {
+   "name": "k768n768",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 768,
+     "N": 768
+    }
+   }
+  },
+  "a6a13cda25aee204": {
+   "name": "lanorml2048x6144",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06
+    },
+    "kind": "lanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2048,
+     "n2": 6144
+    }
+   }
+  },
+  "af336daddce06a65": {
+   "name": "slanorml3072x3840",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "eps": 1e-06
+    },
+    "kind": "slanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072,
+     "n2": 3840
+    }
+   }
+  },
+  "b0d0c9eee31a40e4": {
+   "name": "silu3072",
+   "signature": {
+    "dims": {},
+    "kind": "silu",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Sigmoid",
+      "Mul"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "b20d7f244cea751e": {
+   "name": "k9728n2560",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 9728,
+     "N": 2560
+    }
+   }
+  },
+  "b2fbea3e4f8c9b51": {
+   "name": "nrml7168",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06
+    },
+    "kind": "nrml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 7168
+    }
+   }
+  },
+  "b41eb9b243adf0af": {
+   "name": "lanorml4096x19456",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "lanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 4096,
+     "n2": 19456
+    }
+   }
+  },
+  "b5f271c1176600f5": {
+   "name": "nrm1024",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "nrm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "b78a165110cc1c95": {
+   "name": "k1024n151936",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 1024,
+     "N": 151936
+    }
+   }
+  },
+  "bd3678de3fd6d152": {
+   "name": "alyrqkrs2048",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "I": 3072,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "alyrqkrs",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 6
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true,
+     "split": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "c03e974fcdf3d1d3": {
+   "name": "qkrope4096",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "qkrope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
+  "c7e75bed22d73032": {
+   "name": "slanormqkr9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "slanormqkr",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
+  "c83b01af2410eae1": {
+   "name": "attn2048",
+   "signature": {
+    "dims": {
+     "S": 128,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "attn",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "c8f5a0baccc442ab": {
+   "name": "slanorm9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "slanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
+  "cd45cc6581caf41a": {
+   "name": "alyrf2048x151936",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "I": 3072,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "alyrf",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2048,
+     "n2": 151936
+    }
+   }
+  },
+  "cd97a64d897b9831": {
+   "name": "slanorml3072x7168",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06
+    },
+    "kind": "slanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072,
+     "n2": 7168
+    }
+   }
+  },
+  "cf3a95ac69c2c6a7": {
+   "name": "k768n6144",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 768,
+     "N": 6144
+    }
+   }
+  },
+  "d1b8a209153d2bbb": {
+   "name": "qkrope1024t",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "qkrope",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "alt": true,
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 1024
+    }
+   }
+  },
+  "d2d1d3e1cdfba3a6": {
+   "name": "slanormqk3072",
+   "signature": {
+    "dims": {
+     "H": 1024,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 16,
+     "nkv": 8
+    },
+    "kind": "slanormqk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "d6afa17dc941691e": {
+   "name": "slanormqk9728",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "slanormqk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
+  "d81409c72a9527ac": {
+   "name": "nrm768",
+   "signature": {
+    "dims": {
+     "eps": 1e-06
+    },
+    "kind": "nrm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "d969d8a38a4b0a51": {
+   "name": "k768n3840",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 768,
+     "N": 3840
+    }
+   }
+  },
+  "de48bc01084db1b6": {
+   "name": "slanorml9728x11264",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "eps": 1e-06
+    },
+    "kind": "slanorml",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Sigmoid",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 9728,
+     "n2": 11264
+    }
+   }
+  },
+  "e78b068a00b9d63e": {
+   "name": "alyrf4096x151936",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "I": 9728,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alyrf",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 4096,
+     "n2": 151936
+    }
+   }
+  },
+  "e79c4bf194537247": {
+   "name": "add6144",
+   "signature": {
+    "dims": {},
+    "kind": "add",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "ends": 2,
+      "seed": 100
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Add"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 6144
+    }
+   }
+  },
+  "ea99b8f6342c5d74": {
+   "name": "alanorm768",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 64,
+     "nh": 12,
+     "nkv": 12
+    },
+    "kind": "alanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 768
+    }
+   }
+  },
+  "ed929c68c099628e": {
+   "name": "silu9728",
+   "signature": {
+    "dims": {},
+    "kind": "silu",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Sigmoid",
+      "Mul"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 9728
+    }
+   }
+  },
+  "ee8c12a112c68072": {
+   "name": "lanorm3072",
+   "signature": {
+    "dims": {
+     "H": 768,
+     "eps": 1e-06
+    },
+    "kind": "lanorm",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected",
+      "MatMul",
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "n": 3072
+    }
+   }
+  },
+  "f19def04ade4e12b": {
+   "name": "hcrms2048",
+   "signature": {
+    "dims": {
+     "eps": 1e-06,
+     "hd": 128
+    },
+    "kind": "hcrms",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "Mul",
+      "ReduceMean",
+      "Add",
+      "Sqrt",
+      "Div",
+      "Reshape"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 4
+    },
+    "schema": 1,
+    "variant": {
+     "qk_norm": true
+    },
+    "widths": {
+     "n": 2048
+    }
+   }
+  },
+  "f3a6ec7d70ace908": {
+   "name": "k1024n7168",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 1024,
+     "N": 7168
+    }
+   }
+  },
+  "f6c16ea9d8c71c68": {
+   "name": "k1024n6144",
+   "signature": {
+    "dims": {},
+    "kind": "linear",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 16,
+      "seed": 0
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "FullyConnected"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 1
+    },
+    "schema": 1,
+    "variant": {},
+    "widths": {
+     "K": 1024,
+     "N": 6144
+    }
+   }
+  }
+ }
+}

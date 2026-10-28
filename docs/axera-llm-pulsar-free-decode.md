@@ -993,10 +993,60 @@ the code it replaced. No card run was needed.
    changed. Check by perturbing each input in turn.
 2. **Templates named by their full dims** (eps, heads, head size, context): a checkpoint
    whose dims match another's could reuse its templates without any Pulsar2 run.
-   Today the names carry the widths only, so a shared root is not safe.
+   The registry ("Template registry" above) now has the signatures and the verified-reuse
+   check; `pf_generate.py` still resolves by name, so wiring it in is the next step.
 
 Moving the weight tables and the quantization parameters to CUDA is not on the list:
 after the changes above they take about 7.5 s of a 94 s serial set.
+
+## Template registry (`pf_registry.py`)
+
+Template names carry the widths only (`nrm1024`, `alyrqkr2048`). The dims that change
+a template's records are not in the name: eps, heads and head size, the context, the q / k
+norm, the graph variant, and the Pulsar2 config. `pf_registry.py` gives every template a
+canonical signature and says which templates a model needs and which are missing.
+
+- **Signature** (`signature(name, dims)`): `kind` and `widths` (the numbers in the name; a
+  linear's `K` and `N`); `dims` (the `Dims` fields the kind reads: `eps` for the norms, `hd`
+  for the q / k norm, `nh` / `nkv` / `hd` / `S` for attention, `H` / `I` for the layer kinds;
+  rope, SiLU and the linears read none of them); `variant` (`qk_norm` for kinds that exist
+  only with a q / k norm and for `rope`, `alt` for the `t` suffix, `rot` for rotate_half in the
+  program, `split` for the split first-set layers); `pulsar2` (image, NPU1, U16, MinMax, the
+  layer ops, the variant count, the calibration draws). `sig_id` is the first 16 hex digits of
+  SHA-256 over the canonical JSON.
+- **Keys** (`keys_for(spec, layout)`): `pf_templates.needed` for a `ModelSpec` (dims, eps,
+  heads, the q / k norm, the split first set). The list is the same one, so shipped names
+  do not change.
+- **States** (`status`): `exact` (a directory with the same `sig_id`), `verified` (a stored
+  reuse record says `compare_jobs` is equal on every variant against a directory that exists),
+  `check` (no exact match, but a directory of the same name and another signature: a fresh
+  build is compared with it, and the verdict is stored), `missing` (a build).
+- **Aliases.** A directory with no `signature.json` (every shipped template) is found by its
+  owner's dims, and one written by `resolve` is found by its signature. The names still
+  resolve, and `template_dir` is unchanged.
+- **Manifest.** `template_registry.json` (next to `pf_registry.py`) holds the model specs
+  (from their Hugging Face configs), the signatures of every key of the shipped models and of
+  Qwen3-4B at every layout, and the reuse records. Directories `resolve` builds carry a
+  `signature.json`; the shared directories are not edited.
+- **Not wired yet.** `pf_generate.py` still resolves templates by name (`template_dir`). A
+  model served by a verified reuse needs that call changed to the registry; this section does
+  not do it.
+
+Third model: Qwen3-4B's dims (`config.json` of its AWQ repository in the HF cache; the
+template builds need no checkpoint), layout 8, split first set as Qwen3-0.6B's (assumed). It
+needs 20 keys (69 Pulsar2 units: 4 variants per fused key, 8 for `alyrqkr`, 5 linears, 2
+Adds). None exists yet: 0 exact, 0 verified, 0 checked, 20 built. All 69 builds succeeded in
+24 min 38 s wall (`--jobs 8`, 20 GB of caps; the `k2560n151936` lm_head linear is the long
+pole). Four `alyrqkr4096` variants failed in the parallel pass and were rebuilt alone. Summed
+per-build time 3848 s. Built into `R/templates` (an overlay, not the shared directories).
+
+**Byte-identity** (this branch vs master's code, `pf_generate.py both 0 1`, the same shared
+templates; `F/cmpset.py`): Qwen3-0.6B layouts 5, 6, 7, 8, 9, 10, 11 and llama-160m layouts 3
+and 7: every `.axmodel` of layers 0-1 of both sets equal (Qwen 7 / 23 / 3 / 3 / 23 / 23 /
+3 / 3 axmodels; llama 15 / 15 / 13 / 13). Layout 8 also equals the shipped `F/n8o` set,
+and llama layout 3 equals the shipped `l3` set. The references named in the brief
+(`n5b`, `A/n6`, `B/n8`, `C/n7`, `C/l6`) are gone from the work directory, so those layouts
+have only the pristine-master comparison.
 
 ## Limits
 
