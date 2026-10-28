@@ -815,3 +815,24 @@ def emit_linear_u16(
     params = next(i for i in out.graph.initializer if i.name == "npu_params")
     params.raw_data = linear_params_u16(bytes(params.raw_data), w, s_x, zp_x, s_y, zp_y)
     return out
+
+
+def table_in_params(params: bytes, table: bytes) -> bool:
+    """True when the weight table appears exactly once in ``npu_params``. A width
+    Pulsar2 does not lay out the rule's way compiles with the table absent or moved
+    (K = 6144 and 9728 at N = 2560; K = 4864, 5888 present): the check, not the size."""
+    return bool(table) and params.count(table) == 1
+
+
+def linear_table_present(
+    compiled: str, w: np.ndarray, s_x: float, zp_x: int, s_y: float, zp_y: int
+) -> bool:
+    """The presence check on a compiled U16 linear: its ``npu_params`` holds the table
+    of ``w`` at the calibrated scales ``s_x, zp_x, s_y, zp_y`` exactly once."""  # fmt: skip
+    m = gs.load_model(compiled)
+    params = bytes(
+        next(i for i in m.graph.initializer if i.name == "npu_params").raw_data
+    )
+    tab = linear_params_u16(b"", np.asarray(w, np.float32), s_x, zp_x, s_y, zp_y,
+                            table_only=True)  # fmt: skip
+    return table_in_params(params, tab)

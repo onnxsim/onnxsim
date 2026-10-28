@@ -409,6 +409,13 @@ def owner_of(root: "Root", d: str) -> ModelSpec | None:
     return shipped_owner(d)
 
 
+def failed(d: str) -> bool:
+    """A template whose build failed (``result.json`` ok false: Pulsar2, or the
+    builder-side weight-table check of a linear). Such a directory is no template."""
+    rj = os.path.join(d, "result.json")
+    return os.path.exists(rj) and json.load(open(rj)).get("ok") is False
+
+
 def scan(roots: list[Root]) -> dict[str, list[dict]]:
     """``sig_id`` -> the directories of that signature, over the roots."""
     found: dict[str, list[dict]] = {}
@@ -424,6 +431,8 @@ def scan(roots: list[Root]) -> dict[str, list[dict]]:
                 try:
                     parse(name)
                 except ValueError:
+                    continue
+                if failed(d):
                     continue
                 sf = os.path.join(d, SIG_FILE)
                 owner = owner_of(root, d)
@@ -487,6 +496,64 @@ def summary(needs: list[Need]) -> dict:
     out = {"keys": len(needs)}
     for s in ("exact", "verified", "check", "missing"):
         out[s] = sum(1 for n in needs if n.state == s)
+    return out
+
+
+# ---- linear widths (Pulsar2's weight-table limit) -----------------------------------
+#: a linear's U16 weight table is absent from Pulsar2's npu_params at some input widths
+#: (measured per output width N; ``linear_emit.linear_table_present``). Absence is not
+#: monotone in K (K = 5456 absent, 5888 present at N = 2560), so a width is used only
+#: if it was measured present at its N. The manifest's ``linear_widths[N].measured``
+#: holds each K's verdict and its source. A K that is not measured present is split into
+#: the smallest equal count of measured-present parts, the parts sharing one template and
+#: one residual Add (``add<N>``, both inputs at the Add's scale).
+_LINEAR = re.compile(r"k(\d+)n(\d+)")
+
+
+def widths_entry(man: dict, n: int) -> dict:
+    return man.get("linear_widths", {}).get(str(n), {})
+
+
+def safe_widths(man: dict, n: int) -> list[int]:
+    """The widths measured present at output width ``n``, ascending."""
+    meas = widths_entry(man, n).get("measured", {})
+    return sorted(int(k) for k, v in meas.items() if v.get("present"))
+
+
+def linear_split(k: int, n: int, man: dict) -> dict | None:
+    """``None`` when output width ``n`` has no measurements (nothing is planned) or
+    ``k`` was measured present at ``n``. Otherwise the plan: ``parts`` (the smallest
+    equal split of ``k`` whose parts are each measured present), ``k_part``, ``names``
+    (one template name per part) and ``add``. A larger measured-present width never
+    stands in for ``k``. ``ValueError`` when no equal split into measured widths exists."""
+    meas = widths_entry(man, n).get("measured", {})
+    safe = set(safe_widths(man, n))
+    if not safe:
+        return None
+    if str(k) in meas and meas[str(k)].get("present"):
+        return None
+    for parts in range(2, k + 1):
+        if k % parts == 0 and k // parts in safe:
+            kp = k // parts
+            return dict(parts=parts, k_part=kp, names=[f"k{kp}n{n}"] * parts,
+                        add=f"add{n}")  # fmt: skip
+    raise ValueError(
+        f"k{k}n{n}: no equal split into measured-present widths {sorted(safe)}"
+    )
+
+
+def split_report(spec: ModelSpec, layout: int, man: dict) -> list[str]:
+    """One line per linear key of ``spec`` at ``layout``: unsplit, or its split plan."""
+    out = []
+    for name in keys_for(spec, layout):
+        m = _LINEAR.fullmatch(name)
+        if not m:
+            continue
+        p = linear_split(int(m[1]), int(m[2]), man)
+        if p is None:
+            out.append(f"{name}: unsplit")
+        else:
+            out.append(f"{name}: split {p['parts']} x {p['names'][0]} + {p['add']}")
     return out
 
 
@@ -609,6 +676,7 @@ def manifest_for(specs=None, layouts=LAYOUTS) -> dict:
         "models": {k: asdict(v) for k, v in specs.items()},
         "signatures": dict(sorted(sigs.items())),
         "reuse": old.get("reuse", {}),
+        "linear_widths": old.get("linear_widths", {}),
     }
     return json.loads(json.dumps(man))  # tuples as lists: what a reload gives
 
@@ -655,7 +723,7 @@ def plan(
         for root in roots:
             for grp in GROUPS:
                 d = os.path.join(root.path, grp, name)
-                if not os.path.isdir(d):
+                if not os.path.isdir(d) or failed(d):
                     continue
                 sf = os.path.join(d, SIG_FILE)
                 if os.path.exists(sf):
@@ -753,6 +821,9 @@ def main(argv=None):
     sub.choices["build"].add_argument("--mem-gb", type=int, default=20)
     sub.choices["build"].add_argument("--name", action="append")
     sub.add_parser("manifest")
+    p = sub.add_parser("split")
+    p.add_argument("--model", required=True)
+    p.add_argument("--layout", type=int, required=True)
     a = ap.parse_args(argv)
     if a.cmd == "manifest":
         man = manifest_for()
@@ -760,6 +831,9 @@ def main(argv=None):
         print(f"{MANIFEST}: {len(man['signatures'])} signatures")
         return
     spec = model_spec(a.model)
+    if a.cmd == "split":
+        print("\n".join(split_report(spec, a.layout, load_manifest())))
+        return
     if a.cmd == "keys":
         for n in keys_for(spec, a.layout):
             print(n, name_sig(n, spec)[0])

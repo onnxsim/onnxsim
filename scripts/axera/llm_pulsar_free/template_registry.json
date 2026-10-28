@@ -1,4 +1,58 @@
 {
+ "linear_widths": {
+  "2560": {
+   "measured": {
+    "3072": {
+     "present": true,
+     "source": "pulsar-confirm control (same check)"
+    },
+    "4096": {
+     "present": true,
+     "source": "pulsar-confirm control (same check)"
+    },
+    "4864": {
+     "present": true,
+     "source": "measured by S (table_check.py, Pulsar2 pulsar2:7.0-lite, same check as linear_table_present)"
+    },
+    "5456": {
+     "present": false,
+     "source": "measured by S (table_check.py, Pulsar2 pulsar2:7.0-lite, same check as linear_table_present)"
+    },
+    "5888": {
+     "present": true,
+     "source": "measured by S (table_check.py, Pulsar2 pulsar2:7.0-lite, same check as linear_table_present)"
+    },
+    "6014": {
+     "present": false,
+     "source": "measured by S (table_check.py, Pulsar2 pulsar2:7.0-lite, same check as linear_table_present)"
+    },
+    "6016": {
+     "present": false,
+     "source": "measured by S (table_check.py, Pulsar2 pulsar2:7.0-lite, same check as linear_table_present)"
+    },
+    "6144": {
+     "present": false,
+     "source": "pulsar-confirm control (same check)"
+    },
+    "8192": {
+     "present": false,
+     "source": "pulsar-confirm control (same check)"
+    },
+    "9728": {
+     "present": false,
+     "source": "pulsar-confirm control (same check)"
+    }
+   },
+   "note": "a width is used only if measured present at its N; absence is not monotone in K (5456 absent, 5888 present). Hypothesis, not isolated: absent widths have a first segment (linear_emit.u16_layout) of 280 or more pairs.",
+   "pairs": {
+    "4864x2": {
+     "present": 2,
+     "source": "measured by S (table_check.py, Pulsar2 pulsar2:7.0-lite, same check as linear_table_present)",
+     "tables": 2
+    }
+   }
+  }
+ },
  "models": {
   "llama160m": {
    "H": 768,
