@@ -1,4 +1,21 @@
 {
+ "add_widths": {
+  "measured": {
+   "19456": {
+    "present": false,
+    "source": "measured by T (add19456 of R/templates, same test: card minus the host Add model max 23.9, 3068 of 19456 elements above 1e-2; the first ~460 elements are right)"
+   },
+   "2560": {
+    "present": true,
+    "source": "pf_check of the Add of a K-split linear (down_proj_add, requantizing, exact offsets: worst rel 0)"
+   },
+   "9728": {
+    "present": true,
+    "source": "measured by T (add9728 standalone on the card, random inputs on the gu grids: card minus the host Add model max 4e-4, one output LSB; 0 elements above 1e-2)"
+   }
+  },
+  "note": "an Add whose width is absent is split into equal column parts of measured-present width (pf_registry.add_split); only the widths measured here are used."
+ },
  "linear_widths": {
   "2560": {
    "measured": {

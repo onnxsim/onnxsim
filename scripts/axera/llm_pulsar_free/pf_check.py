@@ -40,6 +40,7 @@ for _p in (HERE, AXERA):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import pf_ksplit  # noqa: E402
 import pf_layout as lay  # noqa: E402
 import pf_model  # noqa: E402
 import pf_plan  # noqa: E402
@@ -65,21 +66,16 @@ def host_fn(cfg, root, wh, k, pk, e):
             e["calibration"], True, exact_offset=e.get("add_offset") == "exact"
         )
         return lambda f: ad(f["a"], f["b"])
-    if e["kind"] == "split":
-        sp = e["split"][pk.rsplit("_", 1)[1]]
-        if pk.endswith("_add"):
-            ad = AddEval(
-                sp["calibration"], True, exact_offset=e.get("add_offset") == "exact"
-            )
-            return lambda f: ad(f["a"], f["b"])
-        w = cfg.merged_weight(k, li, gptq=False)
-        q, r = cfg.split_weights(w)
-        lin = LinearEval(
-            w if pk.endswith("_hi") else r, *map(sp["calibration"].get, "xy")
+    # a split tree (``pf_ksplit``): the leaf's own calibration, and the weights it was
+    # emitted from (a split's hi / lo halves, a K-slice of a ksplit's parts)
+    leaf, path = pf_ksplit.find(e, k, pk)
+    if leaf["kind"] == "add":
+        ad = AddEval(
+            leaf["calibration"], True, exact_offset=e.get("add_offset") == "exact"
         )
-        return lambda f: lin(f["x"])
-    c = e["calibration"]
-    lin = LinearEval(cfg.merged_weight(k, li), c["x"], c["y"])
+        return lambda f: ad(f["a"], f["b"])
+    c = leaf["calibration"]
+    lin = LinearEval(pf_ksplit.leaf_weight(cfg, k, li, path), c["x"], c["y"])
     return lambda f: lin(f["x"])
 
 
@@ -96,7 +92,7 @@ def main():
     p0 = cfg.first_pos if a.set == "first" else cfg.first_pos + a.steps
     if a.set == "nl":  # up to the passage's first newline at or after p0
         p0 = next(p for p in range(p0, len(ids)) if ids[p] in cfg.nl_tokens)
-    rows, bad = [], 0
+    rows, bad, slice_rows = [], 0, []
     with A.AXSession() as sess:
         print("health before", A.health_check(sess), flush=True)
         pl = pf_plan.Plan(sess, cfg)
@@ -110,6 +106,13 @@ def main():
             pl.lines.append(f"R {b} {off} {n} {pl.g}/t/{f}")
             return f
 
+        # the slices of the K-split parts: each part's input is the parent's input at its
+        # byte offset (the parent read in full, compared after the run)
+        sliced = []
+        for (st, wh, pk), ((b, off), start, kp, K) in pl.slices.items():
+            if st != a.set:
+                continue
+            sliced.append((wh, pk, rd(b, off, K * pf_plan.ITEM), start, kp, K))
         todo = []
         for (st, wh, pk), m in pl.M.items():
             if st != a.set:
@@ -133,6 +136,20 @@ def main():
         def load(f, spec):
             return np.fromfile(os.path.join(pl.h, "t", f), F32).reshape(spec.shape)
 
+        for wh, pk, full, start, kp, K in sliced:
+            # the part's card input is its slice of the parent's: an element-for-element match
+            parent = load(full, type("S", (), {"shape": (1, K)})())
+            part = [
+                load(ins[s.name], s)
+                for (wh_, k_, pk_, e_, m_, ins, outs) in todo
+                if pk_ == pk and wh_ == wh
+                for s in m_.inputs
+            ][0]
+            e0 = start // pf_plan.ITEM  # the slice's first element (start is in bytes)
+            want_slice = parent[:, e0 : e0 + kp]
+            err = float(np.abs(part - want_slice).max())
+            slice_rows.append(dict(wh=wh, program=pk, max_abs=err))
+            bad += err != 0.0
         for wh, k, pk, e, m, ins, outs in todo:
             fn = host_fn(cfg, pl.root, wh, k, pk, e)
             feeds = {s.name: load(ins[s.name], s) for s in m.inputs}
@@ -157,13 +174,27 @@ def main():
                 bad += rel > a.tol
         print("health after", A.health_check(sess), flush=True)
     json.dump(rows, open(os.path.join(cfg.out, f"check_{a.set}.json"), "w"), indent=1)
+    if (
+        slice_rows
+    ):  # the K-split inputs (a separate file: check_<set>.json is unchanged)
+        json.dump(
+            slice_rows,
+            open(os.path.join(cfg.out, f"check_{a.set}_slices.json"), "w"),
+            indent=1,
+        )
+    for r in slice_rows:
+        print(
+            f"K-split input {r['wh']} {r['program']}: max |part input - its slice| {r['max_abs']:.3g}"
+        )
     worst = {}
     for r in rows:
         k = (r["program"], r["output"])
         worst[k] = max(worst.get(k, 0.0), r["rel"])
     for (pk, o), v in sorted(worst.items()):
         print(f"{pk:12s} {o:4s} worst rel {v:.2e}")
-    print(f"{len(rows)} outputs checked, {bad} above {a.tol}")
+    print(
+        f"{len(rows)} outputs checked, {len(slice_rows)} K-split inputs checked, {bad} above {a.tol}"
+    )
     sys.exit(1 if bad else 0)
 
 

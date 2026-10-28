@@ -78,6 +78,7 @@ usage: MODEL=llama160m pf_generate.py SET [first_layer last_layer] [--jobs N]
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -172,6 +173,20 @@ def rng2(*arrs):
     return ur.unsigned_minmax(2 * min(lo, 0), 2 * max(hi, 0))
 
 
+def ksplit_grids(x, w, y, kp):
+    """The grids of a linear split along K (``Generator.ksplit``): the input's whole
+    grid ``rng2(x)`` (both parts read the same input), and one output grid shared by
+    both parts and their sum, ``(s, 32768)`` with ``s = max(|y|, |y_0|, |y_1|) / 32767``
+    over the samples (``y`` the unsplit output, ``y_i`` the parts' float outputs,
+    ``x[:, i*kp:(i+1)*kp] @ w[i*kp:(i+1)*kp]``). The Add is then the exact integer sum
+    ``q = q_0 + q_1 - 32768`` (both ratios 1)."""
+    sx = rng2(x)
+    ys = [x[:, i * kp : (i + 1) * kp] @ w[i * kp : (i + 1) * kp] for i in range(2)]
+    R = max(float(np.abs(a).max()) for a in (y, *ys))
+    g = (R / 32767.0, 32768)
+    return sx, [g, g], g
+
+
 class Generator:
     def __init__(self, cfg: pf_model.Config, root: str):
         self.cfg, self.root, self.out = cfg, root, cfg.out
@@ -179,6 +194,8 @@ class Generator:
         self.acts_alias: dict = {}
         #: template name -> directory, resolved by ``pf_registry.plan`` (``resolve_templates``)
         self.tmap: dict = {}
+        #: linear name -> split plan (``pf_registry.split_keys``): a width absent at its N
+        self.kplan: dict = {}
 
     def tdir(self, name: str) -> str:
         """The directory of template ``name``: only a key the registry resolved
@@ -301,6 +318,8 @@ class Generator:
 
     def linear(self, dst, w, x, ys):
         k, n = w.shape
+        if f"k{k}n{n}" in self.kplan:  # K absent at N: parts and an Add
+            return self.ksplit(dst, w, x, ys, self.kplan[f"k{k}n{n}"])
         tdir = self.tdir(f"k{k}n{n}")
         sx, sy = rng2(x), rng2(*ys)
         m = le.emit_linear_u16(
@@ -319,6 +338,111 @@ class Generator:
             bytes=os.path.getsize(dst),
         )
 
+    def _emit_linear(self, dst, name, w, sx, sy):
+        """A linear program of template key ``name`` on the given grids
+        ``sx`` / ``sy`` ((scale, zero point) of its input and output)."""
+        tdir = self.tdir(name)
+        m = le.emit_linear_u16(
+            os.path.join(tdir, "out", "compiled.axmodel"),
+            w,
+            {"x": sx[0], "y": sy[0]},
+            {"x": sx[1], "y": sy[1]},
+        )  # fmt: skip
+        open(dst, "wb").write(m.SerializeToString())
+        return dict(
+            kind="linear",
+            op="Linear",
+            template=self._rel(tdir, self.root),
+            calibration={"x": list(sx), "y": list(sy)},
+            shape=list(w.shape),
+            bytes=os.path.getsize(dst),
+        )
+
+    def add_q(self, dst, n, q):
+        """A residual-style Add of width ``n`` on the explicit grids ``q``
+        (``{"a", "b", "y"}``: (scale, zero point)), from the ``add<n>`` templates
+        (``add``'s retarget, the calibration given instead of sampled)."""
+        refused = []
+        for i in range(4):
+            tdir = os.path.join(self.tdir(f"add{n}"), f"v{i}")
+            try:
+                m = ur.retarget(
+                    os.path.join(tdir, "out", "compiled.axmodel"),
+                    "Add",
+                    ur.quant_of(tdir),
+                    q,
+                    ("a", "b"),
+                )
+            except (ValueError, OSError) as e:
+                refused.append(f"v{i}: {str(e)[:90]}")
+                continue
+            open(dst, "wb").write(m.SerializeToString())
+            return dict(
+                kind="add",
+                op="Add",
+                template=self._rel(tdir, self.root),
+                calibration={t: list(v) for t, v in q.items()},
+                bytes=os.path.getsize(dst),
+                refused=refused,
+            )
+        raise RuntimeError(f"{dst}: no usable template: {refused}")
+
+    def ksplit(self, dst, w, x, ys, plan):
+        """A linear whose width is absent at its N (``plan``, ``pf_registry.split_keys``):
+        ``x`` (samples, K) is split along K into ``plan["parts"]`` slices (2), each a
+        linear of ``plan["k_part"]`` rows on the input's whole grid ``rng2(x)`` (the
+        slices are the same input tensor, bound at a byte offset on the card). Both
+        parts and their sum share one output grid (``ksplit_grids``), so the Add is an
+        exact integer sum. The program files are ``<stem>_p<i>.axmodel`` and
+        ``<stem>_add.axmodel``."""
+        if len(ys) != 1 or plan["parts"] != 2:
+            raise NotImplementedError("a split linear: one output, two parts")
+        k, n = w.shape
+        kp = plan["k_part"]
+        base = dst[: -len(".axmodel")]
+        sx, sps, sy = ksplit_grids(x, w, ys[0], kp)  # sps: one grid, twice
+        parts = [
+            self._emit_linear(f"{base}_p{i}.axmodel", plan["names"][i], w[i * kp : (i + 1) * kp], sx, sp)
+            for i, sp in enumerate(sps)
+        ]  # fmt: skip
+        add = self.add_q(f"{base}_add.axmodel", n, {"a": sps[0], "b": sps[1], "y": sy})
+        return dict(
+            kind="ksplit",
+            op="KSplitLinear",
+            shape=[k, n],
+            k_part=kp,
+            parts=parts,
+            add=add,
+            bytes=sum(p["bytes"] for p in parts) + add["bytes"],
+        )  # fmt: skip
+
+    def add_cols(self, C, key, dst, a, b, plan):
+        """An Add whose width is absent (``plan``: ``pf_registry.add_split``), made of one
+        Add per column part (``plan["width"]`` columns each) on the same samples' columns
+        of ``a`` and ``b``. The parts' outputs are one output at their column offsets
+        (``colsplit``; ``pf_plan.chain_add``). Files ``<stem>_<i>.axmodel``."""
+        w = plan["width"]
+        stem = dst[: -len(".axmodel")]
+        parts = []
+        for i in range(plan["parts"]):
+            cols = slice(i * w, (i + 1) * w)
+            parts.append(
+                self.add(
+                    os.path.join(C, f"{key}_add_{i}"),
+                    f"{stem}_{i}.axmodel",
+                    a[:, cols],
+                    b[:, cols],
+                    w,
+                )
+            )
+        return dict(
+            kind="colsplit",
+            op="ColumnSplitAdd",
+            col=[i * w for i in range(plan["parts"])],
+            parts=parts,
+            bytes=sum(p["bytes"] for p in parts),
+        )
+
     def split(self, st, li, key, dst, xk, yks):
         """A first-set linear with ~16-bit weights: hi = s8(w), lo = s8(w - Q(w)),
         y = Add(hi, lo). The split carries the precision itself: original weights."""
@@ -331,13 +455,22 @@ class Generator:
         ys = [A[k].reshape(len(A[k]), -1) for k in yks]
         hi = self.linear(dst.replace(".axmodel", "_hi.axmodel"), w, x, ys)
         lo = self.linear(dst.replace(".axmodel", "_lo.axmodel"), r, x, [x @ r])
-        ad = self.add(
-            os.path.join(C, f"{key}_add"),
-            dst.replace(".axmodel", "_add.axmodel"),
-            x @ q,
-            x @ r,
-            w.shape[1],
-        )
+        n = w.shape[1]
+        if (
+            f"add{n}" in self.kplan
+        ):  # the Add's width is absent: one Add per column part
+            ad = self.add_cols(
+                C, key, dst.replace(".axmodel", "_add.axmodel"), x @ q, x @ r,
+                self.kplan[f"add{n}"],
+            )  # fmt: skip
+        else:
+            ad = self.add(
+                os.path.join(C, f"{key}_add"),
+                dst.replace(".axmodel", "_add.axmodel"),
+                x @ q,
+                x @ r,
+                n,
+            )
         return dict(
             kind="split",
             op="SplitLinear",
@@ -1708,7 +1841,7 @@ def template_table_error(d, name=None):
     return "; ".join(errs) or "no variant"
 
 
-def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None):
+def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None, plans=None):
     """``{template name: directory}`` of the keys of ``cfg``'s program set,
     resolved by ``pf_registry.plan`` in its order (exact signature, then by name
     in a shared root, then a verified reuse record; never a guess). Logged per
@@ -1716,6 +1849,14 @@ def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None):
     line that makes them, on stderr, and exit 2 (nothing is generated)."""
     R = pf_registry
     spec = R.model_spec(spec_arg or cfg.name)
+    # the first set's split linears are the config's (``pf_model.split_override``:
+    # LLM_PF_SPLIT_FIRST / LLM_PF_SPLIT_KEYS may differ from the registry's spec);
+    # the same as the spec's for every shipped model
+    spec = dataclasses.replace(
+        spec,
+        split_layers=tuple(cfg.split_first["layers"]),
+        split_keys=tuple(cfg.split_first["keys"]),
+    )
     # the layer count is not compared: no template depends on it
     got = (spec.H, spec.I, spec.nh, spec.nkv, spec.hd, spec.eps, spec.vocab,
            spec.qk_norm, spec.S)  # fmt: skip
@@ -1730,7 +1871,15 @@ def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None):
     root = os.path.abspath(root)
     owner = (owners or {}).get(root)
     roots = [R.Root(root, owner)]
-    ch = R.plan(spec, cfg.fuse, roots, R.load_manifest().get("reuse", {}), verify)
+    man = R.load_manifest()
+    # a width absent at its N is its parts and Add (``pf_registry.split_keys``)
+    names, split = R.split_keys(R.keys_for(spec, cfg.fuse), man)
+    if plans is not None:
+        plans.update(split)
+    for name, p in split.items():
+        what = f"+ {p['add']}" if "add" in p else "(Adds of its column parts)"
+        print(f"split {name}: {p['parts']} x {p['names'][0]} {what}", flush=True)
+    ch = R.plan(spec, cfg.fuse, roots, man.get("reuse", {}), verify, names=names)
     missing = [c for c in ch if c.how == "missing"]
     if missing:
         lines = [
@@ -1807,6 +1956,7 @@ def main():
     gen.tmap = resolve_templates(
         cfg, gen.root, a.spec, owners,
         template_table_error if a.verify_tables else None,
+        plans=gen.kplan,
     )  # fmt: skip
     _ADD_OFFSET = a.add_offset or cfg.add_offset
     lo_l, hi_l = (a.layers[0], a.layers[1]) if len(a.layers) == 2 else (0, cfg.L - 1)

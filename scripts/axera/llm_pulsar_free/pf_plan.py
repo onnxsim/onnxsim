@@ -46,6 +46,7 @@ for _p in (HERE, AXERA):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import pf_ksplit  # noqa: E402
 import pf_layout as lay  # noqa: E402
 import pf_model  # noqa: E402
 import pf_templates as tpl  # noqa: E402
@@ -55,8 +56,19 @@ F32 = np.float32
 
 
 def _parts(e, k):
-    """The loaded programs of a manifest entry: a split linear is hi, lo and their Add."""
-    return [f"{k}_{p}" for p in ("hi", "lo", "add")] if e["kind"] == "split" else [k]
+    """The loaded programs of a manifest entry: a split linear is hi, lo and their Add;
+    a K-split linear its parts and Add (``pf_ksplit``, nested trees included)."""
+    return [n for n, _ in pf_ksplit.leaves(e, k)]
+
+
+#: bytes per element of a program's input or output (the card's I/O is float32; the
+#: U16 is inside the program, see ``pf_check``)
+ITEM = 4
+
+
+def _pair(v):
+    """A buffer or ``(buffer, byte offset)`` as ``(buffer, byte offset)``."""
+    return v if isinstance(v, tuple) else (v, 0)
 
 
 class Plan:
@@ -85,7 +97,7 @@ class Plan:
                     src = e.get(
                         "shared", st
                     )  # a shared program: the rest set's serves both
-                    for pk in _parts(e, k):
+                    for pk, le_ in pf_ksplit.leaves(e, k):
                         path = os.path.join(self.root, src, wh, f"{pk}.axmodel")
                         if path not in loaded:
                             if fake:
@@ -102,6 +114,10 @@ class Plan:
             for k in cfg.programs("rest", wh)
         )
         self.out_bufs = {}
+        #: K-split parts: (st, wh, part) -> ((input buffer, byte offset), byte offset of the
+        #: part's slice of that input, the part's rows, the input's rows): ``pf_check``
+        #: reads the slice back and compares it with the part's input
+        self.slices = {}
         B = self.buf
         H, S, kvd = cfg.H, cfg.S, cfg.kvd
         self.x0, self.mask = B(H * 4), B((S + 1) * 4)
@@ -128,8 +144,15 @@ class Plan:
         """A program's float function keyed by its input names (fake mode)."""
         cfg = self.cfg
         li = None if wh == "post" else int(wh[1:])
-        if pk.endswith("_add") or e["kind"] == "add":
+        leaf, _ = (
+            pf_ksplit.find(e, k, pk) if e["kind"] in ("split", "ksplit") else (e, None)
+        )
+        if leaf["kind"] == "add":
             return lambda f: f["a"] + f["b"]
+        if pf_ksplit.in_ksplit(e, k, pk):
+            _, path = pf_ksplit.find(e, k, pk)
+            w = pf_ksplit.leaf_weight(cfg, k, li, path)
+            return lambda f: f["x"] @ w
         if e["kind"] == "split":
             q, r = cfg.split_weights(cfg.merged_weight(k, li, gptq=False))
             w = q if pk.endswith("_hi") else r
@@ -178,17 +201,67 @@ class Plan:
     def chain(self, st, wh, key, **ins):
         """Bind a program's inputs (buffer or (buffer, byte offset)) and its
         output (a merged program with several outputs: ``outputs``)."""
-        if self.man[st][wh].get(key, {}).get("kind") == "split":
-            # hi and lo linears on the same input, then their Add
-            hi = self.chain(st, wh, f"{key}_hi", **ins)
-            lo = self.chain(st, wh, f"{key}_lo", **ins)
-            self.bind(st, wh, f"{key}_add", "I", "a", hi)
-            self.bind(st, wh, f"{key}_add", "I", "b", lo)
-            return self._out(st, wh, key, f"{key}_add")
+        e = self.man[st][wh].get(key, {})
+        if e.get("kind") in ("split", "ksplit"):
+            return self.chain_tree(st, wh, key, e, ins)
         for n, v in ins.items():
             b, off = v if isinstance(v, tuple) else (v, 0)
             self.bind(st, wh, key, "I", n, b, off)
         return self._out(st, wh, key, key)
+
+    def chain_tree(self, st, wh, key, e, ins):
+        """A split tree (``pf_ksplit``) of entry ``e`` named ``key``, on inputs
+        ``ins``. A split: hi and lo linears on the same input, then their Add. A
+        K-split: each part on its K-slice of the input (the slice is a byte offset
+        into the input's buffer: no copy), then the Add of the two."""
+        if e["kind"] == "split":
+            # a stub entry (the fake float set) has its names by kind only
+            sp = e.get("split", {"hi": {"kind": "linear"}, "lo": {"kind": "linear"}, "add": {"kind": "add"}})  # fmt: skip
+            hi = self.chain_tree(st, wh, f"{key}_hi", sp["hi"], ins)
+            lo = self.chain_tree(st, wh, f"{key}_lo", sp["lo"], ins)
+            return self.chain_add(st, wh, key, f"{key}_add", sp["add"], hi, lo)
+        if e["kind"] == "ksplit":
+            b, off = ins["x"] if isinstance(ins["x"], tuple) else (ins["x"], 0)
+            kb = e["k_part"] * ITEM  # the part's slice of the input (float32 I/O)
+            outs = []
+            for i, p in enumerate(e["parts"]):
+                self.slices[(st, wh, f"{key}_p{i}")] = (
+                    (b, off), i * kb, e["k_part"], e["k_part"] * len(e["parts"]),
+                )  # fmt: skip
+                outs.append(
+                    self.chain_tree(st, wh, f"{key}_p{i}", p, {"x": (b, off + i * kb)})
+                )  # fmt: skip
+            return self.chain_add(st, wh, key, f"{key}_add", e["add"], *outs)
+        for n, v in ins.items():
+            b, off = v if isinstance(v, tuple) else (v, 0)
+            self.bind(st, wh, key, "I", n, b, off)
+        return self._out(st, wh, key, key)
+
+    def chain_add(self, st, wh, key, prog, e, a, b):
+        """The Add of a split tree (``pf_ksplit``) named ``prog`` on inputs ``a`` and ``b``
+        (buffer or (buffer, byte offset)): a plain Add, or a column split (``colsplit``:
+        one Add per column part, each on its columns of ``a`` and ``b``, all writing one
+        output buffer at their byte offsets, so the consumer reads the whole width).
+        Returns the output buffer; ``key`` names it."""
+        if e["kind"] != "colsplit":
+            self.bind(st, wh, prog, "I", "a", *_pair(a))
+            self.bind(st, wh, prog, "I", "b", *_pair(b))
+            return self._out(st, wh, key, prog)
+        names = [f"{prog}_{i}" for i in range(len(e["parts"]))]
+        ms = [self.M[(st, wh, n)] for n in names]
+        total = sum(m.outputs[0].nbytes for m in ms)
+        # one output buffer of the whole width, shared by the sets like ``_out``'s
+        if (wh, key, "colsplit") not in self.out_bufs:
+            self.out_bufs[(wh, key, "colsplit")] = self.buf(total)
+        out = self.out_bufs[(wh, key, "colsplit")]
+        for i, name in enumerate(names):
+            ab, ao = _pair(a)
+            bb, bo = _pair(b)
+            off = e["col"][i] * ITEM
+            self.bind(st, wh, name, "I", "a", ab, ao + off)
+            self.bind(st, wh, name, "I", "b", bb, bo + off)
+            self.bind(st, wh, name, "O", 0, out, off)
+        return out
 
     def tables(self, li):
         """(buffer, byte offset) of the layer's cos_q, sin_q, cos_k, sin_k rows."""

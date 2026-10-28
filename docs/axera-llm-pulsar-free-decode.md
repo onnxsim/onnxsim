@@ -1104,11 +1104,20 @@ have only the pristine-master comparison.
 
 ## Split linears (Qwen3-4B's down projection, K = 9728)
 
-Pulsar2's U16 linear at N = 2560 compiles without its weight table for some input widths.
-The check that tells is `linear_emit.linear_table_present`: the compiled `npu_params` holds
-the table of the template's own weights (at its calibrated scales) exactly once. (A check
-that only looks for the right size, or that the output is mostly nonzero, passes these
-builds; the table bytes differ.) Measured with `pulsar2:7.0-lite`:
+**Status: wired (2026-10-28).** `pf_generate.py` emits the split for every linear whose
+width is absent and every Add whose width is absent, from the measured widths in
+`template_registry.json`; `pf_plan.py` and `pf_check.py` run and check the split trees.
+The shipped layouts do not change: no width of Qwen3-0.6B or llama-160m is measured absent
+(`split_keys` returns the key list unchanged at every layout; byte-identity below).
+Qwen3-4B runs at **layout 1**, the only layout whose down projection is a standalone
+program. At layouts 2-8 the down projection is inside a fused program (`lanorm9728`,
+`alyrqkr4096`, ...) whose template still has the K = 9728 table absent: those keys stay
+missing (exit 2), and fusing a split into a merged graph is not written.
+
+**Why.** Pulsar2's U16 linear at N = 2560 compiles without its weight table for some input
+widths (the table check below). K = 9728 is absent, so the linear is split.
+
+**The measured widths** (`linear_emit.linear_table_present`, Pulsar2 `pulsar2:7.0-lite`):
 
 | K (N = 2560) | table | present | source |
 |---|---|---|---|
@@ -1125,68 +1134,125 @@ present. The absent widths all have a first segment (`linear_emit.u16_layout`) o
 or more, the present ones 256 or less. That is a hypothesis: only the widths above are
 measured.
 
-**The split (the design used).** `y = x1 W1 + x2 W2` with x split along K at 4864. The
-input keeps one grid `(s_x, 32768)`. The two halves and the sum share one output grid
-`(s, 32768)` with `s = max(|y|, |y1|, |y2|) / 32767` (calibrated on passage 1). Then
-`Add(y1, y2)` has both ratios exactly 1, so the card's Add is `q = q1 + q2 - 32768`:
-integer, exact, no requantization. Its output is the `down` tensor on the unsplit grid, so
-the residual Add and the next norm are unchanged. Rejected: a separate scale per half with a
-requantizing Add (`pf_fake_quant.card_add`): the same error as the equal grid on 3 of 5 layers
-(within 0.02%), worse on layer 17 (1.02% against 1.00%, max error 780 against 375 steps) and
-better on layer 35 (0.98% against 1.01%), and it adds a rounding that the equal grid does not
-have. A separate Add program with its own scales costs an execute for no accuracy either.
+**The linear split (`pf_registry.split_keys`, `Generator.ksplit`).** `y = x_0 W_0 + x_1 W_1`
+with x split along K at 4864. Both parts read the input on its whole grid `rng2(x)` (a byte
+offset of the same buffer on the card: part 1 starts at byte `4864 x 4`). Both parts and
+their sum share one output grid `(s, 32768)`, `s = max(|y|, |y_0|, |y_1|) / 32767` over the
+calibration samples, so the Add is the exact integer sum `q = q_0 + q_1 - 32768` (both ratios
+1). The Add is a single-op `add2560`.
 
-Host error against the float linear, on the real Qwen3-4B down inputs (AWQ int4 dequantized,
-a float forward on two repo passages; `S/split_host.py`; relative RMS over passage 2):
+**The Add split (`pf_registry.add_split`, `Generator.add_cols`).** Qwen3-4B's first set
+splits gate | up as two s8 linears and an Add (`gu`, N = 19456: the `add19456` Add). That Add
+is wrong on the card. Measured with one retargeted Add program per width on random inputs,
+against the host Add model of `pf_fake_quant.AddEval` (`card_add`):
 
-| layer | unsplit (K = 9728, control) | split, equal grid | split, separate scales + Add |
-|---|---|---|---|
-| 0 | 1.03% | 0.81% | 0.81% |
-| 8 | 1.08% | 0.92% | 0.91% |
-| 17 | 1.20% | 1.00% | 1.02% |
-| 26 | 1.38% | 1.20% | 1.20% |
-| 35 | 1.21% | 1.01% | 0.98% |
+| width | card minus host, max | elements above 0.01 |
+|---|---|---|
+| 9728 (`add9728`) | 4e-4 (one output LSB) | 0 |
+| 19456 (`add19456`) | 23.9 | 3068 of 19456 (the first ~460 right) |
 
-The error is the s8 weight codes (about 1%, the same in both designs). The split is lower,
-probably because each half's per-channel weight scale covers 4864 inputs, not 9728 (not
-isolated). The unsplit
-program cannot be built, so it is a host control only.
+The width is measured absent and the Add is split into two `add9728` column halves (gate, up).
+Both write one output buffer at their byte offsets (`colsplit`; `pf_plan.chain_add`), so the
+consumer reads the whole width as before. In the card check `gu_add_0` and `gu_add_1` are
+2e-6 and 0 relative to their host models.
 
-Card (layers 8 and 35, passage 2, 128 tokens, `S/card_split.py`; health 0.0 before and after):
-the card's split output is within 2 LSB of the host model (mean 0.01 LSB) and its error
-against the float linear is the host's (0.92% rel. RMS at layer 8; 1.01% at 35).
+**The first set keeps the gate | up split.** Position 0 is the massive activation, and the
+first set's split layers (0-2) exist for it: their weights are ~16-bit (two s8 halves). The
+split is not separately measured here as unnecessary for Qwen3-4B; its Add is now a column
+split (above) instead of the N = 19456 Add the card gets wrong.
 
-Execute time per token of the down projection, layer 8, back to back (median of 3):
+**Card checks** (`pf_check.py`, 2 layers, Qwen3-4B dims, `check_<set>.json` and
+`check_<set>_slices.json`; health 0.0 before and after; tolerance 2e-2; all programs below
+2e-3 on both sets, the K-split inputs equal to their slices bit for bit):
 
-| chain | execute us / token |
+| program (layers 0 and 1, worst over both) | worst rel |
 |---|---|
-| `h1`, `h2`, Add | 2100 |
-| `h1`, `h2` | 1846 |
-| Add alone | 296 |
+| `down_proj_p0`, `down_proj_p1` (rest) | 1.8e-3, 5.2e-3 |
+| `down_proj_hi_p0`, `_hi_p1`, `_lo_p0`, `_lo_p1` (first) | 1.3e-4 .. 5.7e-4 |
+| `down_proj_add` (rest), `_hi_add`, `_lo_add` (first) | 6e-8 .. 0 |
+| `gu_hi`, `gu_lo` (first) | 5e-5 |
+| `gu_add_0`, `gu_add_1` (first) | 2.6e-6, 0 |
+| `silu_f` (rest) | 6e-3 |
+| `attn`, `lm_head` | 3e-3, 4e-5 |
 
-Estimated, not measured: the unsplit program is one execute of K = 9728, about 0.27 ms of
-floor plus 2 x 0.65 ms of body, about 1.6 ms. Three executes (two halves and an Add,
-with the residual and norm folded into the Add) add about 0.5 ms per layer, about 20 ms
-per token over Qwen3-4B's 36 layers. Two linears in one program (verified to build with
-both tables present) would keep the unsplit execute count (0 extra executes, an estimated
-~1.6 ms); that program's emitter is not written, so it is not on the card.
+**An error found on the way.** The first version took a K-split part's input offset as
+2 bytes per element (U16). The card's program I/O is float32 (a 4864-wide linear's input is
+19456 bytes), so part 1 read the wrong slice. `pf_check` did not catch it: the host read the
+same bytes the card did. `pf_check` now reads the parent input and compares each part's input
+with its slice (`check_<set>_slices.json`; all zero now), and `pf_plan.ITEM = 4` is the
+element size of every program's I/O.
 
-**Registry.** `template_registry.json` holds `linear_widths` (per N: each K's measured
-verdict and its source). A width is used only if measured present at its N (absence is not
-monotone in K: 5456 absent, 5888 present). `pf_registry.linear_split(K, N, manifest)` plans
-a K that is not measured present into the smallest equal number of measured-present parts
-(K = 9728 at N = 2560: 2 x `k4864n2560` + `add2560`).
-`pf_registry.py split --model qwen3_4b --layout 8` prints the plan. Generation does not use
-the plan yet: `pf_generate` still asks for `k9728n2560` and reports it missing. A linear
-template whose table check fails is written with `ok: false` (`pf_templates.build_linear`),
-and `pf_registry` skips such a directory as a template.
+**Accuracy.** Teacher-forced, 48 steps of `docs/adaquant.md` (`pf_plan.py --doc 0 --prompt 48`,
+the card against the float model of the same checkpoint):
 
-**Byte-identity of the registry change** (`pf_generate.py both 0 1`, `--add-offset exact`,
-`LLM_PF_CAL_TARS=0`, the shared templates; every `.axmodel` of layers 0-1, both sets): Qwen3-0.6B
-layouts 3, 5, 6, 7, 8, 9, 10, 11 equal pristine `origin/master`. Layout 8 also equals `F/n8o`.
-llama-160m layouts 3 and 7 equal pristine `origin/master`. Llama layout 3 does not equal the
-shipped `l3` set (10 of its axmodels and the `on2` calibration differ), but it equals pristine
-`origin/master`, so the difference predates this change.
+2 layers (`q4b5`, the build of this section), 47 / 48 top-1 agreement, median 1.48% and p90
+1.80% relative logit error (`plan_doc0.json`). The same two layers with the earlier
+requantizing Add (each part on its own grid, `q4b4`): 48 / 48, median 1.49%, p90 1.83%.
+Both are the same accuracy within the step noise.
+
+**36 layers: not run.** The float reference of `pf_record` for the whole Qwen3-4B (the
+dequantized 36-layer checkpoint, `pf_awq_snapshot.py`, 8 GB) was killed at the 24 GB cap
+(`MemoryMax`) at record time. The 2-layer result is the only card result for Qwen3-4B here.
+Layer 35 was therefore not checked on the card.
+
+**Execute time** (`pf_profile.py --set rest`, per program, 2 layers, median of 10 runs each):
+
+| program | us |
+|---|---|
+| `down_proj_p0` / `_p1` (K = 4864 each) | 935 / 939 |
+| `down_proj_add` (N = 2560) | 304 |
+| split down projection, total | 2178 |
+| unsplit (estimate, below) | about 1600 |
+| `gu` (K = 2560, N = 19456, rest set) | 2750 |
+| `lm_head` (N = 151936) | 19710 |
+
+Per token of the rest set, 2 layers (`s_per_token` 49 ms wall; execute 38.0-39.0 ms, median
+of 47 steps, 24 runs per token). Per layer, the split down projection is 2.15 ms of about
+9.26 ms (both halves 0.92 + 0.94 ms, the Add 0.29 ms). The unsplit estimate is 1.6 ms (above),
+so the split costs about 0.58 ms per layer more. For a 36-layer Qwen3-4B at layout 1, the
+split path is about 353 ms per token of execute (36 x 9.26 ms + `lm_head` 19.7 ms), and the
+unsplit path about 332 ms (estimate). Both figures are for layout 1, the layout that runs
+Qwen3-4B; the fused layouts are not possible for it. These are weight-bandwidth bound (each
+linear streams its whole s8 table; the 0.27 ms execute floor is a small part).
+
+Load average during the card runs was 2.4-3.5 (the host shares the machine; the profile
+was run back to back with the decode).
+
+**Estimated, not measured:** the unsplit down projection cannot be built (its table is
+absent), so the unsplit figure is an estimate: one execute with the body of two K = 4864
+halves (0.65 ms each, `935 - floor` with the floor about 0.27 ms, the doc's figure) plus one
+floor, about 1.6 ms, against 2.18 ms for the split. About 0.6 ms per layer, about 21 ms per
+token over 36 layers.
+
+**Generating Qwen3-4B** (layout 1; the fused layouts are not possible):
+
+```sh
+# the float checkpoint of the AWQ int4 one (no float checkpoint is cached)
+python pf_awq_snapshot.py <Qwen/Qwen3-4B-AWQ snapshot> <snap>            # LLM_PF_SNAPSHOT
+# the absent template: one overlay with the layout's keys (builds k4864n2560 and add9728)
+python pf_registry.py build --model qwen3_4b --layout 1 --out <overlay> --root <shared roots>
+MODEL=qwen3_4b LLM_PF_SNAPSHOT=<snap> LLM_PF_OUT=<out> LLM_PF_FUSE=1 LLM_PF_TEMPLATES=<overlay> \
+  python pf_record.py --n-first 128 --n-attn 16
+python pf_generate.py both 0 1 --add-offset exact          # the card run above; the log: "split k9728n2560 ..."
+# the whole model (both 0 35) is the same command on a 36-layer snapshot: not run (see Accuracy)
+```
+
+`pf_awq_snapshot.py` reads the AWQ `gemm` packing (nibble `i` is output column `ORDER[i]`,
+autoawq's interleave). The order is not checked against a float reference (none is cached);
+the per-channel scales do not discriminate it, so it is unverified.
+
+**Not updated:** `pf_estimate.py` and `pf_fake_quant` (the host fake-quant of a whole decode)
+do not know the split trees; use `pf_plan.py` and `pf_check.py` for Qwen3-4B.
+
+**Byte-identity of the shipped layouts** (new code vs pristine `origin/master`, both sets
+of layers 0-1, `--add-offset exact`, `LLM_PF_CAL_TARS=0`, the shared templates):
+
+Qwen3-0.6B layouts 3, 5, 6, 7, 8, 9, 10, 11 and llama-160m layouts 3 and 7: every `.axmodel`
+of layers 0-1 of both sets equal, and every manifest equal, to pristine `origin/master`
+(`F/cmpset.py`: 0 differing files in each; 2 / 2 manifest entries). Layout 8 of
+Qwen3-0.6B also equals the shipped `F/n8o` set (first 23, rest 3 axmodels, 0 differing).
+Since no width of these models is measured absent, `pf_registry.split_keys` returns their
+key lists unchanged, and the generation path is the pre-existing one.
 
 ## Limits
 
