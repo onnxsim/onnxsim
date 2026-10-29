@@ -1407,6 +1407,35 @@ on layers 0, a middle fused layer and 35; the 48-step `pf_plan` decode against f
 Qwen3-4B ms per token. No card event occurred (`card-events.log` is untouched). No code changed in
 round 3, so the shipped-output byte identity is unchanged by construction.
 
+**Row-scaled norm probe (2026-10-29, `pf_rsnorm_probe.py`): Pulsar2 accepts it, the retarget does not.**
+The fix candidate divides `x` by its per-row max `|x|` before the squares:
+`s = ReduceMax(Abs(x))`, `xs = x / s`, `u = xs / sqrt(mean(xs^2) + eps)`. The scale cancels in
+`u`, and every U16 tensor after the division lies in [-1, 1], so one row's outlier cannot set
+the range of the squares. One program, U16 `layer_configs` on all seven op types, 18 calibration
+rows (two massive-channel rows of opposite sign, +6309 and -4200), 2560 wide:
+
+* **Pulsar2 (7.0-lite, AX650 target):** compiles it in about 20 s. Every op is accepted:
+  `Abs`, `ReduceMax`, `Div`, `Mul`, `ReduceMean`, `Add`, `Sqrt`. The frontend keeps the eight
+  nodes, the quantized model has `AxAbs`, `AxReduceMax` and `AxQuantizedDiv` / `Mul` / `Add` /
+  `Sqrt` / `ReduceMean`, and the `.axmodel` is one `neu mode` node with one NPU subgraph (no CPU
+  fallback). Nothing was refused. A native build with the same calibration is record-identical
+  (`compare_jobs` empty); a different calibration changes segment 2, as expected.
+* **Card (AX8850, `axcl-card.lock`, `health_check` 0.0 before and after; `card_final_a.json`):**
+  ordinary rows read 1.98e-2 and 2.53e-2 rms relative error, and the host fake-quant of the
+  input alone (the input's per-tensor U16 rounding, step 0.160 over [-4200, 6309]) reads
+  1.99e-2 and 2.56e-2. So the card matches the float norm up to the input's own rounding; the
+  norm adds nothing measurable. Outlier rows (+6309, -4200 at channel 4) read 1.3e-3 and 1.1e-3
+  rms (their ordinary elements 4e-2 median); the input floor there is 4e-4 and 6e-4, so about
+  1e-3 comes from the `xs` path. No NaN in any row. A row scaled to 1e-2 is below the input's
+  step and reads 1.0 (informational; the calibration range sets it, not the norm).
+* **Not supported yet: the retarget.** `u16_retarget.OPS` has no `Abs` or `ReduceMax`
+  (`candidates` raises `not a retargetable U16 op`), so a calibrated copy of this norm cannot be
+  placed in a layer program. Their record formulas (the ratio lanes for the reduce, the
+  sign-free abs) would have to be learned from native builds at two calibrations and
+  validated as retarget-equals-native on the card, as the other ops were. Until then layout 8
+  stays at layer 16. Not built: the new template family, the 36-layer run, the host and card
+  checks of the K-split programs, and any Qwen3-4B ms per token.
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two
