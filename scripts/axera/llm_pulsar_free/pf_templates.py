@@ -787,6 +787,22 @@ SPLIT_DOWN = """
 """
 #: the template's second parts' weights, relative to the first parts'
 SPLIT_LO = 1 / 256
+#: ``alyrqkrk``'s variants after the six of ``ALYR_VARIANTS`` (v6, v7, ...; a variant's
+#: draws are seeded by its index), ``(i, j, ks)`` as ``ALYR_VARIANTS``: the first norm's
+#: variant 3 (its residual Add cancels the attention's ``z @ w`` in the calibration) with
+#: each RoPE variant ``j`` and ``ks``. A template's tie and Add-shift pattern depends on the
+#: draws, so each is a separate build; the retarget takes the first variant that accepts a
+#: layer's calibration (``pf_generate._retarget_fused``). Found for layer 5 of Qwen3-4B
+#: (``docs/axera-llm-pulsar-free-decode.md``, the K-split section).
+KSPLIT_ALYR_EXTRA = (
+    (3, 0, 1),
+    (3, 2, 1),
+    (3, 0, 1.25),
+    (3, 1, 1),
+    (3, 3, 1),
+    (3, 0, 0.8),
+    (3, 2, 0.8),
+)
 #: ``alyrf``'s variants (no RoPE): ``alanorm``'s v0 with each ``slanorm`` variant
 ALYRF_VARIANTS = ((0, 0, 1), (0, 1, 1), (0, 2, 1), (0, 3, 1))
 
@@ -859,6 +875,8 @@ def _lyr_graph(
         split or ksplit
     ):  # lanorm's v2 / v3 halves (v6, v7) gave wrong x / yq / v on the card
         variants = [v for v in variants if v[0] == 0]
+    if ksplit and attn:  # the K-split variants after the six (``KSPLIT_ALYR_EXTRA``)
+        variants = [*variants, *KSPLIT_ALYR_EXTRA]
     for i, j, ks in variants if qk else ALYRF_VARIANTS:
         ga, gb = g1s[i], g2s[j]
         gb, ws = gb if isinstance(gb, tuple) else (gb, {})

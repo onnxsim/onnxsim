@@ -1254,64 +1254,95 @@ Qwen3-0.6B also equals the shipped `F/n8o` set (first 23, rest 3 axmodels, 0 dif
 Since no width of these models is measured absent, `pf_registry.split_keys` returns their
 key lists unchanged, and the generation path is the pre-existing one.
 
-## Fused K-split (Qwen3-4B layout 8): status 2026-10-29, not working end to end
+## Fused K-split (Qwen3-4B layout 8): status 2026-10-29, layer 16 blocks the 36-layer run
 
-**Status: the templates, the registry and the recorder are done; the layout-8 generation
-for 36 layers fails at layer 5, and no card check was run for Qwen3-4B's fused layers.**
-Everything below is measured; nothing here is a card result for the fused 4B path.
+**Status: layout 8 does not generate for 36 layers yet. Layers 0-15 (both sets) now generate,
+including layer 5, which needed new template variants; the first refusal is at
+`rest/L16/alyr.axmodel`, and that one is a calibration problem that no template variant can fix.** No card check was run for Qwen3-4B's fused layers
+(the 36-layer set does not exist), and no Qwen3-4B ms per token was measured. Everything below
+is measured on the host.
 
-**Which fused programs hold the absent K = 9728 table** (`tablecheck` on the compiled
-`npu_params` of each variant, its own weights and calibrated scales): `lanorm9728`,
-`slanorm9728`, `slanormqkr9728` and `alyrqkr4096` (the whole layer) hold the down linear
-with the table absent in every variant; their other linears are present. So the fused
-layers cannot use the unsplit down projection.
+**The K-split program.** The down linear is split along K into two K = 4864 linears
+(`KSPLIT_DOWN` in `pf_templates.py`: `Split` of the input, two `MatMul`s, one `Add`), both on one
+output grid (`pf_generate.ksplit_grids`). One execute per layer is kept (`alyrqkrk4096`, and
+`slanormk9728` for the last layer). Names: `pf_templates.KSPLIT_BASE` / `ksplit_name`;
+`ModelSpec.ksplit_down` (only `qwen3_4b`) and `Config.ksplit` switch them on.
 
-**The K-split fused program.** The down linear is split along K into two K = 4864 linears
-(`KSPLIT_DOWN` in `pf_templates.py`: `Split` of the input, two `MatMul`s, one `Add`), both
-on one output grid as the standalone split (`pf_generate.ksplit_grids`). One execute per
-layer is kept: layout 8 still runs `alyrqkrk4096` per rest layer, `slanormk9728` for the
-last layer. The split is inside the program, so the execute count does not change. Names:
-`pf_templates.KSPLIT_BASE` / `ksplit_name` (`alyrqkrk`, `alyrfk`, `lanormk`, `slanormk`,
-`slanormqkk`, `slanormqkrk`); `ModelSpec.ksplit_down` (only `qwen3_4b`) and `Config.ksplit`
-switch them on. Shipped specs are unchanged (`ksplit_down` false; their signatures in
-`template_registry.json` are unchanged).
+**Builds.** `k4864n2560`, `add9728`, `lanormk9728`, `slanormk9728`, `slanormqkrk9728` and the
+six `alyrqkrk4096` variants v0-v5 were built earlier (`U`, heavy lock, each variant alone:
+about 95 s each). The `KSPLIT_ALYR_EXTRA` variants v6-v12 (see below) were built on
+2026-10-29 with a host build script (heavy lock, one at a time, MemoryMax 24G; 7 of 7 `ok`,
+92-100 s each, peak 6.2 GB). The signature of `alyrqkrk4096` now has 13 variants
+(`template_registry.json`: `2b7b2dda0b2f7e23`, replacing `3f81906688f5aae4`); only that key's
+signature changed (64 keys of the three models at layouts 3-11 compared with `origin/master`).
 
-**Builds** (`pf_registry.py build --model qwen3_4b --layout 8`, heavy lock):
-`k4864n2560`, `add9728`, `lanormk9728` (4 variants), `slanormk9728` (4),
-`slanormqkrk9728` (4) built. `alyrqkrk4096` (6 variants) failed in the parallel pass
-(Pulsar2 `Killed` inside the 2 GB container); each variant then built alone and passed.
-The build exited 0. The 20-key overlay for `pf_generate` is `U/tpl` (all exact).
+**Layer 5 (fixed by the extra variants).** The six old variants refuse layer 5's `alyr` for
+four reasons, all from the template's own calibration (`u16_retarget` ties and Add shifts;
+`pf_generate._tied`):
 
-**The stale `k9728n2560`.** R's `k9728n2560` build says ok with its npu_params table
-absent (hits 0). `pf_registry.failed` now treats a linear whose width is measured absent
-at its N as not a template (`measured_absent`); the registry no longer counts it.
+* v0: `d_1`, `u_1`, `x_1` share a template zero point (`d_1` and `u_1` also share a scale).
+  At this layer `x_1` is [-93, 173], `u_1` [-39, 83] (x2 copies included) and `d_1` [-19.6, 41],
+  so `d_1`'s range would widen 4.39x in the union. v0 also ties `sk` / `sq` (`sq` widens 9.8x).
+* v3: `d`, `u`, `x` tie; `d` widens 4.06x.
+* v4: `ck` and `cq` tie (both 2.441e-5 / 24576); `cq` widens 21.9x (`cq` is [-0.21, 0.26], `ck`
+  is [-2.0, 8.19] at this layer).
+* v5: `cq` and `sk` tie; `cq` widens 8.6x.
+* v1, v2: the residual Add `x = x_1 + b` (`n32`) needs Add shift 14 (`0x1ea0`, ratio in (1, 2])
+  but all six templates have shift 15 there, so Pulsar2 left out that write (`_check_add_shift_writes`).
 
-**The 36-layer recording fits.** `pf_record.py` now runs layer-major in groups of layers
-(`--layers-per-group`, default 4; each layer's records go to disk when its group ends).
-Qwen3-0.6B: the staged recorder's output equals the pristine recorder's bit for bit
-(58 files, 1014 arrays). The 36-layer Qwen3-4B recording under the heavy lock with
-`MemoryMax=24G`: rc 0, peak 14.7 GB (per group: rest 3.6 -> 11.3 GB, then the first set
-flat near 13.3 GB). The growth is the `ref.Model` weight cache filling to its 3 GB cap
-(`llm_reference.DEFAULT_CACHE_BYTES`), confirmed with `tracemalloc` on 0.6B (245 MB of
-widened weights, then flat); the rest is allocator-held memory. The earlier kill at 24 GB
-was the per-layer records accumulating, not the graphs.
+`KSPLIT_ALYR_EXTRA` (appended to the six, v6 on; a variant's draws are seeded by its index)
+has seven variants `(lanorm variant, RoPE variant, ks)`: `(3,0,1)`, `(3,2,1)`, `(3,0,1.25)`,
+`(3,1,1)`, `(3,3,1)`, `(3,0,0.8)`, `(3,2,0.8)`. Lanorm variant 3 (residual cancelled, `bk` 0.95)
+was chosen because it is the one whose n32 Add can shift 14 in a template. A host prediction of
+each template's calibration (the same 18 draws, `u16_retarget.calibrate_graph`; host probe, not
+committed) matched the real zero points only to a few codes and did not reproduce every tie, so
+the real builds and the guard decided. Real refusals for layer 5 `rest`: v6 and v7 ambiguous record match
+(`0x1ea0 = 0xf` matches `n14` and `n19`), v8 `d_1/u_1/x_1` tie, v9 the same ambiguous match,
+v0-v5 as above. **v10** (`(3,3,1)`) is accepted: layer 5 `rest` and `first` use
+`alyrqkrk4096/v10` (checked with a host wrapper that prints each tie group's widen for every
+variant tried; not committed).
 
-**Layout-8 generation fails at layer 5.** `pf_generate.py both 0 35 --add-offset exact`
-(`LLM_PF_TEMPLATES` = the overlay) stops at `rest/L5/alyr.axmodel`, "no usable template":
-`alyrqkrk4096` variants 0 and 3 refuse the tie of the first norm's `d`/`u`/`x` (`d_1`'s range
-would widen past 4.0x), variants 1 and 2 need the `n32` Add shift 14 where the register
-holds 15, variants 4 and 5 refuse the RoPE tie (`cq` widens past 4.0x). The peak during
-that run was 23.9 GB (two workers). Log: `U/q4b/gen/gen.log`. Not fixed: the ties are
-Pulsar2 register sharing in the template, so a fix needs new variants whose calibration
-keeps those tensors' ranges within 4x at this layer.
+**The 36-layer run (`pf_generate.py both 0 35 --add-offset exact`, `--jobs 1`, heavy lock,
+MemoryMax 24G).** It generated `rest` and `first` for layers 0-15. The `alyr` variant chosen
+per layer, `rest` / `first`: 0-4 `v1` (first from layer 3); 5 `v10` / `v10`; 6 `v3` / `v12`;
+7 `v3` / `v10`; 8 `v1` / `v12`; 9 `v3` / `v1`; 10 `v1` / `v1`; 11 `v1` / `v10`; 12 `v1` / `v12`;
+13 `v10` / `v1`; 14, 15 `v1` / `v1`. It stopped at `rest/L16/alyr.axmodel` with
+`no usable template` for all 13 variants:
 
-**Byte-identity of the shipped sets** (new code vs `origin/master`, layers 0-1, both sets,
-shared templates, `F/cmpset.py`): Qwen3-0.6B layouts 3, 5, 6, 7, 8, 9, 10, 11: 0 differing
-axmodels each (layout 8 vs `F/n8o`: not compared). llama-160m layouts 3 and 7: 0 differing.
+* v0 `sk`/`sq` tie (`sq` widens past 4x); v2 and v9 `k` / `uk` tie (`uk` past 4x); v3 `d`/`u`/`x`
+  tie; v4, v5 `ck`/`cq`, `cq`/`sk` ties (as at layer 5);
+* v1, v6, v7, v8, v10, v11, v12: `cannot convert float NaN to integer`. This is the real
+  failure, and it is not a tie.
 
-**Not measured:** host `FusedEval` checks of the K-split programs; the card checks
-(`pf_check` on layers 0, a middle fused layer and 35; the 48-step `pf_plan` decode against
-float); any Qwen3-4B ms per token. Estimates are not given here.
+**Why layer 16's norm is NaN.** The second norm of `alyr` (after the MLP residual) takes
+`x = x1 + down`. At layer 16 the recorded `rest` set has one row (row 43) whose `down` is
+about 6300 at essentially one channel: that row's `x` reaches 6309 (12617 with the x2 copy), its
+mean(x^2) is 16010 (the median row: 0.90). The coarse pass's `sq0 = Mul(x, x)` has the range [0, 1.59e8] (x2 copies
+included) and so U16 scale 2429. Every ordinary row's `sq0` (0.5 to 500) quantizes to 0, then
+`m0`, `e0` (eps) and `r0` are 0, and `u = x / r0` is NaN: the fake-quant `u` of 507 of 508 rows
+is NaN (host probes, not committed). With row 43 left out of the calibration the scale is
+0.0726 and the fake-quant `u` has a median relative error of 1.0e-3 on 200 rows, so the cause is
+that one row. The card would compute the same zeros: the template cannot represent a per-tensor
+U16 `sq0` whose range is 1e8 wide. In the `rest` set, layers 16-32 each have one row above 300
+(about 6300 in magnitude; row 43 at 16-30, checked), layer 33 has 8 such rows, and layers 34 and 35
+have 414 and 385. So the per-tensor MinMax calibration of the norms after the MLP residual fails
+for these layers, whatever the template variant (checked at 16 only).
+Fixing it needs a calibration policy or a template structure change (for example, a norm on
+x scaled by a power of two per tensor, or clipping the `sq0` range); neither was attempted here,
+and either needs a card check of the decode against float before it counts.
+
+**Peak memory.** The 36-layer run used one worker and hit the 24 GB `MemoryMax` (systemd reports
+a peak of 24G; no kill; the run ended with the RuntimeError at L16). The recording of the 36
+layers (`pf_record.py`, layer-major, 4 layers resident) peaked at 14.7 GB.
+
+**Byte identity of the shipped code.** Qwen3-0.6B layout 5, layers 0-1, `both`: `origin/master`
+and this branch produce the same files (30 of 30 `axmodel`s byte-equal; rest 7, first 23;
+(host runs, not committed). Qwen3-0.6B layout 8, layers 0-1 vs the shipped `F/n8o`: 26 of 26 byte-equal.
+llama-160m was not regenerated; its shipped template signatures are unchanged.
+
+**Not measured:** the host `FusedEval` checks of the K-split programs; the card checks (`pf_check`
+on layers 0, a middle fused layer and 35; the 48-step `pf_plan` decode against float); any
+Qwen3-4B ms per token. No card event occurred (`card-events.log` is untouched).
 
 ## Limits
 
