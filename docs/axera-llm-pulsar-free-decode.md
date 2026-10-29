@@ -1256,6 +1256,11 @@ key lists unchanged, and the generation path is the pre-existing one.
 
 ## Fused K-split (Qwen3-4B layout 8): status 2026-10-29, layer 16 blocks the 36-layer run
 
+**Round 3 (norm after the residual, host only): no structure tried here is ready to build.** See
+"Norm after the residual: candidates" at the end of this section. The diagnosis below is
+refined there (the outlier is spread over three channels at layers 16-27, and the residual's own U16 storage
+sets a floor of 3-6e-3 median error at layers 16-20 whatever the norm does).
+
 **Status: layout 8 does not generate for 36 layers yet. Layers 0-15 (both sets) now generate,
 including layer 5, which needed new template variants; the first refusal is at
 `rest/L16/alyr.axmodel`, and that one is a calibration problem that no template variant can fix.** No card check was run for Qwen3-4B's fused layers
@@ -1327,13 +1332,70 @@ U16 `sq0` whose range is 1e8 wide. In the `rest` set, layers 16-32 each have one
 (about 6300 in magnitude; row 43 at 16-30, checked), layer 33 has 8 such rows, and layers 34 and 35
 have 414 and 385. So the per-tensor MinMax calibration of the norms after the MLP residual fails
 for these layers, whatever the template variant (checked at 16 only).
-Fixing it needs a calibration policy or a template structure change (for example, a norm on
-x scaled by a power of two per tensor, or clipping the `sq0` range); neither was attempted here,
-and either needs a card check of the decode against float before it counts.
+A power-of-two scale per tensor does not help: a per-tensor U16 square needs a range of 1e8 /
+resolution 1e-3 = 1e11 levels, and U16 has 65536. Only a row-dependent scale or a split of the
+channels can change that. The candidates and their numbers are below.
 
 **Peak memory.** The 36-layer run used one worker and hit the 24 GB `MemoryMax` (systemd reports
 a peak of 24G; no kill; the run ended with the RuntimeError at L16). The recording of the 36
 layers (`pf_record.py`, layer-major, 4 layers resident) peaked at 14.7 GB.
+
+**Norm after the residual: candidates (round 3, agent X, host only).** The recording was
+regenerated (`pf_awq_snapshot` + `pf_record`, heavy lock, peak 14.7 GB; V's was gone). The
+baseline reproduces V's failure exactly: at layer 16 the template's `sq0` scale is 2429.2 and
+507 of 508 rows come out NaN (the calibration is the template's: every tensor's U16 MinMax over
+the rows and their x2 copies).
+
+*The outlier is not one channel.* At layer 16 the massive row 43 has rms 126.5, with channel 4 at
+6309, channel 100 at 818, channel 0 at 650 and about 26 channels above 20. Channels 0, 4 and 100 are
+the only channels above 100 in any row through layer 27; from layer 33 more channels exceed 100
+(six at 33, 22 at 35), and at layers 27-35 many rows exceed 100 in some channel (53 rows at 27, 414
+at 34, mostly channel 4). So a "one channel" split is not enough on its own.
+
+*The floor.* The residual `x` is itself a per-tensor U16 tensor, and its range is set by row 43.
+Quantizing `x` alone (float norm, the same x2-copy calibration) gives this median and maximum
+relative error on the ordinary rows (`max|x| < 100`, `d = x / rms(x)`):
+
+| layer | ordinary rows | floor (x stored, float norm) | row 43 / outlier rows, max |
+|---|---|---|---|
+| 16 | 507 | 5.9e-3 (max 2.2e-2) | 1.7e-5 |
+| 20 | 507 | 4.4e-3 (max 1.0e-2) | 1.7e-5 |
+| 27 | 455 | 1.4e-3 (max 7.1e-3) | 1.4e-3 |
+| 33 | 23 | 1.3e-3 (max 4.1e-3) | 1.1e-3 |
+| 35 | 48 | 3.4e-4 (max 6.7e-4) | 2.3e-4 |
+
+Without the x2 copies in the calibration the floor at layer 16 is 2.9e-3. So the 1e-3 bar is not
+reachable at layers 16-27 by any norm structure while the residual stream is per-tensor U16.
+
+*Candidates* (the norm's two-pass graph with each candidate's coarse pass; the second pass is
+unchanged; errors as above, ordinary rows: median / max; outlier row: max):
+
+* **Baseline** (template `NORM2_C`): NaN at 16 (507 rows), 20 (505), 27 (18), 33 (2); at 35 the
+  median is 1.6e-2 (`sq0` scale 60).
+* **(a) row-scaled domain** (divide `x` by its row max before squaring; the max is an oracle
+  here, it needs a `ReduceMax` the template op set does not have): 16 `5.9e-3 / 3.1e-2`,
+  20 `4.5e-3 / 1.6e-2`, 27 `1.6e-3 / 8.8e-3`, 33 `1.5e-3 / 4.4e-3`, 35 `4.4e-4 / 8.1e-4`. Reaches the
+  floor at every layer; outlier row 2e-4 to 3e-3. Its op support in Pulsar2 U16 and its
+  `u16_retarget` formulas are unverified, so it is not built.
+* **(b) channel split of the coarse mean of squares** (the big channels, `|x| > 100` on a
+  calibration row, in their own term; coarse scale = sqrt(normal-channel mean) + sqrt(big-channel
+  mean)): 16 `2.5e-1 / 5.7e-1`, 20 `2.3e-1 / 4.9e-1`, 27 `2.3e-3 / 7.5e-2`, 33 `1.5e-3 / 6.3e-2`,
+  35 `4.7e-4 / 1.6e-3`. It works at 27-35 but fails at 16-20: the big term's U16 range (about
+  1.6e4 x 4) rounds the ordinary rows' big-channel mean (about 0.5) to 0 or one step, so the
+  coarse scale is about half the true one, and the second pass's `m` range, calibrated on the
+  float chain, clips. Without the x2 copies on the big term the median at 16 is 6.6e-3 (the
+  floor) but the max is 0.39 on a few rows, and at 20 the median is 5.1e-3 with max 0.14. Not
+  a clean result; the tail rows are unexplained.
+* **(c) two-level square** (the squared value as hi + lo U16 tensors): not expressible in the
+  graph. The residual of a quantized square needs the unquantized square, which the graph never
+  holds; the in-graph version is the baseline.
+
+*Verdict (not built, no card run).* (a) would reach the floor but needs an unverified `ReduceMax`
+(and a `u16_retarget` rule for it); (b) reaches the floor at 27-35 and fails at 16-20. The floor
+itself is 3-6e-3 at 16-20, so a norm change cannot meet the 1e-3 bar there. The next step is a
+decision: either accept floor-level norm error (and check the decode on the card), or probe whether
+Pulsar2 U16 supports `ReduceMax` and `Abs` in a fused norm (one template build), and only then
+build (a). Host probes: `X/ana/cands2.py`, `X/ana/dbg2.py` (not committed).
 
 **Byte identity of the shipped code.** Qwen3-0.6B layout 5, layers 0-1, `both`: `origin/master`
 and this branch produce the same files (30 of 30 `axmodel`s byte-equal; rest 7, first 23;
@@ -1342,7 +1404,8 @@ llama-160m was not regenerated; its shipped template signatures are unchanged.
 
 **Not measured:** the host `FusedEval` checks of the K-split programs; the card checks (`pf_check`
 on layers 0, a middle fused layer and 35; the 48-step `pf_plan` decode against float); any
-Qwen3-4B ms per token. No card event occurred (`card-events.log` is untouched).
+Qwen3-4B ms per token. No card event occurred (`card-events.log` is untouched). No code changed in
+round 3, so the shipped-output byte identity is unchanged by construction.
 
 ## Limits
 
