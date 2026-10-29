@@ -50,7 +50,7 @@ jobs:
       # X2Paddle 1.6.0 needs onnx<1.16, which has no cp312 wheels on some
       # platforms; build the onnxsim wheel for cp311 to match the shard runtime.
       - name: Build cp311 wheel
-        uses: pypa/cibuildwheel@v4.3.1
+        uses: pypa/cibuildwheel@v4.3.4
         env:
           CIBW_BUILD: "cp311-manylinux_x86_64"
           CIBW_ARCHS: native
