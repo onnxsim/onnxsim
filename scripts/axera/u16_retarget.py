@@ -98,7 +98,15 @@ OPS = (
     "Softmax",
     "MatMul",
     "Silu",
+    "Abs",
+    "ReduceMax",
 )
+#: the row-scaled norm's ops (``pf_rsnorm_probe``): Abs takes the per-tensor
+#: formulas of its input and output; ReduceMax is a pass-through in U16 (no
+#: record of its own, and its output shares its input's calibration, see
+#: ``propagate``). A graph with one of them is calibrated with ``_mul_input``'s
+#: zero-point rule and the windowed ReduceMean forward (``calibrate_graph``).
+NEW_OPS = ("Abs", "ReduceMax")
 SIGMOID_TABLE = 0x1050  # 128 registers, two u16 entries each
 SIGMOID_TAIL = 0x1850
 #: the table's 16 segments: input codes per entry as ``65536 / step`` (``0x100``:
@@ -136,6 +144,12 @@ def propagate(
         if n.op_type in ("Split", "Concat"):
             ts = [t for t in [*n.input, *n.output] if t and t not in consts]
             moves += [(a, b) for a in ts for b in ts if a != b]
+    # a ReduceMax's output is not calibrated on its own: Pulsar2 keeps its input's
+    # scale and zero point (the quant json lists the output as overlapped with the
+    # input), so it overrides whatever a MinMax of the output would give
+    shares = [
+        (n.input[0], n.output[0]) for n in m.graph.node if n.op_type == "ReduceMax"
+    ]
     changed = True
     while changed:
         changed = False
@@ -144,6 +158,9 @@ def propagate(
                 q[b], changed = q[a], True
             elif b in q and a not in q:
                 q[a], changed = q[b], True
+        for a, b in shares:
+            if a in q and q.get(b) != q[a]:
+                q[b], changed = q[a], True
     return q
 
 
@@ -265,6 +282,9 @@ def candidates(
     """Formula name -> 32-bit record value on calibration ``q``."""
     if op not in OPS:
         raise ValueError(f"{op}: not a retargetable U16 op ({', '.join(OPS)})")
+    if op == "ReduceMax":
+        # pass-through: no formula of its own (its output takes its input's calibration)
+        return {}
     s = {t: v[0] for t, v in q.items()}
     z = {t: v[1] for t, v in q.items()}
     c = {}
@@ -1040,6 +1060,72 @@ def _template_weight(template, name) -> np.ndarray:
     )
 
 
+def _mul_input(m: onnx.ModelProto, t: str) -> bool:
+    """A graph input all of whose consumers are Mul: its symmetric range's zero
+    point is 32767 (``unsigned_minmax``'s rule for a Mul operand); any other
+    tensor's is rint's 32768 (seen on a graph input read by Abs and Div, and on
+    an inner tensor (``xs = x / s``) read by Mul). Used by graphs with
+    ``NEW_OPS`` only: the older graphs keep ``calibrate_graph``'s default."""
+    if t not in {i.name for i in m.graph.input}:
+        return False
+    uses = [n.op_type for n in m.graph.node if t in n.input]
+    return bool(uses) and all(u == "Mul" for u in uses)
+
+
+#: Pulsar2's ReduceMean sums in windows of this many elements (``REDUCE_WINDOW``):
+#: a window's pairwise sum, the window sums' pairwise sum, then / n in float32.
+#: Calibrated that way the scales of a ReduceMean and of the Add and Sqrt after it
+#: match Pulsar2's MinMax to the ulp on the row-scaled norm's builds (seeds 3, 7, 99;
+#: a plain float32 mean is one or two ulps off there). Used by ``calibrate_graph``
+#: for graphs with ``NEW_OPS`` only (the older graphs' calibrations are unchanged).
+CAL_WINDOW = 256
+
+
+def _windowed_forward(m: onnx.ModelProto) -> onnx.ModelProto:
+    """``m`` with each ReduceMean (last axis, width ``k * CAL_WINDOW``) replaced by
+    the window sums and their division, for the float forward of ``calibrate_graph``."""
+    m = onnx.ModelProto.FromString(m.SerializeToString())
+    shaped = onnx.shape_inference.infer_shapes(m)
+    dims = {
+        v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+        for v in [*shaped.graph.input, *shaped.graph.value_info, *shaped.graph.output]
+    }
+    nodes, inits = [], []
+    for n in m.graph.node:
+        if n.op_type != "ReduceMean":
+            nodes.append(n)
+            continue
+        src = dims[n.input[0]]
+        width = src[-1]
+        if width % CAL_WINDOW or len(src) != 2 or src[0] != 1:
+            raise ValueError(
+                f"{n.output[0]}: ReduceMean width {width} is not a window multiple"
+            )
+        k, out = width // CAL_WINDOW, n.output[0]
+        t = lambda name: f"__cal_{out}_{name}"  # noqa: E731
+        inits += [
+            onnx.numpy_helper.from_array(np.array([k, CAL_WINDOW], np.int64), t("shp")),
+            onnx.numpy_helper.from_array(np.array([1], np.int64), t("ax1")),
+            onnx.numpy_helper.from_array(np.array([1, k], np.int64), t("shp2")),
+            onnx.numpy_helper.from_array(np.array([float(width)], F), t("n")),
+        ]
+        nodes += [
+            onnx.helper.make_node("Reshape", [n.input[0], t("shp")], [t("w")]),
+            onnx.helper.make_node(
+                "ReduceSum", [t("w"), t("ax1")], [t("ws")], keepdims=0
+            ),
+            onnx.helper.make_node("Reshape", [t("ws"), t("shp2")], [t("ws2")]),
+            onnx.helper.make_node(
+                "ReduceSum", [t("ws2"), t("ax1")], [t("tot")], keepdims=1
+            ),
+            onnx.helper.make_node("Div", [t("tot"), t("n")], [out]),
+        ]
+    del m.graph.node[:]
+    m.graph.node.extend(nodes)
+    m.graph.initializer.extend(inits)
+    return m
+
+
 def calibrate_graph(
     directory: str, samples: Mapping | None = None
 ) -> dict[str, tuple[float, int]]:
@@ -1054,13 +1140,19 @@ def calibrate_graph(
     consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
     data = _data(directory, ins, samples)
-    ref = ReferenceEvaluator(m)
+    new = any(n.op_type in NEW_OPS for n in m.graph.node)
+    ref = ReferenceEvaluator(_windowed_forward(m) if new else m)
     lo, hi = {}, {}
     for j in range(len(data[ins[0]])):
         res = ref.run(None, {n: data[n][j].astype(F) for n in ins}, intermediate=True)
         for k, v in res.items():
             a = np.asarray(v)
-            if k in consts or a.dtype.kind != "f" or a.size == 0:
+            if (
+                k in consts
+                or k.startswith("__cal_")
+                or a.dtype.kind != "f"
+                or a.size == 0
+            ):
                 continue
             lo[k] = min(lo.get(k, np.inf), float(a.min()))
             hi[k] = max(hi.get(k, -np.inf), float(a.max()))
@@ -1068,7 +1160,9 @@ def calibrate_graph(
         k: (
             signed_absmax(max(abs(lo[k]), abs(hi[k])))
             if k in signed
-            else unsigned_minmax(lo[k], hi[k])
+            else unsigned_minmax(
+                lo[k], hi[k], symmetric_32767=not new or _mul_input(m, k)
+            )
         )
         for k in lo
     }
