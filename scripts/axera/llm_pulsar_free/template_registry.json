@@ -778,6 +778,57 @@
     }
    }
   },
+  "2b7b2dda0b2f7e23": {
+   "name": "alyrqkrk4096",
+   "signature": {
+    "dims": {
+     "H": 2560,
+     "I": 9728,
+     "S": 128,
+     "eps": 1e-06,
+     "hd": 128,
+     "nh": 32,
+     "nkv": 8
+    },
+    "kind": "alyrqkrk",
+    "pulsar2": {
+     "calibration_method": "MinMax",
+     "draws": {
+      "count": 18,
+      "seed": 300
+     },
+     "dtype": "U16",
+     "image": "pulsar2:7.0-lite",
+     "layer_ops": [
+      "MatMul",
+      "Add",
+      "Softmax",
+      "Transpose",
+      "Reshape",
+      "FullyConnected",
+      "Mul",
+      "ReduceMean",
+      "Sqrt",
+      "Div",
+      "Sigmoid",
+      "Silu",
+      "Split",
+      "Concat"
+     ],
+     "npu_mode": "NPU1",
+     "variants": 13
+    },
+    "schema": 1,
+    "variant": {
+     "ksplit": true,
+     "qk_norm": true,
+     "rot": true
+    },
+    "widths": {
+     "n": 4096
+    }
+   }
+  },
   "2bd614e2b00ef036": {
    "name": "alanorml2048x6144",
    "signature": {
@@ -1051,57 +1102,6 @@
     },
     "widths": {
      "n": 9728
-    }
-   }
-  },
-  "3f81906688f5aae4": {
-   "name": "alyrqkrk4096",
-   "signature": {
-    "dims": {
-     "H": 2560,
-     "I": 9728,
-     "S": 128,
-     "eps": 1e-06,
-     "hd": 128,
-     "nh": 32,
-     "nkv": 8
-    },
-    "kind": "alyrqkrk",
-    "pulsar2": {
-     "calibration_method": "MinMax",
-     "draws": {
-      "count": 18,
-      "seed": 300
-     },
-     "dtype": "U16",
-     "image": "pulsar2:7.0-lite",
-     "layer_ops": [
-      "MatMul",
-      "Add",
-      "Softmax",
-      "Transpose",
-      "Reshape",
-      "FullyConnected",
-      "Mul",
-      "ReduceMean",
-      "Sqrt",
-      "Div",
-      "Sigmoid",
-      "Silu",
-      "Split",
-      "Concat"
-     ],
-     "npu_mode": "NPU1",
-     "variants": 6
-    },
-    "schema": 1,
-    "variant": {
-     "ksplit": true,
-     "qk_norm": true,
-     "rot": true
-    },
-    "widths": {
-     "n": 4096
     }
    }
   },

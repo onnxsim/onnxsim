@@ -131,7 +131,10 @@ def test_slanormk_and_lanormk_split_only_the_down_linear():
 def test_the_k_split_keeps_the_generators_of_the_unsplit_program():
     _, _, _, _, _, gens_split = tpl.graph("alyrqkrk4096", D4B)
     _, _, _, _, _, gens_lyr = tpl.graph("alyrqkr4096", D4B)
-    assert len(gens_split) == 6  # lanorm's v2 / v3 halves (v6, v7) are not used
+    # the six variants of the unsplit program's lanorm v0 come first (templates built from
+    # them stay valid); the ``KSPLIT_ALYR_EXTRA`` ones after them (v6 on), and lanorm's v2 /
+    # v3 halves are not used
+    assert len(gens_split) == 6 + len(tpl.KSPLIT_ALYR_EXTRA)
     assert len(gens_lyr) == 8
 
 
