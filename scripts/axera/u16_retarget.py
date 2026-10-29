@@ -1081,9 +1081,11 @@ def _mul_input(m: onnx.ModelProto, t: str) -> bool:
 CAL_WINDOW = 256
 
 
-def _windowed_forward(m: onnx.ModelProto) -> onnx.ModelProto:
+def _windowed_forward(m: onnx.ModelProto, strict: bool = True) -> onnx.ModelProto:
     """``m`` with each ReduceMean (last axis, width ``k * CAL_WINDOW``) replaced by
-    the window sums and their division, for the float forward of ``calibrate_graph``."""
+    the window sums and their division, for the float forward of ``calibrate_graph``.
+    ``strict=False``: a ReduceMean of another width stays a plain mean (a width-128
+    norm in a graph with ``NEW_OPS``), instead of raising."""
     m = onnx.ModelProto.FromString(m.SerializeToString())
     shaped = onnx.shape_inference.infer_shapes(m)
     dims = {
@@ -1098,6 +1100,9 @@ def _windowed_forward(m: onnx.ModelProto) -> onnx.ModelProto:
         src = dims[n.input[0]]
         width = src[-1]
         if width % CAL_WINDOW or len(src) != 2 or src[0] != 1:
+            if not strict:
+                nodes.append(n)
+                continue
             raise ValueError(
                 f"{n.output[0]}: ReduceMean width {width} is not a window multiple"
             )
@@ -1126,22 +1131,52 @@ def _windowed_forward(m: onnx.ModelProto) -> onnx.ModelProto:
     return m
 
 
+def _u8_weights(m: onnx.ModelProto) -> onnx.ModelProto:
+    """A copy of ``m`` with every constant MatMul operand (a 2-D weight) rounded to
+    its per-column 8-bit grid: ``s = max|w| / 127.5`` per output column,
+    ``q = rint(w / s)`` clipped to [-128, 127], ``w = q * s``. Pulsar2 calibrates a
+    row-scaled norm's MatMul-fed tensors on these weights: with the float weights
+    the ReduceMean outputs of the Qwen3 ``ident`` build sit 0.1-0.24% off the native
+    scales, with them 9-19 ulp (and the other ReduceMeans 0-2 ulp)."""
+    m = onnx.ModelProto.FromString(m.SerializeToString())
+    consts = {i.name for i in m.graph.initializer}
+    ops = {t for n in m.graph.node if n.op_type == "MatMul" for t in n.input}
+    for i in m.graph.initializer:
+        if i.name not in ops or i.name not in consts:
+            continue
+        w = onnx.numpy_helper.to_array(i)
+        if w.dtype != F or w.ndim != 2:
+            continue
+        s = np.abs(w).max(axis=0, keepdims=True) / F(127.5)
+        s = np.where(s > 0, s, F(1)).astype(F)
+        q = (np.clip(np.rint(w / s), -128, 127) * s).astype(F)
+        i.CopyFrom(onnx.numpy_helper.from_array(q, i.name))
+    return m
+
+
 def calibrate_graph(
-    directory: str, samples: Mapping | None = None
+    directory: str,
+    samples: Mapping | None = None,
+    weight_u8: bool | None = None,
 ) -> dict[str, tuple[float, int]]:
     """``calibrate`` for a fused program: U16 MinMax of every tensor (inputs,
     constants, inner tensors, output) over the float forward of the whole
     graph; both operands of every MatMul are signed (``signed_absmax``), as
     Pulsar2 quantizes them. Pulsar2's inner scales can be a float32 ulp or two
     off this (seen on fused RMSNorms and attention); the zero points agree.
-    ``samples``: ``{input: arrays}`` in place of the tars."""
+    ``samples``: ``{input: arrays}`` in place of the tars.
+    ``weight_u8``: the forward on the constant MatMul weights rounded to 8 bits
+    (``_u8_weights``). ``None`` (the default) turns it on for graphs with
+    ``NEW_OPS`` only; the older graphs' calibrations are unchanged."""
     m = onnx.load(os.path.join(directory, "model.onnx"))
     signed = {t for n in m.graph.node if n.op_type == "MatMul" for t in n.input}
     consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
     data = _data(directory, ins, samples)
     new = any(n.op_type in NEW_OPS for n in m.graph.node)
-    ref = ReferenceEvaluator(_windowed_forward(m) if new else m)
+    u8 = new if weight_u8 is None else weight_u8
+    fwd = _u8_weights(m) if u8 else m
+    ref = ReferenceEvaluator(_windowed_forward(fwd, strict=False) if new else fwd)
     lo, hi = {}, {}
     for j in range(len(data[ins[0]])):
         res = ref.run(None, {n: data[n][j].astype(F) for n in ins}, intermediate=True)
