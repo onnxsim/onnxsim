@@ -745,7 +745,33 @@ every prompt, and exact Add offsets give the same as without them.
 Every divergence left is at a float top-1 / top-2 gap below 0.1. Both newline
 divergences with gaps of 1.57 and 1.87 are gone.
 
-### Where the error comes from
+#### Calibration of a row-scaled norm: the weights are 8-bit (RC, 2026-10-29)
+
+`u16_retarget.calibrate_graph` on a graph with `NEW_OPS` (Abs, ReduceMax) runs its float
+forward with each constant MatMul weight rounded to 8 bits per output column
+(`_u8_weights`: `s = max|w| / 127.5` per column, `q = rint(w / s)` clipped to [-128, 127]).
+Pulsar2's MinMax of the ReduceMean outputs and of the tensors fed by the weighted MatMuls
+match the native build that way. The `ident` build (Qwen3, seed 777, `templates_alyrrsqkrk4096`):
+
+| tensor | float weights (before) | 8-bit weights (after) |
+|---|---|---|
+| `m0_1` (2560-wide, scale 1.2851435e-06) | 26987 ulp | 9 ulp |
+| `m0` (2560-wide) | 22879 ulp | 19 ulp |
+| `qm` (32 x 128) | 29331 ulp | 1 ulp |
+| `km` (8 x 128) | 12730 ulp | 1 ulp |
+| `um`, `m_1`, `m` | 0-2 ulp | 0-2 ulp |
+
+Checked and ruled out on the same build: the calibration samples (Pulsar2's copies equal
+the tars), fp16 / bf16 rounding of every tensor, fake-quantizing every activation at its
+native scale, and summation order (the windowed rule changes m0 by 3 ulp only). The flag is
+on for `NEW_OPS` graphs only (`weight_u8=None`); the shipped Qwen3 and llama fused
+templates have no `NEW_OPS`, so their calibrations are unchanged. The same rounding moves
+their old-graph calibrations toward the natives too (within-2-ulp tensors: lanorm2048
+7/18 -> 13/18, alanorml2048x6144 20/32 -> 30/32, slanorm3072 11/22 -> 19/22,
+nrmqkr1024 24/67 -> 56/67), so it is a candidate for the old graphs as well. That is a
+change to the shipped calibrations and needs its own check; it is not made here.
+
+## Where the error comes from
 
 The host estimate (`pf_estimate.py`) evaluates every program in fake-quant. With
 round-to-nearest weights it reproduces the card's Qwen3 accuracy closely: 44/48 and 47/48,
