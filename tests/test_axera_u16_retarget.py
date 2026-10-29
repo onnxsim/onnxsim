@@ -16,6 +16,7 @@ import sys
 import numpy as np
 import onnx
 import pytest
+from onnx.reference import ReferenceEvaluator
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts", "axera"))
@@ -932,3 +933,108 @@ def test_whole_layer_assignment_puts_the_attention_first():
     q = ur.quant_of(d)
     same = ur.retarget_graph(template, f"{d}/model.onnx", q, q, attention_first=True)
     assert ur.compare_jobs(same, gs.load_model(template)) == []
+
+
+# ---- row-scaled norm (Abs, ReduceMax): pf_rsnorm_probe's program, seeds 3 / 7 / 99 -------
+RSN = os.environ.get(
+    "AXERA_RSNORM_BUILDS", "/mnt/data/cache/claude-work/tmp/llm-pulsar-free/rsnorm"
+)
+
+
+def _rs(seed):
+    return f"{RSN}/s{seed}"
+
+
+def test_abs_and_reduce_max_are_retargetable_ops():
+    assert {"Abs", "ReduceMax"} <= set(ur.OPS)
+    q = {"x": (3.0e-5, 32768), "a": (1.5e-5, 0)}
+    c = ur.candidates("Abs", q, ("x",), "a")
+    assert c["zp:x"] == 32768 and c["zp:a"] == 0
+    assert c["inv:x"] == ur._fbits(1 / np.float32(3.0e-5))
+    assert c["s:a"] == ur._fbits(np.float32(1.5e-5))
+    # a ReduceMax is a pass-through in U16: no formula of its own
+    assert ur.candidates("ReduceMax", q, ("a",), "r") == {}
+
+
+def test_reduce_max_output_takes_its_input_calibration():
+    model = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,8] x) => (float[1,8] y) "
+        "{ a = Abs(x) r = ReduceMax<axes=[-1], keepdims=1>(a) y = Div(x, r) }"
+    )
+    q = {"x": (1.0, 300), "a": (0.5, 0), "r": (0.25, 7), "y": (2.0, 0)}
+    got = ur.propagate(model, q)
+    assert got["r"] == q["a"]  # overrides the output's own (MinMax) calibration
+    assert got["y"] == q["y"] and got["x"] == q["x"]
+
+
+def test_symmetric_zero_point_rule_of_new_graphs():
+    model = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,4] x, float[1,4] z) => (float[1,4] y) "
+        "{ a = Abs(x) m = Mul(z, z) s = Mul(a, a) y = Add(m, s) }"
+    )
+    assert ur._mul_input(model, "z") is True  # only Mul consumers
+    assert ur._mul_input(model, "x") is False  # Abs consumer
+    assert ur._mul_input(model, "a") is False  # not a graph input
+
+
+def test_windowed_forward_sums_256_wide_windows():
+    model = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,512] x) => (float[1,1] y) "
+        "{ y = ReduceMean<axes=[-1], keepdims=1>(x) }"
+    )
+    x = np.random.default_rng(1).standard_normal((1, 512)).astype(np.float32)
+    got = ReferenceEvaluator(ur._windowed_forward(model)).run(None, {"x": x})[0]
+    w = x.reshape(2, 256).sum(-1, dtype=np.float32)
+    want = (w.sum(dtype=np.float32) / np.float32(512)).reshape(1, 1)
+    np.testing.assert_allclose(got, want, rtol=1e-6)
+    bad = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,300] x) => (float[1,1] y) { y = ReduceMean<axes=[-1], keepdims=1>(x) }"
+    )
+    with pytest.raises(ValueError, match="window multiple"):
+        ur._windowed_forward(bad)
+
+
+XFAIL_ULP = pytest.mark.xfail(
+    strict=True,
+    reason="the target's sqrt-derived scale (r for seed 7, u for seed 3) is one float32 ulp "
+    "off the windowed float forward; no tested rounding variant reproduces both",
+)
+
+
+@pytest.mark.parametrize(
+    "t,n",
+    [
+        (7, 99),
+        (3, 99),
+        pytest.param(99, 7, marks=XFAIL_ULP),
+        pytest.param(99, 3, marks=XFAIL_ULP),
+        pytest.param(7, 3, marks=XFAIL_ULP),
+        pytest.param(3, 7, marks=XFAIL_ULP),
+    ],
+)
+def test_rsnorm_retarget_equals_the_native_build(t, n):
+    td, nd = _rs(t), _rs(n)
+    template = _need(td)
+    want = gs.load_model(_need(nd))
+    got = ur.retarget_graph(
+        template, f"{td}/model.onnx", ur.quant_of(td), ur.calibrate_graph(nd)
+    )
+    assert ur.compare_jobs(got, want) == []
+
+
+@pytest.mark.parametrize("seed", [3, 7, 99])
+def test_rsnorm_calibration_within_one_ulp(seed):
+    d = _rs(seed)
+    _need(d)
+    mine, native = ur.calibrate_graph(d), ur.quant_of(d)
+    for t, (s, zp) in native.items():
+        assert mine[t][1] == zp, t
+        ulps = abs(
+            int(np.float32(mine[t][0]).view(np.int32))
+            - int(np.float32(s).view(np.int32))
+        )
+        assert ulps <= 1, (t, mine[t], (s, zp))

@@ -1436,6 +1436,45 @@ rows (two massive-channel rows of opposite sign, +6309 and -4200), 2560 wide:
   stays at layer 16. Not built: the new template family, the 36-layer run, the host and card
   checks of the K-split programs, and any Qwen3-4B ms per token.
 
+**Row-scaled norm: the retarget (2026-10-29, `u16_retarget`; the probe's graph, not yet a layer).**
+`Abs` and `ReduceMax` are retargetable now (`OPS`, `NEW_OPS`). The formulas were decoded from native
+builds of single ops and of the probe graph (`pf_rsnorm_probe.BODY`, seeds 3, 7, 99; 18 rows each):
+
+* **Abs** (`x -> a = |x|`): its CORE job holds the input's `1 / s_x` lanes (`0x0f50`..`0x0fc0`) and
+  `zp_x` (`0x1b10`); the job that quantizes `a` holds `1 / s_a` lanes. `a`'s zero point is always 0
+  (an Abs range starts at 0), so no record carries a nonzero one. These are the per-tensor
+  formulas `candidates` already has, so `Abs` needs no formula of its own.
+* **ReduceMax** (`r = max over the row of a`): no record of its own (its job's lanes are the constant
+  `0x3f800000` at every calibration). Pulsar2 lists `r` as overlapped with `a` in the quant json, so
+  `r` takes `a`'s scale and zero point. `propagate` overrides a ReduceMax output's own MinMax with its
+  input's (`shares`), and the Div that reads `r` uses that scale (`s_x / (s_r s_y)`, as before).
+* **Symmetric ranges** (`lo == -hi`, e.g. `xs = x / max|x|` over rows with +1 and -1 maxima): the zero
+  point is 32767 for a graph input read only by Mul and 32768 (`rint`) otherwise (an input read by Abs
+  and Div; an inner `xs` read by Mul). Applied to graphs with the new ops only.
+* **ReduceMean-derived scales**: Pulsar2's MinMax of `m`, `e` (= `m + eps`) follows a window-256 sum
+  (pairwise sums of 256-wide windows, a pairwise sum of the windows, then `/ n` in float32). A plain
+  float32 mean is one or two ulps off on these builds. `calibrate_graph` uses this forward for graphs
+  with the new ops only (`_windowed_forward`); the older graphs keep their forward.
+
+Checked with `compare_jobs` (`tests/test_axera_u16_retarget.py`, `test_rsnorm_*`, scratch-gated on
+`AXERA_RSNORM_BUILDS`):
+
+* template seed 7 -> seed 99 and seed 3 -> seed 99: equal (exact).
+* the other four pairs (targets 7 or 3) differ in one float32 ulp of one scale: the target's `r`
+  (seed 7, `sqrt`) or `u` (seed 3, `xs / r`). No rounding variant tried (`sqrt`, `e * rsqrt(e)`,
+  `exp(0.5 log)`, `xs / r` vs `xs * (1 / r)`, float64 divide, the reduction orders above) reproduces
+  both. These are strict xfails; the records that Abs and ReduceMax write are identical in every build.
+* calibrate_graph matches Pulsar2's zero points on all three seeds; scales within one ulp.
+
+**Not done:** the row-scaled coarse pass as a template family (`alyr` variants with it; the probe's
+graph inside `NORM2_C`), the 36-layer run, the host and card checks of the K-split programs, and any
+Qwen3-4B ms per token. Layout 8 still stops at `rest/L16/alyr.axmodel`.
+
+**Shipped outputs.** `pf_generate both 0 1 --add-offset exact` on `origin/master` (a pristine export)
+and on this branch gives byte-equal `axmodel`s for every set (rest and first) of Qwen3-0.6B layouts 3,
+5-11 and llama-160m layouts 3 and 7; layout 8 matches `F/n8o` on layers 0-1 (26 of 26). The new
+code runs only for graphs with `Abs` or `ReduceMax`, so no shipped program takes it.
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two
