@@ -1287,9 +1287,13 @@ key lists unchanged, and the generation path is the pre-existing one.
 refined there (the outlier is spread over three channels at layers 16-27, and the residual's own U16 storage
 sets a floor of 3-6e-3 median error at layers 16-20 whatever the norm does).
 
+**Status (row-scaled family, T2, 2026-10-31): the retarget gate passes for all nine variant / seed pairs tried (v1 at seed 1004;
+v2-v5 at seeds 1003 and 1004), and the separate tolerant check (`identity_check_rowscaled`, below) rejects all nine: no row-scaled
+variant is accepted, layout 8 still stops at layer 16, no card run and the default is unchanged (see "Row-scaled family: the
+tolerant identity check" below).**
 **Status (row-scaled family, V3, 2026-10-30): the eps-Add constant is fixed on the template side (template seed 1004)
 and the gate passes, but `compare_jobs` still differs in segments 1-2 and `npu_params`, so no row-scaled variant is accepted yet;
-layout 8 still stops at layer 16 (see "Row-scaled family: the eps-Add constant and the template seed" below).**
+layout 8 still stops at layer 16 (see "Row-scaled family: the eps-Add constant and the template seed" above).**
 **Status: layout 8 does not generate for 36 layers yet. Layers 0-15 (both sets) now generate,
 including layer 5, which needed new template variants; the first refusal is at
 `rest/L16/alyr.axmodel`, and that one is a calibration problem that no template variant can fix.** No card check was run for Qwen3-4B's fused layers
@@ -1658,6 +1662,42 @@ lanes. The target calibration is still off Pulsar2's native quant for 44 of 114 
 `m0` 5 ulps, `qt` 10, `yq` 33; `scale_diff`). Not done: any further draw search for segment 1-2, the 36-layer set, the layer
 and card checks and any Qwen3-4B ms per token. Evidence (scratch, not kept): `V3/logs/diff_v1_base.log`,
 `V3/logs/diff_v1_s1004.log`, `V3/logs/seed_scan_v1.log`.
+
+**Row-scaled family: the tolerant identity check (2026-10-31, T2; no variant accepted, layout 8 unchanged).**
+`compare_jobs` is unchanged. A separate check, `u16_retarget.identity_check_rowscaled(got, want, max_ulp=32)`, states the
+tolerance: exact equality of the segment count, each segment's job count, each job's record count, job type (its `0x0160`
+write), opcodes and registers in order (record placement), every non-scale value (zero points, add shifts and offsets,
+tables, the rest), the slot-table bounds, the table record count, the IO-slot (A8) records as a multiset, and the
+`npu_params` length. The float32 scale lanes (`LANES_LO` / `LANES_HI`, the Mul / Div / Sqrt / Softmax / ReduceMean lanes)
+may differ by at most 32 ulps, same sign. Each record is counted `exact`, `within` or `out`. Its `npu_params` words are
+counted the same way by integer distance, which for float32 is the ulp distance.
+
+Nine template / native pairs (`alyrrsqkrk4096`, the template at seed 1004 for v1 and at seeds 1003 and 1004 for v2-v5;
+each native at seed 777 of its own generator), Pulsar2 7.0 at Docker 12 GB, one build at a time under the heavy lock. Every
+pair passes the retarget gate. Counts per segment (positional; a shifted job makes its tail `out`):
+
+| variant, seed | structure failures | seg 0 out | seg 1 out | seg 2 within / out (max ulp) | seg 3, 4 | `npu_params` out (max delta) | tolerant |
+|---|---|---|---|---|---|---|---|
+| v1, 1004 | 6 (seg 2 records 3458-3459, 3532-3535 out of order) | 2 | 2 | 160 / 51 (21) | exact | 24,499 (3.1e8) | fail |
+| v2, 1003 | 0 | 3 | 1 | 168 / 28 (21) | exact | 24,497 (3.1e8) | fail |
+| v2, 1004 | 12 (seg 2 job lengths 24 vs 22, 1 vs 3, ...) | 3 | 2 | 72 / 1309 (5) | exact | 24,499 (3.1e8) | fail |
+| v3, 1003 | 0 | 3 | 1 | 160 / 44 (21) | exact | 24,497 (3.1e8) | fail |
+| v3, 1004 | 6 (seg 2 records 3458-3459, 3532-3535) | 3 | 2 | 160 / 55 (21) | exact | 24,499 (3.1e8) | fail |
+| v4, 1003 | 12 (seg 2 job 283: 20 vs 22 records; job 314: 4 vs 2) | 4 | 1 | 56 / 1228 (5) | exact | 44,437 (1.4e8) | fail |
+| v4, 1004 | 0 | 4 | 2 | 192 / 17 (8) | exact | 44,439 (1.4e8) | fail |
+| v5, 1003 | 0 | 3 | 1 | 200 / 16 (5) | exact | 43,267 (4.3e9) | fail |
+| v5, 1004 | 12 (seg 2 job 280: 24 vs 22; job 314: 2 vs 4) | 3 | 2 | 72 / 1308 (5) | exact | 43,269 (4.3e9) | fail |
+
+What fails, in order of size. (1) `npu_params`: 24-44 thousand words differ by more than 32, in about 5,000 runs. They are float32
+constants (linear and MatMul scale products; e.g. `0xc47f0bda` against `0xc47f0c2d`, about 600 ulps). The count is nearly the same
+for every variant with the same target calibration, so it comes from the calibration side, not from the template draws. (2) Segments
+0 and 1: one to four records out, all in non-scale words (segment 0's `0x0000` control words, and segment 1's sigmoid table entry
+`0x1060` = `0x5fff` against `0x6000`, `0x8424` against `0x8bc0`). (3) Segment 2: the job layout differs (record order in v1 and v3,
+job lengths in v2, v4 and v5 at seed 1004), and its scale lanes differ by up to 21 ulps while its table entries (`0x15d0`) differ far
+more. So the scale-lane gap in the records is 5-21 ulps, but the `npu_params` constants and the job layout are not within a
+1-ulp gap, and no template seed or draw changes them. The card question (does the 1-ulp gap matter?) cannot be asked yet: no
+36-layer row-scaled set exists to run (layer 16 is the first blocker), so no card table is given and layout 8 stays the default.
+Evidence: `T2/logs/tol_v*_s*.log`, `T2/logs/npu_out_v2_s1003.log`; the templates and natives were scratch and are not kept.
 
 ## Limits
 

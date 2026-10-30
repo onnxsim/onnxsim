@@ -1106,3 +1106,190 @@ def test_unsigned_zero_point_divides_in_float32():
     s64, z64 = ur.unsigned_minmax(lo, hi)
     s32, z32 = ur.unsigned_minmax(lo, hi, f32=True)
     assert s32 == s64 and z64 == 31071 and z32 == 31070
+
+
+# ---- row-scaled family: identity_check_rowscaled (a separate, tolerant check) --------
+# Synthetic records (graph_stitch's record format) and a parsed model whose npu_params
+# is set programmatically. Scratch-gated test at the end: a real template against its
+# native build, skipped unless both builds are present (AXERA_ROWSCALED_TEMPLATE/_NATIVE).
+
+_A1, _A2, _A9 = gs.A1, gs.A2, gs.A9
+_JOB, _LANE, _ZP, _TAB = gs.REG_JOBTYPE, gs.LANES_LO[0], 0x1EF0, gs.TABLE_REGS[0]
+
+
+def _f32(v):
+    return int(np.float32(v).view(np.uint32))
+
+
+def _seg0(lane_value=_f32(1.0), extra=()):
+    """Segment 0: one job (type 3) then a slot table of one (SYNC_END), then one job
+    (type 5). The slot table is empty (the record before SYNC_END is not an A2 wait)."""
+    return [
+        gs._rec(_A1, _JOB, 3),
+        gs._rec(_A1, _LANE, lane_value),
+        gs._rec(_A1, _ZP, 7),
+        gs._rec(_A9, 0, 0),
+        gs._rec(_A2, 0, gs.SYNC_END),
+        gs._rec(_A1, _JOB, 5),
+        gs._rec(_A1, _TAB, 0x1234),
+        *extra,
+        gs._rec(_A9, 0, 0),
+    ]
+
+
+def _segment_report(ra, rb):
+    return ur._rowscaled_segment(ra, rb, 32, *gs.slot_table(ra), *gs.slot_table(rb))
+
+
+def _npu(words):
+    return np.asarray(words, "<u4").tobytes()
+
+
+def _pair(monkeypatch, segs_got, segs_want, npu_got=b"", npu_want=b""):
+    """Two models that differ only in what the check reads (the segments, the IO order
+    and npu_params), so no MCode blob needs to be built."""
+    got = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["": 13]> g (float[1] x) => (float[1] y) { y = Identity(x) }'
+    )
+    want = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["": 13]> g (float[1] x) => (float[1] y) { y = Identity(x) }'
+    )
+    for m, raw in ((got, npu_got), (want, npu_want)):
+        m.graph.initializer.append(
+            onnx.TensorProto(
+                name="npu_params",
+                data_type=onnx.TensorProto.UINT8,
+                raw_data=raw,
+                dims=[len(raw)],
+            )
+        )
+    table = {id(got): segs_got, id(want): segs_want}
+    monkeypatch.setattr(ur, "_segs", lambda m: table[id(m)])
+    monkeypatch.setattr(ur, "_io_order", lambda m: ["x"])
+    return got, want
+
+
+def test_rowscaled_scale_lane_within_bound_is_counted_not_exact():
+    base = _seg0()
+    near = _seg0(lane_value=_f32(1.0) + 5)  # 5 ulps up: within 32
+    far = _seg0(lane_value=_f32(1.0) + 40)  # 40 ulps: out
+    rep = _segment_report(base, near)
+    assert (rep["exact"], rep["within"], rep["out"], rep["max_ulp"]) == (
+        len(base) - 1,
+        1,
+        0,
+        5,
+    )
+    assert rep["structure"] == []
+    rep = _segment_report(base, far)
+    assert (rep["within"], rep["out"]) == (0, 1) and rep["structure"] == []
+
+
+def test_rowscaled_sign_flip_and_non_scale_values_are_out():
+    base = _seg0()
+    neg = _seg0(
+        lane_value=_f32(-1.0)
+    )  # sign differs: out even though bits are far apart
+    assert _segment_report(base, neg)["out"] == 1
+    zp = _seg0()
+    zp[2] = gs._rec(_A1, _ZP, 8)  # a zero point is exact: one unit is out
+    rep = _segment_report(base, zp)
+    assert (rep["within"], rep["out"]) == (0, 1)
+    tab = _seg0()
+    tab[6] = gs._rec(_A1, _TAB, 0x1235)  # a table entry is not a scale lane: out
+    assert _segment_report(base, tab)["out"] == 1
+
+
+def test_rowscaled_structure_is_exact():
+    base = _seg0()
+    # one more record: a structure difference, not a counted record
+    assert any(
+        "records vs" in s
+        for s in _segment_report(base, base + [gs._rec(_A1, _ZP, 0)])["structure"]
+    )
+    # job types swapped: the job order differs
+    swapped = _seg0()
+    swapped[0] = gs._rec(_A1, _JOB, 5)
+    swapped[5] = gs._rec(_A1, _JOB, 3)
+    assert any("job type" in s for s in _segment_report(base, swapped)["structure"])
+    # the same records in another job's position: the register sequence differs
+    moved = _seg0()
+    moved[1], moved[2] = moved[2], moved[1]
+    rep = _segment_report(base, moved)
+    assert rep["out"] == 2 and any("record 1" in s for s in rep["structure"])
+
+
+def test_identity_check_rowscaled_passes_within_bound_and_fails_outside(monkeypatch):
+    npu = _npu([1, 2, 3, 4, 5])
+    near = _npu([1, 2, 3, 9, 5])  # one word differs by 5 (in bound)
+    got, want = _pair(monkeypatch, [_seg0(_f32(1.0) + 5)], [_seg0()], npu, near)
+    rep = ur.identity_check_rowscaled(got, want)
+    assert (
+        rep["pass"]
+        and rep["npu_params"]["within"] == 1
+        and rep["npu_params"]["max_delta"] == 5
+    )
+    assert rep["segments"][0]["within"] == 1 and rep["segments"][0]["out"] == 0
+    # the same scale lane 40 ulps off fails; compare_jobs (unchanged) also reports it
+    got, want = _pair(monkeypatch, [_seg0(_f32(1.0) + 40)], [_seg0()], npu, npu)
+    assert not ur.identity_check_rowscaled(got, want)["pass"]
+    assert ur.compare_jobs(got, want)
+    # within bound everywhere, but npu_params words far apart: fails
+    got, want = _pair(monkeypatch, [_seg0()], [_seg0()], npu, _npu([1, 2, 3, 4000, 5]))
+    rep = ur.identity_check_rowscaled(got, want)
+    assert not rep["pass"] and rep["npu_params"]["out"] == 1
+
+
+def test_identity_check_rowscaled_npu_params_length_is_exact(monkeypatch):
+    got, want = _pair(monkeypatch, [_seg0()], [_seg0()], _npu([1, 2]), _npu([1, 2, 3]))
+    rep = ur.identity_check_rowscaled(got, want)
+    assert not rep["pass"] and any("npu_params length" in s for s in rep["structure"])
+
+
+def test_identity_check_rowscaled_segment_count_is_exact(monkeypatch):
+    got, want = _pair(monkeypatch, [_seg0()], [_seg0(), _seg0()])
+    assert not ur.identity_check_rowscaled(got, want)["pass"]
+
+
+def test_rowscaled_scale_lanes_are_the_float_lanes_only():
+    # the tolerance applies to the float32 scale lanes and nothing else
+    assert ur.SCALE_LANE_REGS == frozenset(gs.LANES_LO + gs.LANES_HI)
+    assert not (ur.SCALE_LANE_REGS & set(gs.TABLE_REGS))
+    assert (
+        _ZP not in ur.SCALE_LANE_REGS
+        and gs.ADD_OFFSET_REGS[0] not in ur.SCALE_LANE_REGS
+    )
+
+
+_RS_TEMPLATE = os.environ.get(
+    "AXERA_ROWSCALED_TEMPLATE",
+    "/mnt/data/cache/claude-work/tmp/qwen-fuse/T2/tmpl/alyrrsqkrk4096/v1_s1004",
+)
+_RS_NATIVE = os.environ.get(
+    "AXERA_ROWSCALED_NATIVE",
+    "/mnt/data/cache/claude-work/tmp/qwen-fuse/T2/ident/alyrrsqkrk4096_v1_s777",
+)
+
+
+def test_rowscaled_template_against_native_is_tolerant_or_refused():
+    """A row-scaled template and its native build: the retarget gate refuses it, or the
+    tolerant check reports its counts (pass or fail). Not an exact-identity test."""
+    tdir, ndir = _RS_TEMPLATE, _RS_NATIVE
+    for d in (tdir, ndir):
+        if not os.path.exists(os.path.join(d, "out", "compiled.axmodel")):
+            pytest.skip(f"build not present: {d}")
+    q = ur.propagate(os.path.join(ndir, "model.onnx"), ur.calibrate_graph(ndir))
+    try:
+        got = ur.retarget_graph(
+            os.path.join(tdir, "out", "compiled.axmodel"),
+            os.path.join(ndir, "model.onnx"),
+            ur.quant_of(tdir),
+            q,
+            attention_first=True,
+        )
+    except ValueError as e:
+        pytest.skip(f"retarget gate refused: {str(e)[:80]}")
+    rep = ur.identity_check_rowscaled(
+        got, gs.load_model(os.path.join(ndir, "out", "compiled.axmodel"))
+    )
+    assert isinstance(rep["pass"], bool) and len(rep["segments"]) == 5
