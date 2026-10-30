@@ -1038,3 +1038,71 @@ def test_rsnorm_calibration_within_one_ulp(seed):
             - int(np.float32(s).view(np.int32))
         )
         assert ulps <= 1, (t, mine[t], (s, zp))
+
+
+# ---- row-scaled graphs: data movement, FullyConnected activations, float32 zero points ----
+_RS_TEXT = (
+    "g (float[1,4] x) => (float[1,2] y, float[1,1] z) "
+    "<float[2,2] w = {1.0, 0.0, 0.0, 1.0}, int64[2] shp = {1, 2}> {"
+    " a = Abs(x) s0, s1 = Split<axis=1>(a) r = Reshape(s1, shp) "
+    " y = MatMul(r, w) u = Mul(s0, s0) ut = Transpose<perm=[1, 0]>(u) "
+    " z = MatMul(s0, ut) }"
+)
+
+
+def _calibrated(tmp_path, text, x):
+    """``calibrate_graph`` of an ONNX text graph over one sample ``x`` (``{"x": ...}``)."""
+    onnx.save(
+        onnx.parser.parse_model(f'<ir_version: 9, opset_import: ["" : 17]> {text}'),
+        str(tmp_path / "model.onnx"),
+    )
+    return ur.calibrate_graph(str(tmp_path), samples={"x": [x]})
+
+
+def test_data_movement_takes_its_source_quant_in_new_graphs(tmp_path):
+    x = np.array([[4.0, -0.5, -1.0, 2.0]], np.float32)
+    q = _calibrated(tmp_path, _RS_TEXT, x)  # Abs: a new graph
+    # a Split half and a Reshape feeding a FullyConnected share the Abs's quant
+    assert q["s1"] == q["a"] and q["r"] == q["a"]
+    # a dynamic MatMul operand (both inputs variable) keeps its own signed MinMax
+    assert q["s0"][1] == 0 and q["s0"][0] == pytest.approx(
+        np.float32(4.0 / 32767.5), rel=1e-6
+    )
+    assert q["s0"] != q["a"]
+    # ut (a Transpose of u = s0 * s0, absmax 16) is a dynamic MatMul operand: signed
+    assert q["ut"][1] == 0 and q["ut"][0] == pytest.approx(
+        np.float32(16.0 / 32767.5), rel=1e-6
+    )
+
+
+def test_data_movement_keeps_its_own_quant_in_old_graphs(tmp_path):
+    # no NEW_OPS: the Split half keeps its own MinMax, as before
+    text = _RS_TEXT.replace("Abs(x)", "Neg(x)")
+    x = np.array([[4.0, -0.5, -1.0, 2.0]], np.float32)
+    q = _calibrated(tmp_path, text, x)
+    assert q["s1"] != q["a"]
+
+
+def test_fully_connected_activation_is_unsigned_in_new_graphs(tmp_path):
+    text = (
+        "g (float[1,4] x) => (float[1,2] y) "
+        "<float[4,2] w = {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}> "
+        "{ a = Abs(x) p = Add(x, a) y = MatMul(p, w) }"
+    )
+    x = np.array([[-3.0, 1.0, 0.5, -2.0]], np.float32)
+    q = _calibrated(tmp_path, text, x)
+    # p = x + |x| = [0, 2, 1, 0]: a range [0, 2], zero point 0 (lo == 0)
+    assert q["p"][1] == 0 and q["p"][0] == pytest.approx(2.0 / 65535.0, rel=1e-6)
+    # a range with a negative minimum is unsigned with a zero point (not signed absmax)
+    text2 = text.replace("Add(x, a)", "Sub(x, a)")  # x - |x|: [-6, 0, 0, -4]
+    q2 = _calibrated(tmp_path, text2, x)
+    assert q2["p"][1] > 0 and q2["p"][0] == pytest.approx(6.0 / 65535.0, rel=1e-6)
+
+
+def test_unsigned_zero_point_divides_in_float32():
+    # -lo / s at a half-code boundary: float64 keeps 31070.5003 (-> 31071), float32 gives
+    # exactly 31070.5 (-> 31070, half to even), as Pulsar2's native zero point (o_a)
+    lo, hi = -2.169715404510498, 2.4067251682281494
+    s64, z64 = ur.unsigned_minmax(lo, hi)
+    s32, z32 = ur.unsigned_minmax(lo, hi, f32=True)
+    assert s32 == s64 and z64 == 31071 and z32 == 31070
