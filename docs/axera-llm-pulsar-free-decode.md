@@ -1526,6 +1526,46 @@ So the symmetric zero points of the row-scaled coarse pass (32767 / 32768 for th
 attention and q / k zero points in every variant tried. Not built: the 36-layer run, layer 35, the card
 checks and any Qwen3-4B ms per token. The 13 template directories are the agent's scratch, not committed.
 
+**Row-scaled family: the zero-point ties (2026-10-30, S4; `u16_retarget`, NEW_OPS graphs only).** The symmetric
+zero points were not the cause. On a native build (v0 at seed 777) `xs` and `xs_1` (32768) and `g` (32767) match
+`calibrate_graph`; `g` is 32768 in the template's own calibration, where `-lo / s` sits on the half-code boundary,
+so the tie is a template coincidence. Three other rules were wrong, and they caused the refusals in `zk0` / `zk1` / `att`:
+
+* **Data movement shares its source's quant.** Pulsar2's native quant json gives every Reshape, Transpose, Split and
+  Concat output its source's scale and zero point (`zk0`, `zk1` = `z` = 25448; `att` = `o_a` = 31070; `k1`, `k2`,
+  `q1`, `q2`, `qr3` = their source). `calibrate_graph` gave them their own MinMax, and a MatMul operand, signed. Now
+  they take the source's calibration, except a dynamic MatMul operand (both inputs variable: `qh_a`, `kt_a`, `vt_a`),
+  which native keeps signed with its own scale.
+* **A FullyConnected's activation is unsigned MinMax** (`y_1`, `yn`: native 31939, 34222), not signed absmax.
+* **Float32 zero-point division.** `o_a`: `-lo / s` is 31070.5003 in float64 (rounds to 31071); native gives 31070,
+  which float32 division (31070.5, half to even) reproduces. Every unsigned zero point of the v0 native build now
+  matches (96 tensors), and every scale to 1.6e-6 relative (the eps-scale ulp).
+
+The rules are gated on `NEW_OPS`: `calibrate_graph` of all 136 shipped fused template directories is identical to
+`origin/master` (checked, not a `pf_generate` run). Host tests: `test_data_movement_*`, `test_fully_connected_activation_*`,
+`test_unsigned_zero_point_divides_in_float32`.
+
+Rebuilt variants (template + native seed-777 build each, one Pulsar2 build at a time, `S4/templates`), with the
+identity gate of `retarget_graph` and then `compare_jobs`:
+
+| variant | gate | why |
+|---|---|---|
+| v0 | refused | template tie 0x8000: `xs_1`, `xs`, `g` (v6-v10 the same tie) |
+| v1 | passes the gate | `compare_jobs` differs in all five segments: ulp-level formulas in segment 0 (records kept at the template value) and a shifted job layout (native segment 0 has 48 records more) |
+| v2 | refused | template tie 0x7ecc among the k / u chain |
+| v3 | refused | template tie 0x85ec: `x` vs `u`, `d` (`x` = 36020, `u` = `d` = 36535 natively) |
+| v4 | refused | template tie 0x6000: `cq`, `ck` |
+| v5 | refused | template tie 0x5fff: `cq`, `sk` |
+| v6-v10 | refused | template tie 0x8000 (`xs` / `g` / `add_const`) |
+| v11 | refused | template's table not spaced evenly |
+| v12 | refused | template tie 0x37800035 (scale lanes `m_1`, `e`) |
+
+So no variant is accepted: no 36-layer set, no layer checks, no card run and no Qwen3-4B ms per token. The
+remaining blocker is twofold: (1) a template's own zero points and scale lanes coincide across tensors, and the
+retarget cannot tell records with equal template codes apart in the non-main segments (a template with distinct codes, or
+role-based assignment there, is needed); (2) on v1 the retarget does not reproduce native records (ulp-level formulas
+and a job count that depends on calibration). Layout 8 still stops at `rest/L16/alyr.axmodel`, and the default is unchanged.
+
 **Shipped outputs (this change):** Qwen3-0.6B layouts 3, 5-11 and llama-160m layouts 3, 7 on layers 0-1 are
 byte-equal to a pristine `origin/master` (30/30, 34/34, 30/30, 28/28, 26/26, 26/26, 6/6, 6/6; llama 30/30,
 26/26). Layout 8 matches `F/n8o` on layers 0-1 (26 of 26).

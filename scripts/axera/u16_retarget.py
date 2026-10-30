@@ -188,7 +188,7 @@ MIN_SCALE = F(1e-10)
 
 
 def unsigned_minmax(
-    lo: float, hi: float, symmetric_32767: bool = True
+    lo: float, hi: float, symmetric_32767: bool = True, f32: bool = False
 ) -> tuple[float, int]:
     """U16 MinMax of a range folded with 0: ``zp = rint(-lo / s)``. At a
     symmetric range (``lo == -hi``, where ``-lo / s`` is exactly 32767.5)
@@ -201,6 +201,8 @@ def unsigned_minmax(
     s = max(F((hi - lo) / 65535.0), MIN_SCALE)
     if symmetric_32767 and lo == -hi and hi > 0:
         return float(s), 32767
+    if f32:  # -lo / s divided in float32: at a half-code boundary this is the rounding
+        return float(s), int(np.clip(np.rint(F(-lo) / s), 0, 65535))
     return float(s), int(np.clip(np.rint(-lo / float(s)), 0, 65535))
 
 
@@ -1154,6 +1156,31 @@ def _u8_weights(m: onnx.ModelProto) -> onnx.ModelProto:
     return m
 
 
+def _moves_share(m: onnx.ModelProto, q: dict) -> dict:
+    """``q`` with every data-movement output (``MOVES``: Reshape, Transpose, Split,
+    Concat) given its first input's calibration. Pulsar2 keeps one quant across such
+    a chain (the native quant json lists the outputs with the producer's scale and
+    zero point, even where a MatMul reads them as a dynamic operand: ``zk0`` = ``z``,
+    ``att`` = ``o_a``, ``k1`` = ``k``, ``qr3`` = ``q``), so the MinMax of the output
+    is not its quant. Graph order, so a chain takes its source's final value."""
+    q = dict(q)
+    consts = {i.name for i in m.graph.initializer}
+    # a dynamic MatMul operand (both inputs variable) keeps its own signed MinMax:
+    # native gives ``qh_a`` (a Reshape of ``q_a``) zero point 0 and its own scale
+    dyn = {
+        t
+        for n in m.graph.node
+        if n.op_type == "MatMul" and not any(t in consts for t in n.input)
+        for t in n.input
+    }
+    for n in m.graph.node:
+        if n.op_type in MOVES and n.input and n.input[0] in q:
+            for o in n.output:
+                if o not in dyn:
+                    q[o] = q[n.input[0]]
+    return q
+
+
 def calibrate_graph(
     directory: str,
     samples: Mapping | None = None,
@@ -1167,13 +1194,23 @@ def calibrate_graph(
     ``samples``: ``{input: arrays}`` in place of the tars.
     ``weight_u8``: the forward on the constant MatMul weights rounded to 8 bits
     (``_u8_weights``). ``None`` (the default) turns it on for graphs with
-    ``NEW_OPS`` only; the older graphs' calibrations are unchanged."""
+    ``NEW_OPS`` only; the older graphs' calibrations are unchanged. For ``NEW_OPS``
+    graphs also: a data-movement output takes its source's calibration (``_moves_share``),
+    a FullyConnected's activation is unsigned MinMax (only a dynamic MatMul operand is
+    signed), and an unsigned zero point divides ``-lo`` by the scale in float32."""
     m = onnx.load(os.path.join(directory, "model.onnx"))
-    signed = {t for n in m.graph.node if n.op_type == "MatMul" for t in n.input}
     consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
     data = _data(directory, ins, samples)
     new = any(n.op_type in NEW_OPS for n in m.graph.node)
+    signed = {t for n in m.graph.node if n.op_type == "MatMul" for t in n.input}
+    if new:  # a FullyConnected's activation (one constant operand) is unsigned MinMax
+        signed = {
+            t
+            for n in m.graph.node
+            if n.op_type == "MatMul" and not any(i in consts for i in n.input)
+            for t in n.input
+        }
     u8 = new if weight_u8 is None else weight_u8
     fwd = _u8_weights(m) if u8 else m
     ref = ReferenceEvaluator(_windowed_forward(fwd, strict=False) if new else fwd)
@@ -1196,13 +1233,15 @@ def calibrate_graph(
             signed_absmax(max(abs(lo[k]), abs(hi[k])))
             if k in signed
             else unsigned_minmax(
-                lo[k], hi[k], symmetric_32767=not new or _mul_input(m, k)
+                lo[k], hi[k], symmetric_32767=not new or _mul_input(m, k), f32=new
             )
         )
         for k in lo
     }
     for k, a in consts.items():
-        q[k] = unsigned_minmax(a.min(), a.max())
+        q[k] = unsigned_minmax(a.min(), a.max(), f32=new)
+    if new:
+        q = _moves_share(m, q)
     return q
 
 
