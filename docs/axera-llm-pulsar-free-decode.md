@@ -1287,6 +1287,9 @@ key lists unchanged, and the generation path is the pre-existing one.
 refined there (the outlier is spread over three channels at layers 16-27, and the residual's own U16 storage
 sets a floor of 3-6e-3 median error at layers 16-20 whatever the norm does).
 
+**Status (row-scaled family, V3, 2026-10-30): the eps-Add constant is fixed on the template side (template seed 1004)
+and the gate passes, but `compare_jobs` still differs in segments 1-2 and `npu_params`, so no row-scaled variant is accepted yet;
+layout 8 still stops at layer 16 (see "Row-scaled family: the eps-Add constant and the template seed" below).**
 **Status: layout 8 does not generate for 36 layers yet. Layers 0-15 (both sets) now generate,
 including layer 5, which needed new template variants; the first refusal is at
 `rest/L16/alyr.axmodel`, and that one is a calibration problem that no template variant can fix.** No card check was run for Qwen3-4B's fused layers
@@ -1632,6 +1635,29 @@ So the calibration change alone does not make any variant pass: the same ties bl
 runs, and v1 still differs in every segment. Not done: the eps-Add fix (`e0_1`, a template draw change, not
 attempted), the layer-35 check, the 36-layer set, the card checks and any Qwen3-4B ms per token. The 13
 Pulsar2 template builds and native builds were scratch and are not kept.
+
+**Row-scaled family: the eps-Add constant and the template seed (2026-10-30, V3; no variant accepted, layout 8 unchanged).**
+The V2 table's `e0_1` item is a template-side fact, not a target one. The target calibration (`calibrate_graph` of the
+native seed-777 dir, and Pulsar2's own native quant json: `e0_1` = 1.285159e-6 in both) gives the eps Add `e0_1` the
+constant `0x38000`, as native does. The template built from the generator's seed-301 draws has `e0_1` = 1.44058e-6, so its
+eps-Add record is `0x28000` (`e0`'s value), and `npu_params` differs there.
+`e0_1`'s scale is the MinMax of `m0_1 + eps` over the 18 draws, and `m0_1` is set by the largest row of the draws. Single-input
+scalings of the template draws cannot bring it under 1.3107e-6 (the ratio `s_eps / s_e0_1` must round to 3): `a` at 0.5-2.0,
+`v_a` at 0.8-1.25 and `q_a` at 0.8-1.25 all give 1.37e-6 or more, and the top five draws (0.087-0.094) would each need a
+change. The template's draw seed does: seed 1004 (`tmpl_seed`, `v1_s1004`, one Pulsar2 build) gives `e0_1` = 1.30178e-6
+(`0x38000`) and `e0` = 1.48122e-6 (`0x28000`), and its host prescreen has no cross-ties. Seed 1007 also reaches 1.30096e-6
+but has two ties (`0x477fff00` on `sq0_1` / `sq0` / `um`, `0x7d69` on `bl` / `kt`), so it is not used. Of seeds 1000-1065
+three (1004, 1007, 1056) reach the constant.
+
+With seed 1004 the retarget gate passes, and `compare_jobs` against the native seed-777 build of `v1` now differs in
+`npu_params` (232k words), segment 1 (2 records: `0x1060` = `0x5fff` against `0x6000`) and segment 2 (1284 records: most lanes off by 1-2 units, some `0x15d0` lanes off by much more); segments 0 (3 records at the tail), 3 and 4 match. Before the
+change (seed 301) all five segments differed (18908, 19040, 1805, 6332 and 6579 records). Replacing the target calibration by
+Pulsar2's own native scales (`quant_of` of the native dir, the oracle) makes segment 0 identical as well, but segments 1 and 2
+and `npu_params` still differ, so the rest is not a calibration scale alone: the template's own records are kept in those
+lanes. The target calibration is still off Pulsar2's native quant for 44 of 114 tensors on this variant (1-33 ulps: `e0`,
+`m0` 5 ulps, `qt` 10, `yq` 33; `scale_diff`). Not done: any further draw search for segment 1-2, the 36-layer set, the layer
+and card checks and any Qwen3-4B ms per token. Evidence (scratch, not kept): `V3/logs/diff_v1_base.log`,
+`V3/logs/diff_v1_s1004.log`, `V3/logs/seed_scan_v1.log`.
 
 ## Limits
 
