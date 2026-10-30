@@ -1610,6 +1610,29 @@ per token. The shipped outputs are unaffected: this change is a documentation up
 Evidence: the TB run logs (prescreen, greedy search, the v0 build, gate and record diff). The template and native
 builds were scratch and are not kept.
 
+**Row-scaled family: v0-v12 against the new calibration (2026-10-30, V2; no variant accepted, layout 8 unchanged).**
+The `pulsar_ref` calibration (above) is in place, and the 13 variants of `alyrrsqkrk4096` were rebuilt from the
+generator's seed-300 draws (Pulsar2 7.0, Docker 12 GB cap; a 2 GB cap kills the build during quant extract). Each
+variant has a native build at seed 777 of its own generator (`V2/ident.py`: `propagate` + `calibrate_graph` of the
+native dir, `retarget_graph`, then `compare_jobs`). The 13 native builds and their identity results:
+
+| variant | retarget gate | `compare_jobs` |
+|---|---|---|
+| v0 | refused: `0x8000` (`xs_1`, `xs`, `g`, `add_const`) | not reached |
+| v1 | passes | differs: `npu_params` and all five segments |
+| v2 | refused: `0x7ecc` (`k`, `k1`-`k3`, `kr`) | not reached |
+| v3 | refused: `0x85ec` (`x` vs `u`, `d`) | not reached |
+| v4 | refused: `0x6000` (`cq`, `ck`) | not reached |
+| v5 | refused: `0x5fff` (`cq`, `sk`) | not reached |
+| v6-v10 | refused: `0x8000` (as v0) | not reached |
+| v11 | refused: table not spaced evenly | not reached |
+| v12 | refused: `0x37800035` (`m_1`, `e`) | not reached |
+
+So the calibration change alone does not make any variant pass: the same ties block the gate as in the S4 and TB
+runs, and v1 still differs in every segment. Not done: the eps-Add fix (`e0_1`, a template draw change, not
+attempted), the layer-35 check, the 36-layer set, the card checks and any Qwen3-4B ms per token. The 13
+Pulsar2 template builds and native builds were scratch and are not kept.
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two
