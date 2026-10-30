@@ -133,6 +133,7 @@ jobs:
   regression:
     name: Shard ${{ matrix.shard }}
     needs: [build, setup]
+    if: github.repository == 'onnxsim/onnxsim'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -200,7 +201,7 @@ jobs:
   known-slow:
     name: Known-slow models (non-blocking)
     needs: [build, setup]
-    if: ${{ needs.setup.outputs.has_known_slow == 'true' && (github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true') }}
+    if: ${{ github.repository == 'onnxsim/onnxsim' && needs.setup.outputs.has_known_slow == 'true' && (github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
@@ -256,7 +257,7 @@ jobs:
   summary:
     name: Summary
     needs: [regression, known-slow]
-    if: always()
+    if: ${{ always() && github.repository == 'onnxsim/onnxsim' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

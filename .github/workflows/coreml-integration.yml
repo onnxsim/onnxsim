@@ -212,7 +212,7 @@ jobs:
   export-benchmark-models:
     name: Export benchmark model suite (gated models via HF_TOKEN)
     needs: build
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'onnxsim/onnxsim' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -247,7 +247,7 @@ jobs:
   benchmark-decode-macos:
     name: Run LLM decode benchmark (macOS, real Core ML)
     needs: build-macos
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'onnxsim/onnxsim' && github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 60
     strategy:
