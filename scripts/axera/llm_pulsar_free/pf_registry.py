@@ -116,16 +116,22 @@ DEPS = {
     "slanormqkrk": NORM + QK,
     "alyrqkrk": LAYER,
     "alyrfk": LAYER,
+    # the row-scaled family (``pf_templates.rs_name``): every norm of the layer row-scaled
+    "alyrrsqkr": LAYER,
+    "alyrrsf": LAYER,
+    "alyrrsqkrk": LAYER,
+    "alyrrsfk": LAYER,
 }
 #: kinds that exist only with a per-head q / k norm (``rope``: without one)
 QK_KINDS = {
     "qkrope", "hcrms", "qkf", "nrmqk", "nrmqkr", "slanormqk", "slanormqkr",
     "lyrqk", "lyrqkr", "alyrqk", "alyrqkr", "alyrqkrs", "alyrf",
-    "slanormqkk", "slanormqkrk", "alyrqkrk", "alyrfk",
+    "slanormqkk", "slanormqkrk", "alyrqkrk", "alyrfk", "alyrrsqkr", "alyrrsf",
+    "alyrrsqkrk", "alyrrsfk",
 }  # fmt: skip
 #: rotate_half made in the program (Split / Concat), not by two linears
 ROT_KINDS = {"nrmqkr", "slanormqkr", "lyrqkr", "alyrqkr", "alyrqkrs",
-             "slanormqkrk", "alyrqkrk"}  # fmt: skip
+             "slanormqkrk", "alyrqkrk", "alyrrsqkr", "alyrrsqkrk"}  # fmt: skip
 SPLIT_KINDS = {"alyrqkrs"}
 #: the down linear split along K in two (``pf_templates.KSPLIT_BASE``; variant ``ksplit``)
 KSPLIT_KINDS = {
@@ -135,6 +141,8 @@ KSPLIT_KINDS = {
     "slanormqkrk",
     "alyrqkrk",
     "alyrfk",
+    "alyrrsqkrk",
+    "alyrrsfk",
 }
 
 _NAME = re.compile(r"([a-z]+?)(\d+)(?:x(\d+))?(t?)")
@@ -196,6 +204,8 @@ class ModelSpec:
     #: the down linear (K = I) is absent at its N: the fused programs that hold it
     #: split it along K (``pf_templates.ksplit_name``); the shipped models: False
     ksplit_down: bool = False
+    #: every norm of the whole-layer programs row-scaled (``pf_templates.rs_name``)
+    rs_norm: bool = False
 
     @property
     def kvd(self) -> int:
@@ -276,6 +286,7 @@ class _Cfg:
         }
         self.fuse = int(layout)  # fmt: skip
         self.ksplit = bool(spec.ksplit_down)
+        self.rs_norm = bool(spec.rs_norm)
 
 
 def keys_for(spec: ModelSpec, layout: int, man: dict | None = None) -> list[str]:

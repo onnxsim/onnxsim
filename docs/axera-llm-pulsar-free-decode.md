@@ -1501,6 +1501,35 @@ and on this branch gives byte-equal `axmodel`s for every set (rest and first) of
 5-11 and llama-160m layouts 3 and 7; layout 8 matches `F/n8o` on layers 0-1 (26 of 26). The new
 code runs only for graphs with `Abs` or `ReduceMax`, so no shipped program takes it.
 
+**Row-scaled family (`alyrrsqkrk4096`, 2026-10-30): no variant accepted, so layout 8 still stops at layer 16.**
+The coarse pass is row-scaled (`NORM2_CRS`, `rs_name`, `Config.rs_norm`); the family is built and
+checked, but the flag is off for Qwen3-4B (`pf_model`, `pf_registry.SPECS`, `template_registry.json`),
+so no default changes. Each variant was built (one Pulsar2 build, heavy lock) and then identity-checked
+against a native build at seed 777 (the calibration it serves, `R4/ident.py`: `propagate` +
+`calibrate_graph`, then `retarget_graph` against the native build, `compare_jobs`). Every one refused in
+`retarget_graph` (ambiguous template: zero-point codes shared by several tensors that the target calibration
+gives different values; or an uneven table):
+
+| variant | refusal (segment, record, code, tie) |
+|---|---|
+| v0 | seg 1, 0x8000: `xs_1`, `xs`, `g`, `add_const` |
+| v1 | seg 2, 0x8662: `z`, `zk0`, `zk1` |
+| v2 | seg 2, 0x7ac4: `z`, `zk0`, `zk1` |
+| v3 | seg 2, 0x9270: `z`, `zk0`, `zk1` |
+| v4 | seg 1, 0x6000: `cq`, `ck` |
+| v5 | seg 0, 0x7480: `n10` |
+| v6-v10 | seg 1, 0x8000: `n14`, `n22`, `n38` ... (the same zero point as v0) |
+| v11 | the template's table is not spaced evenly |
+| v12 | seg 2, 0x73d6: `z`, `zk0` |
+
+So the symmetric zero points of the row-scaled coarse pass (32767 / 32768 for the `xs` tensors) tie with the
+attention and q / k zero points in every variant tried. Not built: the 36-layer run, layer 35, the card
+checks and any Qwen3-4B ms per token. The 13 template directories are the agent's scratch, not committed.
+
+**Shipped outputs (this change):** Qwen3-0.6B layouts 3, 5-11 and llama-160m layouts 3, 7 on layers 0-1 are
+byte-equal to a pristine `origin/master` (30/30, 34/34, 30/30, 28/28, 26/26, 26/26, 6/6, 6/6; llama 30/30,
+26/26). Layout 8 matches `F/n8o` on layers 0-1 (26 of 26).
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two

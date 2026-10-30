@@ -160,6 +160,7 @@ class Config:
         nl_tokens: tuple = (),
         add_offset: str = "pulsar2",
         ksplit: bool = False,
+        rs_norm: bool = False,
     ):
         self.model, self.name, self.out = model, name, out
         #: tokens that run on the ``nl`` set (``pf_record.py``), when it exists
@@ -186,6 +187,8 @@ class Config:
         #: the down linear (K = I) split along K in the fused programs that hold it
         #: (``pf_templates.ksplit_name``); its width is absent at its N
         self.ksplit = bool(ksplit)
+        #: every norm of the whole-layer programs row-scaled (``pf_templates.rs_name``)
+        self.rs_norm = bool(rs_norm)
         self.layer_programs = lay.layer_programs(self.qk_norm, self.fuse)
         self.post_programs = lay.post_programs(self.fuse)
         self.k_program = lay.k_program(self.qk_norm, self.fuse)
