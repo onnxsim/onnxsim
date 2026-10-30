@@ -1590,6 +1590,167 @@ def compare_jobs(got, want) -> list[str]:
     return diffs
 
 
+# ---- row-scaled family: a separate, explicit tolerant identity check -----------------
+# ``compare_jobs`` stays exact. The row-scaled norm's scales come from its own float
+# calibration, which can differ from Pulsar2's by a few float32 ulps, so its scale words
+# are compared with a bound. Everything else must match exactly.
+
+ROWSCALED_MAX_ULP = 32
+# float32 scale words: the Mul / Div / Sqrt / Softmax / ReduceMean lanes (graph_stitch's
+# _core_values). Table entries, zero points, add shifts, offsets and opcodes are not here.
+SCALE_LANE_REGS = frozenset(gs.LANES_LO + gs.LANES_HI)
+
+
+def _job_spans(recs: Sequence[bytes], lo: int, hi: int) -> list[tuple[int, int]]:
+    """``(start, end)`` record spans of a segment's jobs (a job ends at its ``a9``
+    launch, as in ``_canonical_jobs``), the slot table ``[lo, hi)`` excluded."""
+    spans, start = [], 0
+    for i, r in enumerate(recs):
+        if lo <= i < hi:
+            continue
+        if r[0] == gs.A9:
+            spans.append((start, i + 1))
+            start = i + 1
+    if start < len(recs):
+        spans.append((start, len(recs)))
+    return spans
+
+
+def _rowscaled_segment(ra, rb, max_ulp: int, lo_a, hi_a, lo_b, hi_b) -> dict:
+    """Counts and structure differences of one segment (records ``ra`` against
+    ``rb``, positionally). A record is ``exact``, ``within`` (a scale-lane word
+    whose float32 bits differ by at most ``max_ulp``, same sign), or ``out``."""
+    out = {
+        "records": len(rb),
+        "exact": 0,
+        "within": 0,
+        "out": 0,
+        "max_ulp": 0,
+        "structure": [],
+        "table_records": (0, 0),
+    }
+    if len(ra) != len(rb):
+        out["structure"].append(f"{len(ra)} records vs {len(rb)}")
+        return out
+    if (lo_a, hi_a) != (lo_b, hi_b):
+        out["structure"].append(f"slot table [{lo_a}, {hi_a}) vs [{lo_b}, {hi_b})")
+    ja, jb = _job_spans(ra, lo_a, hi_a), _job_spans(rb, lo_b, hi_b)
+    if len(ja) != len(jb):
+        out["structure"].append(f"{len(ja)} jobs vs {len(jb)}")
+    else:
+        for k, ((sa, ea), (sb, eb)) in enumerate(zip(ja, jb)):
+            if ea - sa != eb - sb:
+                out["structure"].append(f"job {k}: {ea - sa} records vs {eb - sb}")
+            # the job type is written by the job's own 0x0160 record
+            ta = [
+                gs._val(r)
+                for r in ra[sa:ea]
+                if r[0] == gs.A1 and gs._reg(r) == gs.REG_JOBTYPE
+            ]
+            tb = [
+                gs._val(r)
+                for r in rb[sb:eb]
+                if r[0] == gs.A1 and gs._reg(r) == gs.REG_JOBTYPE
+            ]
+            if ta != tb:
+                out["structure"].append(f"job {k}: job type {ta} vs {tb}")
+    out["table_records"] = (
+        sum(gs._reg(r) in gs.TABLE_REGS for r in ra),
+        sum(gs._reg(r) in gs.TABLE_REGS for r in rb),
+    )
+    if out["table_records"][0] != out["table_records"][1]:
+        out["structure"].append("table records %d vs %d" % out["table_records"])
+    for i, (x, y) in enumerate(zip(ra, rb)):
+        if x == y:
+            out["exact"] += 1
+            continue
+        if x[0] != y[0] or gs._reg(x) != gs._reg(y):
+            if len(out["structure"]) < 20:
+                out["structure"].append(f"record {i}: {x.hex()} vs {y.hex()}")
+            out["out"] += 1
+            continue
+        vx, vy = gs._val(x), gs._val(y)
+        if (
+            gs._reg(y) in SCALE_LANE_REGS
+            and not (vx ^ vy) >> 31
+            and abs(vx - vy) <= max_ulp
+        ):
+            out["within"] += 1
+            out["max_ulp"] = max(out["max_ulp"], abs(vx - vy))
+        else:
+            out["out"] += 1
+    return out
+
+
+def identity_check_rowscaled(got, want, max_ulp: int = ROWSCALED_MAX_ULP) -> dict:
+    """Tolerant identity of a row-scaled retarget against its native build.
+
+    Exact (any difference fails): the segment count; per segment the record count,
+    the job count and each job's record count, job type (its 0x0160 write), opcodes
+    and registers in order (so record placement), every non-scale value (zero points,
+    add shifts and offsets, tables and the rest), the slot-table bounds, the table
+    record count, the IO-slot (A8) records as a multiset when the IO orders agree, and
+    the ``npu_params`` length. Scale lanes (``SCALE_LANE_REGS``, float32 words) may differ
+    by at most ``max_ulp`` ulps (same sign). ``npu_params`` words may differ by at most
+    ``max_ulp`` in integer value (a float32 scale word's integer difference is its ulp
+    distance; the packed tables' differences are reported with the same bound).
+
+    Returns ``{"pass": bool, "structure": [...], "npu_params": {...}, "segments": [...]}``
+    with per-segment ``exact`` / ``within`` / ``out`` counts and the largest ulp seen.
+    ``compare_jobs`` is unchanged; this is a separate check."""
+    same_io = _io_order(got) == _io_order(want)
+    report = {"pass": True, "structure": [], "npu_params": {}, "segments": []}
+    pa = next(i.raw_data for i in got.graph.initializer if i.name == "npu_params")
+    pb = next(i.raw_data for i in want.graph.initializer if i.name == "npu_params")
+    if len(pa) != len(pb):
+        report["structure"].append(f"npu_params length {len(pa)} vs {len(pb)}")
+    else:
+        # whole 32-bit words; a length that is not a multiple of 4 is zero-padded (equal lengths)
+        pad = (-len(pa)) % 4
+        wa = np.frombuffer(pa + bytes(pad), "<u4").astype(np.int64)
+        wb = np.frombuffer(pb + bytes(pad), "<u4").astype(np.int64)
+        d = np.abs(wa - wb)
+        nz = d > 0
+        report["npu_params"] = {
+            "words": int(d.size),
+            "differing": int(nz.sum()),
+            "within": int((nz & (d <= max_ulp)).sum()),
+            "out": int((d > max_ulp).sum()),
+            "max_delta": int(d.max()) if d.size else 0,
+        }
+    sa, sb = _segs(got), _segs(want)
+    if len(sa) != len(sb):
+        report["structure"].append(f"{len(sa)} segments vs {len(sb)}")
+        report["pass"] = False
+        return report
+    for si, (ra, rb) in enumerate(zip(sa, sb)):
+        lo_a, hi_a = gs.slot_table(ra) if si == 0 else (0, 0)
+        lo_b, hi_b = gs.slot_table(rb) if si == 0 else (0, 0)
+        seg = _rowscaled_segment(ra, rb, max_ulp, lo_a, hi_a, lo_b, hi_b)
+        if (
+            si == 0
+            and len(ra) == len(rb)
+            and sorted(ra[lo_a:hi_a]) != sorted(rb[lo_b:hi_b])
+        ):
+            seg["structure"].append("slot table records differ")
+        if same_io and len(ra) == len(rb):
+            aa = sorted(r for r in ra if r[0] == gs.A8)
+            ab = sorted(r for r in rb if r[0] == gs.A8)
+            if aa != ab:
+                seg["structure"].append("A8 (IO slot) records differ")
+        seg["segment"] = si
+        report["segments"].append(seg)
+        report["structure"] += [f"segment {si}: {x}" for x in seg["structure"]]
+    npu = report["npu_params"]
+    if (
+        report["structure"]
+        or any(s["out"] for s in report["segments"])
+        or npu.get("out")
+    ):
+        report["pass"] = False
+    return report
+
+
 def add_const_sharing(nodes, q) -> tuple[int, ...]:
     """Which Adds of a fused graph share one ``npu_params`` constant at
     calibration ``q``: for each Add (graph order) the index of the first Add
