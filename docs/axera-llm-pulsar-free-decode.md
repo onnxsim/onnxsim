@@ -1570,6 +1570,34 @@ and a job count that depends on calibration). Layout 8 still stops at `rest/L16/
 byte-equal to a pristine `origin/master` (30/30, 34/34, 30/30, 28/28, 26/26, 26/26, 6/6, 6/6; llama 30/30,
 26/26). Layout 8 matches `F/n8o` on layers 0-1 (26 of 26).
 
+**Row-scaled family: the template rebuild (2026-10-30, TB; no variant accepted, layout 8 unchanged).** The
+S4 blocker was template-level ties (equal template codes whose native values differ), so the template's own
+calibration was changed to separate them. Each change is a small explicit change to the template's sample set,
+applied only to the template side (`alyrrsqkrk4096`'s draws at seed 300 + i; the native side keeps the
+generator's seed-777 draws), so the native target and the layer calibration are unchanged. Two kinds:
+`g` / `sq` draw changes (one input's largest-|value| draw scaled by 0.9 / 1.1), and `peak` changes (one element of
+an input raised so that a tensor's MinMax moves to another draw, by 2% over the global peak; the only way found
+to separate `x_1`, `u_1` and `d_1`, whose template zero point (34770) did not move under any draw scale or
+element spike, because `u_1` and `x_1` peak in the same draw and `u = x / (max|x| rms)` keeps their ratio).
+Host prescreen (`calibrate_graph` of both sides, no Pulsar2) of the unmodified v0..v12 ties: `0x8000`
+(`g` 32767 vs `xs`, `xs_1`, `w`, `add_const` 32768) for v0, v6-v10; `0x7ecc` (k chain) for v2; `0x85ec` (`x` vs `u` / `d`)
+for v3; `0x6000` (`cq` / `ck`) for v4; `0x5fff` (`cq` / `sk`) for v5; `0x37800035` (`m_1` / `e`) for v12.
+
+| variant | template change (TB) | Pulsar2 template | retarget gate | `compare_jobs` at seed 777 |
+|---|---|---|---|---|
+| v0 | `peak` a -> `x_1` (draw 1, +2%); `g` draw 1 x0.9; `sq` draw 17 x1.1; `peak` `ck` -> `kt` (draw 9, +2%) | ok (94 s) | pass (`0x8000`, `0x87d2`, `0x8e38` and the `0x477fff00` Div lane, `kt`'s peak, separated) | differs: `npu_params` and all five segments (seg 0: 18908 of 105800 records; seg 2: 1904 of 6504, two-unit differences in the `0x0500` lanes; seg 3 / 4 job layout); input order differs |
+| v1 (S4) | none | ok | pass | differs in all five segments (S4: ulp-level formulas, a calibration-dependent job count) |
+| v2-v5, v11, v12 | not rebuilt (ties above; v11 table spacing) | - | - | - |
+
+The `compare_jobs` difference is not a tie any more: the template's records now identify their formulas, and what
+differs is the target's float32 scales and the tables built from them (`npu_params` differs in about 4.3 M
+words; the scale-lane records differ by one or two units), plus the job layout of the windowed reductions.
+Fixing that needs the row-scaled norm's scales to match Pulsar2's float32 values, not another template
+calibration, so it is the next blocker. Not run: the 36-layer set, the layer and card checks, any Qwen3-4B ms
+per token. The shipped outputs are unaffected: this change is a documentation update only, no code changed.
+Evidence: `TB/logs/` (prescreen, greedy, the v0 build and gate logs, `diff_v0.log`) and the template and native
+builds under `TB/templates` and `TB/ident` (scratch, not committed).
+
 ## Limits
 
 - **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two
