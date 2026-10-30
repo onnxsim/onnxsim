@@ -186,6 +186,31 @@ NORM2_R = """
   y = Mul(d, g)
 """
 NORM2 = NORM2_C + NORM2_R
+#: the row-scaled coarse pass (``pf_rsnorm_probe``): ``xs = x / max|x|`` before the
+#: squares, so one row's outlier cannot set the range of ``x * x``; ``u`` is
+#: ``x / rms(x)`` up to eps (the scale cancels). Replaces ``NORM2_C`` in the ``rs``
+#: families (``rsslanorm``, ``rsslanormqkr``, ``alyrrs*``); the second pass is unchanged
+NORM2_CRS = """
+  ax = Abs(x)
+  mx = ReduceMax<axes=[-1], keepdims=1>(ax)
+  xs = Div(x, mx)
+  sq0 = Mul(xs, xs)
+  m0 = ReduceMean<axes=[-1], keepdims=1>(sq0)
+  e0 = Add(m0, eps0)
+  r0 = Sqrt(e0)
+  u = Div(xs, r0)
+"""
+#: the ops the row-scaled coarse pass adds to a graph's layer ops
+RS_OPS = ("Abs", "ReduceMax")
+
+
+def _rs_body(body: str) -> str:
+    """``body`` with its coarse norm row-scaled (``NORM2_C`` -> ``NORM2_CRS``)."""
+    if body.count(NORM2_C) != 1:
+        raise ValueError(f"rs: {body.count(NORM2_C)} coarse norms, one expected")
+    return body.replace(NORM2_C, NORM2_CRS)
+
+
 #: residual Add, then the two-pass RMSNorm of its sum; outputs the sum ``x`` (the
 #: residual stream) and the normalized ``y``
 ADDNORM = "  x = Add(a, b)\n" + NORM2
@@ -461,6 +486,8 @@ KSPLIT_BASE = {
     "slanormk": "slanorm",
     "slanormqkk": "slanormqk",
     "slanormqkrk": "slanormqkr",
+    "alyrrsqkrk": "alyrrsqkr",
+    "alyrrsfk": "alyrrsf",
 }
 #: the kinds of ``KSPLIT_BASE`` (``pf_registry``: the K-split kinds)
 KSPLIT_KINDS = frozenset(KSPLIT_BASE)
@@ -472,7 +499,10 @@ def ksplit_name(name: str, inter: int) -> str:
     ``alyrqkr<n>`` and ``alyrf<n>`` always (their down linear is the layer's), the
     ``lanorm`` / ``slanorm`` / ``slanormqk(r)`` kinds of width ``inter`` only (their
     width is the linear's K). Any other name is returned unchanged."""
-    m = re.fullmatch(r"(alyrqkr|alyrf|lanorm|slanormqkr|slanormqk|slanorm)(\d+)", name)
+    m = re.fullmatch(
+        r"(alyrqkr|alyrf|alyrrsqkr|alyrrsf|lanorm|slanormqkr|slanormqk|slanorm)(\d+)",
+        name,
+    )
     if not m:
         return name
     kind, n = m.group(1), int(m.group(2))
@@ -502,11 +532,29 @@ def ksplit_graph(base, d: Dims):
 def graph(name: str, d: Dims):
     """``(op types, body, inputs {name: shape}, output shape, initializers,
     variant generators)`` of a fused template ``name``."""
+    mr = re.fullmatch(r"rs(slanorm|slanormqkr)(\d+)", name)
+    if mr:  # a tail (``slanorm`` / ``slanormqkr``) with the row-scaled norm
+        ops, body, ins, outs, inits, gens = graph(mr[1] + mr[2], d)
+        return [*dict.fromkeys([*ops, *RS_OPS])], _rs_body(body), ins, outs, inits, gens
+    mr = re.fullmatch(r"alyrrs(qkr|f)(\d+)", name)
+    if mr:  # the whole layer with every norm row-scaled (``rs_name``)
+        n = int(mr[2])
+        if mr[1] == "qkr":
+            return _lyr_graph(n, d, rot=True, attn=True, rs=True)
+        return _lyr_graph(n, d, attn=True, rs=True, tail=f"slanorm{d.I}")
     mk = re.fullmatch(
-        r"(alyrqkrk|alyrfk|lanormk|slanormk|slanormqkk|slanormqkrk)(\d+)", name
+        r"(alyrqkrk|alyrfk|lanormk|slanormk|slanormqkk|slanormqkrk"
+        r"|alyrrsqkrk|alyrrsfk)(\d+)",
+        name,
     )
-    if mk and mk.group(1) == "alyrqkrk":  # its variants as ``alyrqkr``'s split ones
-        return _lyr_graph(int(mk.group(2)), d, rot=True, attn=True, ksplit=True)
+    if mk and mk.group(1) in (
+        "alyrqkrk",
+        "alyrrsqkrk",
+    ):  # its variants as ``alyrqkr``'s split ones
+        return _lyr_graph(
+            int(mk.group(2)), d, rot=True, attn=True, ksplit=True,
+            rs=mk.group(1) == "alyrrsqkrk",
+        )  # fmt: skip
     if mk:  # the unsplit graph of the same width, its down linear split
         base = KSPLIT_BASE[mk.group(1)] + mk.group(2)
         return ksplit_graph(graph(base, d), d)
@@ -807,6 +855,13 @@ KSPLIT_ALYR_EXTRA = (
 ALYRF_VARIANTS = ((0, 0, 1), (0, 1, 1), (0, 2, 1), (0, 3, 1))
 
 
+def rs_name(name: str) -> str:
+    """The row-scaled family's name of a whole-layer template (``alyrqkrk4096`` ->
+    ``alyrrsqkrk4096``, ``alyrfk9728`` -> ``alyrrsfk9728``); other names unchanged."""
+    m = re.fullmatch(r"alyr(qkr|f)(k?)(\d+)", name)
+    return f"alyrrs{m[1]}{m[2]}{m[3]}" if m else name
+
+
 def lyr_name(t: str) -> str:
     """The name in ``lyrqk`` / ``alyrqk`` of tensor ``t`` of its first half
     (``lanorm`` / ``alanorm``)."""
@@ -823,6 +878,7 @@ def _lyr_graph(
     tail: str | None = None,
     split: bool = False,
     ksplit: bool = False,
+    rs: bool = False,
 ):
     """``lyrqk<n>``: ``lanorm<n>`` + gate / up linears + ``slanormqk<I>``
     (``lyrqkr<n>``: ``slanormqkr<I>``, q / k rotated in the program;
@@ -834,8 +890,12 @@ def _lyr_graph(
     if n != d.nh * d.hd:
         raise ValueError(f"lyrqk{n}: the model's q width is {d.nh * d.hd}")
     ops1, b1, ins1, _, in1, g1s = graph(f"{'a' if attn else ''}lanorm{n}", d)
+    if rs:  # every norm row-scaled: the residual's own norm (the first half) too
+        b1, ops1 = _rs_body(b1), [*dict.fromkeys([*ops1, *RS_OPS])]
     tail = tail or f"slanormqk{'r' if rot else ''}{d.I}"
-    qk = tail.startswith("slanormqk")
+    if rs:
+        tail = "rs" + tail
+    qk = "slanormqk" in tail
     ops2, b2, ins2, outs2, in2, g2s = graph(tail, d)
     b1 = re.sub(r"\b[A-Za-z_]\w*\b", lambda t: _lyr_word(t.group(0)), b1)
     b2 = b2.replace("  x = Add(a, b)\n", "  x = Add(x_1, b)\n")
@@ -904,6 +964,7 @@ def _lyr_word(w: str) -> str:
     an attribute name or a keyword stays."""
     tensors = set(LYR_ATTN) | set(LYR_RENAME)
     tensors |= {"b", "x", "sq0", "m0", "e0", "r0", "u", "sq", "m", "e", "r", "d", "y"}
+    tensors |= {"ax", "mx", "xs"}  # the row-scaled coarse pass (``NORM2_CRS``)
     tensors |= {"eps", "eps0", "w"}
     return lyr_name(w) if w in tensors else w
 
@@ -998,6 +1059,8 @@ def needed(cfg) -> list[str]:
         if cfg.fuse == 4 or cfg.fuse >= 10:  # layout 4: a linear after the norm
             raise NotImplementedError(f"ksplit: layout {cfg.fuse} is not wired")
         names = [ksplit_name(n, inter) for n in names]
+    if getattr(cfg, "rs_norm", False) and getattr(cfg, "fuse", 0) >= 8:
+        names = [rs_name(n) for n in names]
     return list(dict.fromkeys(names))
 
 

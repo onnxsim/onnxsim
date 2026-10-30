@@ -579,12 +579,17 @@ class Generator:
     def _calib(rg, model, signed=()):
         """U16 MinMax of every range, and of the graph's float constants;
         ``signed``: tensors calibrated as a dynamic MatMul operand
-        (``ur.signed_absmax``, as ``ur.calibrate_graph`` does)."""
+        (``ur.signed_absmax``, as ``ur.calibrate_graph`` does). A graph with the
+        row-scaled norm's ops (``ur.NEW_OPS``): the symmetric zero-point rule of
+        ``calibrate_graph`` (``_mul_input``)."""
+        new = any(n.op_type in ur.NEW_OPS for n in model.graph.node)
         q = {
             k: (
                 ur.signed_absmax(max(abs(lo), abs(hi)))
                 if k in signed
-                else ur.unsigned_minmax(lo, hi)
+                else ur.unsigned_minmax(
+                    lo, hi, symmetric_32767=not new or ur._mul_input(model, k)
+                )
             )
             for k, (lo, hi) in rg.items()
         }
@@ -676,6 +681,7 @@ class Generator:
         attn=None,
         ranges=False,
         ksplit=False,
+        rs=False,
     ):
         """The two-pass RMSNorm as one program (``nrm<H>``), or with the
         residual Add before it (``anorm<H>``: ``x = a + b``, outputs ``x`` and
@@ -726,7 +732,7 @@ class Generator:
             rgs.append(rg)
             x = (a + b).astype(F32)
         rg, mc = self._stage(
-            tpl.NORM2_C,
+            tpl.NORM2_CRS if rs else tpl.NORM2_C,
             {"x": [1, H]},
             {"u": [1, H]},
             {"x": list(x) + list(x * F32(2))},
@@ -1346,6 +1352,7 @@ class Generator:
             w=cfg.merged_weight("o_proj", li),
             attn=self._attn_samples(A),
             ranges=True,
+            rs=cfg.rs_norm,
         )
         rgs = [{tpl.lyr_name(t): r for t, r in rg.items()} for rg in rg1]
         m = r2("m")  # the norm's output as the gate / up linears' input (x2)
@@ -1374,6 +1381,7 @@ class Generator:
             post=head,
             ranges=True,
             ksplit=cfg.ksplit,
+            rs=cfg.rs_norm,
         )
         rgs += [{("x_1" if t == "a" else t): r for t, r in rg.items()} for rg in rg2]
         wgu = cfg.merged_weight("gu", li)
@@ -1390,6 +1398,8 @@ class Generator:
                 name, key = f"{name}x{cfg.vocab}", "alyrfh"
         if cfg.ksplit:  # the down linear split along K (``pf_templates.ksplit_name``)
             name = tpl.ksplit_name(name, cfg.I)
+        if cfg.rs_norm:  # the row-scaled family (``pf_templates.rs_name``)
+            name = tpl.rs_name(name)
         if split:
             name, key = f"alyrqkrs{cfg.nh * cfg.hd}", "alyrs"
             sw = cfg.merged_weight("gu", li, gptq=False)
@@ -1891,6 +1901,7 @@ def resolve_templates(cfg, root, spec_arg=None, owners=None, verify=None, plans=
         split_layers=tuple(cfg.split_first["layers"]),
         split_keys=tuple(cfg.split_first["keys"]),
         ksplit_down=bool(cfg.ksplit),
+        rs_norm=bool(cfg.rs_norm),
     )
     # the layer count is not compared: no template depends on it
     got = (spec.H, spec.I, spec.nh, spec.nkv, spec.hd, spec.eps, spec.vocab,
