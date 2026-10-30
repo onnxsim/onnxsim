@@ -1133,6 +1133,239 @@ def _windowed_forward(m: onnx.ModelProto, strict: bool = True) -> onnx.ModelProt
     return m
 
 
+def _fma(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """``a * b + c`` in float32 with one rounding (float64 holds the exact float32
+    product; the double rounding of the sum is the only emulation error)."""
+    return (a.astype(np.float64) * b.astype(np.float64) + c.astype(np.float64)).astype(
+        F
+    )
+
+
+#: Sleef's expf (``expf_u10``, the FMA form), the exp of Pulsar2's float Sigmoid and
+#: Softmax: range reduction by ln 2 (split L2U + L2L), a degree-6 polynomial, 2**n.
+_SLEEF_INV_LN2 = F(1.442695040888963407359924681001892137426645954152985934135449406931)
+_SLEEF_L2U = F(0.693145751953125)
+_SLEEF_L2L = F(1.428606765330187045e-06)
+_SLEEF_POLY = (
+    0.000198527617612853646278381,
+    0.00139304355252534151077271,
+    0.00833336077630519866943359,
+    0.0416664853692054748535156,
+    0.166666671633720397949219,
+    0.5,
+)
+
+
+def _sleef_exp(x: np.ndarray) -> np.ndarray:
+    """Pulsar2's float exp (see ``_SLEEF_*``). Bit-exact on the Sigmoid probes (65,536
+    and 4,010 inputs over [-88, 88], subnormal tail included) and the Softmax probes."""
+    d = np.asarray(x, F)
+    q = np.rint((d * _SLEEF_INV_LN2).astype(F)).astype(F)
+    s = _fma(q, -_SLEEF_L2U, d)
+    s = _fma(q, -_SLEEF_L2L, s)
+    u = F(_SLEEF_POLY[0])
+    for c in _SLEEF_POLY[1:]:
+        u = _fma(u, s, F(c))
+    u = _fma((s * s).astype(F), u, s)
+    u = (u + F(1)).astype(F)
+    return (u * np.exp2(q.astype(np.float64)).astype(F)).astype(F)
+
+
+def _sigmoid_pulsar(x: np.ndarray) -> np.ndarray:
+    """Pulsar2's float Sigmoid: ``1 / (1 + exp(-x))`` with ``_sleef_exp``."""
+    x = np.asarray(x, F)
+    return (F(1) / (F(1) + _sleef_exp(-x))).astype(F)
+
+
+def _lanes_sum(v: np.ndarray, lanes: int) -> np.ndarray:
+    """Sum of the last axis as Pulsar2's vector kernels do: 16 lanes (a zero-padded
+    tail), the chunks added lane-wise in order, then the lanes halved pairwise."""
+    n = v.shape[-1]
+    pad = (-n) % lanes
+    pv = np.concatenate([v, np.zeros(v.shape[:-1] + (pad,), F)], axis=-1)
+    pv = pv.reshape(v.shape[:-1] + (-1, lanes))
+    acc = pv[..., 0, :].copy()
+    for j in range(1, pv.shape[-2]):
+        acc = (acc + pv[..., j, :]).astype(F)
+    while acc.shape[-1] > 1:
+        h = acc.shape[-1] // 2
+        acc = (acc[..., :h] + acc[..., h:]).astype(F)
+    return acc[..., 0]
+
+
+def _softmax_pulsar(x: np.ndarray) -> np.ndarray:
+    """Pulsar2's float Softmax over the last axis: ``x - max``, ``_sleef_exp``, the
+    16-lane sum (``_lanes_sum``), then every exp times the reciprocal of the sum."""
+    x = np.asarray(x, F)
+    e = _sleef_exp((x - x.max(axis=-1, keepdims=True)).astype(F))
+    s = _lanes_sum(e, 16)[..., None]
+    return (e * (F(1) / s)).astype(F)
+
+
+def _model4(X: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """A MatMul of one or two rows as Pulsar2 accumulates it: four lanes, the first
+    four terms into lane 0, then term k into lane (k - 4) % 4, each step a float32
+    product and sum; the result is (lane0 + lane2) + (lane1 + lane3). Exact on the
+    probes at K = 16, 32, 64, 2560 and 4096 (N = 256, 1024, 4096)."""
+    R, K = X.shape
+    acc = [np.zeros((R, W.shape[1]), F) for _ in range(4)]
+
+    def add(a, k):
+        return (a + (X[:, k : k + 1] * W[k][None, :]).astype(F)).astype(F)
+
+    for k in range(min(4, K)):
+        acc[0] = add(acc[0], k)
+    for k in range(4, K):
+        acc[(k - 4) % 4] = add(acc[(k - 4) % 4], k)
+    return ((acc[0] + acc[2]).astype(F) + (acc[1] + acc[3]).astype(F)).astype(F)
+
+
+def _seqfma_matmul(X: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """A MatMul of four rows: one sequential chain per output, each term a fused
+    multiply-add (the product exact, one rounding per step)."""
+    R, K = X.shape
+    acc = np.zeros((R, W.shape[1]), F)
+    for k in range(K):
+        acc = (
+            acc.astype(np.float64)
+            + X[:, k : k + 1].astype(np.float64) * W[k][None, :].astype(np.float64)
+        ).astype(F)
+    return acc
+
+
+def _matmul_pulsar(X: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """Pulsar2's float MatMul by row count (2-D, or 3-D over a batch): 1-2 rows
+    ``_model4``, 4 rows ``_seqfma_matmul``, other row counts numpy (not modelled)."""
+    X = np.asarray(X, F)
+    W = np.asarray(W, F)
+    if X.ndim == 3:
+        return np.stack(
+            [
+                _matmul_pulsar(X[b], W[b] if W.ndim == 3 else W)
+                for b in range(X.shape[0])
+            ]
+        )
+    if X.shape[0] in (1, 2):
+        return _model4(X, W)
+    if X.shape[0] == 4:
+        return _seqfma_matmul(X, W)
+    return (X @ W).astype(F)
+
+
+#: Pulsar2's ReduceMean sum: 512-element blocks, 32 lanes (lane b takes index
+#: b mod 32 of a block, sequentially), lanes r, r+8, r+16, r+24 combined per group
+#: r, the 8 groups summed in order; then / n in float32. Revealed at K = 128, 256,
+#: 2560 (``_RM_*``); the row-scaled norms of the Qwen3 build match it to the ulp.
+_RM_BLOCK, _RM_LANES, _RM_GROUPS = 512, 32, 8
+
+
+def _rowmean_sum(x: np.ndarray) -> np.ndarray:
+    """``sum`` over the last axis of a (rows, K) float32 array (K >= 32)."""
+    rows, K = x.shape
+    lanes = [None] * _RM_LANES
+    for base in range(0, K, _RM_BLOCK):
+        for b in range(_RM_LANES):
+            tmp = None
+            for k in range(base + b, min(base + _RM_BLOCK, K), _RM_LANES):
+                tmp = x[:, k].copy() if tmp is None else (tmp + x[:, k]).astype(F)
+            if tmp is None:
+                continue
+            lanes[b] = tmp if lanes[b] is None else (lanes[b] + tmp).astype(F)
+    per = _RM_LANES // _RM_GROUPS
+    groups = []
+    for r in range(_RM_GROUPS):
+        acc = lanes[r]
+        for j in range(1, per):
+            acc = (acc + lanes[r + _RM_GROUPS * j]).astype(F)
+        groups.append(acc)
+    tot = groups[0]
+    for r in range(1, _RM_GROUPS):
+        tot = (tot + groups[r]).astype(F)
+    return tot
+
+
+def _rowmean_pulsar(x: np.ndarray) -> np.ndarray:
+    """ReduceMean over the last axis as Pulsar2 sums it (``_rowmean_sum``, / K)."""
+    x = np.asarray(x, F)
+    K = x.shape[-1]
+    return (_rowmean_sum(x.reshape(-1, K)) / F(K)).reshape(x.shape[:-1]).astype(F)
+
+
+def _pulsar_op(n: onnx.NodeProto, env: dict) -> np.ndarray | None:
+    """The modelled value of node ``n`` (a list of outputs), or None when ``n`` is
+    not one of the modelled ops in the form the model covers."""
+    attrs = {a.name: onnx.helper.get_attribute_value(a) for a in n.attribute}
+    x = env[n.input[0]] if n.input else None
+    if n.op_type == "Sigmoid":
+        return [_sigmoid_pulsar(x)]
+    if (
+        n.op_type == "Softmax"
+        and x.ndim >= 1
+        and attrs.get("axis", -1) in (-1, x.ndim - 1)
+    ):
+        return [_softmax_pulsar(x)]
+    if n.op_type == "MatMul":
+        w = env[n.input[1]]
+        batched = x.ndim == 3 and w.ndim == 3 and w.shape[0] == x.shape[0]
+        if (x.ndim == 2 and w.ndim == 2) or batched or (x.ndim == 3 and w.ndim == 2):
+            return [_matmul_pulsar(x, w)]
+        return None
+    if (
+        n.op_type == "ReduceMean"
+        and len(n.input) == 1
+        and x.ndim >= 2
+        and x.shape[-1] >= _RM_LANES
+    ):
+        axes = list(attrs.get("axes", [-1]))
+        if axes not in ([-1], [x.ndim - 1]) or attrs.get("keepdims", 1) != 1:
+            return None
+        return [_rowmean_pulsar(x)[..., None]]
+    return None
+
+
+def _pulsar_forward(m: onnx.ModelProto):
+    """``run(feeds)``: every tensor of ``m`` (inputs and node outputs) for one sample,
+    the float forward of ``calibrate_graph`` for ``NEW_OPS`` graphs: Sigmoid, Softmax,
+    MatMul and ReduceMean as Pulsar2 computes them (the ``_*_pulsar`` models above),
+    every other node by the onnx reference op of its own."""
+    g = m.graph
+    consts = {i.name: onnx.numpy_helper.to_array(i) for i in g.initializer}
+    refs = []
+    for n in g.node:
+        ins = [i for i in n.input if i]
+        nn = onnx.helper.make_node(n.op_type, ins, list(n.output), domain=n.domain)
+        nn.attribute.extend(n.attribute)
+        model = onnx.helper.make_model(
+            onnx.helper.make_graph(
+                [nn],
+                "node",
+                [
+                    onnx.helper.make_tensor_value_info(i, onnx.TensorProto.FLOAT, None)
+                    for i in ins
+                ],
+                [
+                    onnx.helper.make_tensor_value_info(o, onnx.TensorProto.FLOAT, None)
+                    for o in n.output
+                ],
+            ),
+            opset_imports=[onnx.helper.make_opsetid("", 17)],
+        )
+        model.ir_version = 8
+        refs.append(ReferenceEvaluator(model))
+
+    def run(feeds: dict) -> dict:
+        env = {**consts, **feeds}
+        for n, ref in zip(g.node, refs):
+            res = _pulsar_op(n, env)
+            if res is None:
+                res = ref.run(None, {i: env[i] for i in n.input if i})
+            for o, v in zip(n.output, res):
+                env[o] = np.asarray(v)
+        return env
+
+    return run
+
+
 def _u8_weights(m: onnx.ModelProto) -> onnx.ModelProto:
     """A copy of ``m`` with every constant MatMul operand (a 2-D weight) rounded to
     its per-column 8-bit grid: ``s = max|w| / 127.5`` per output column,
@@ -1185,6 +1418,7 @@ def calibrate_graph(
     directory: str,
     samples: Mapping | None = None,
     weight_u8: bool | None = None,
+    pulsar_ref: bool | None = None,
 ) -> dict[str, tuple[float, int]]:
     """``calibrate`` for a fused program: U16 MinMax of every tensor (inputs,
     constants, inner tensors, output) over the float forward of the whole
@@ -1197,7 +1431,10 @@ def calibrate_graph(
     ``NEW_OPS`` only; the older graphs' calibrations are unchanged. For ``NEW_OPS``
     graphs also: a data-movement output takes its source's calibration (``_moves_share``),
     a FullyConnected's activation is unsigned MinMax (only a dynamic MatMul operand is
-    signed), and an unsigned zero point divides ``-lo`` by the scale in float32."""
+    signed), and an unsigned zero point divides ``-lo`` by the scale in float32.
+    ``pulsar_ref``: the float forward models Pulsar2's own float ops (``_pulsar_forward``:
+    Sigmoid and Softmax by Sleef's exp, MatMul and ReduceMean by their accumulation
+    order). ``None`` (the default) turns it on for graphs with ``NEW_OPS`` only."""
     m = onnx.load(os.path.join(directory, "model.onnx"))
     consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
@@ -1213,10 +1450,18 @@ def calibrate_graph(
         }
     u8 = new if weight_u8 is None else weight_u8
     fwd = _u8_weights(m) if u8 else m
-    ref = ReferenceEvaluator(_windowed_forward(fwd, strict=False) if new else fwd)
+    # ``pulsar_ref`` (default: NEW_OPS graphs): the float forward with Pulsar2's
+    # Sigmoid, Softmax, MatMul and ReduceMean (``_pulsar_forward``) in place of the
+    # windowed ReduceMean of ``_windowed_forward``; the older graphs keep the reference.
+    use_pulsar = new if pulsar_ref is None else pulsar_ref
+    if use_pulsar:
+        run = _pulsar_forward(fwd)
+    else:
+        ref = ReferenceEvaluator(_windowed_forward(fwd, strict=False) if new else fwd)
+        run = lambda feeds: ref.run(None, feeds, intermediate=True)  # noqa: E731
     lo, hi = {}, {}
     for j in range(len(data[ins[0]])):
-        res = ref.run(None, {n: data[n][j].astype(F) for n in ins}, intermediate=True)
+        res = run({n: data[n][j].astype(F) for n in ins})
         for k, v in res.items():
             a = np.asarray(v)
             if (
