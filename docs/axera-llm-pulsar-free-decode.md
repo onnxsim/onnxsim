@@ -1595,8 +1595,8 @@ words; the scale-lane records differ by one or two units), plus the job layout o
 Fixing that needs the row-scaled norm's scales to match Pulsar2's float32 values, not another template
 calibration, so it is the next blocker. Not run: the 36-layer set, the layer and card checks, any Qwen3-4B ms
 per token. The shipped outputs are unaffected: this change is a documentation update only, no code changed.
-Evidence: `TB/logs/` (prescreen, greedy, the v0 build and gate logs, `diff_v0.log`) and the template and native
-builds under `TB/templates` and `TB/ident` (scratch, not committed).
+Evidence: the TB run logs (prescreen, greedy search, the v0 build, gate and record diff). The template and native
+builds were scratch and are not kept.
 
 ## Limits
 
