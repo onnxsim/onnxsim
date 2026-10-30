@@ -108,10 +108,12 @@ jobs:
     # executes with the repo's secrets, and the preview builds the PR head
     # (possibly from a fork), so a maintainer has to ask for it.
     if: >-
-      github.event_name != 'issue_comment' || (
-        github.event.issue.pull_request != null &&
-        startsWith(github.event.comment.body, '/preview') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      github.repository == 'onnxsim/onnxsim' && (
+        github.event_name != 'issue_comment' || (
+          github.event.issue.pull_request != null &&
+          startsWith(github.event.comment.body, '/preview') &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+        )
       )
     environment:
       name: ${{ case(github.event_name == 'push', 'github-pages', github.event_name == 'release', 'npm', '') }}
