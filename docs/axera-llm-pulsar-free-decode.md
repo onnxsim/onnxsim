@@ -1545,6 +1545,18 @@ The rules are gated on `NEW_OPS`: `calibrate_graph` of all 136 shipped fused tem
 `origin/master` (checked, not a `pf_generate` run). Host tests: `test_data_movement_*`, `test_fully_connected_activation_*`,
 `test_unsigned_zero_point_divides_in_float32`.
 
+**Pulsar2's float ops in the calibration forward (`pulsar_ref`, NEW_OPS graphs).** The float forward of
+`calibrate_graph` now computes Sigmoid and Softmax the way Pulsar2 does, and MatMul and ReduceMean by their
+accumulation order (`u16_retarget._pulsar_forward`). Sigmoid is `1 / (1 + exp(-x))` with Sleef's `expf_u10`
+(FMA form); Softmax is `x - max`, the same exp, a 16-lane sum (tree over the lanes), and multiplication by the
+reciprocal. Both reproduce Pulsar2 7.0's float dumps bit for bit (65,536 and 4,010 Sigmoid inputs over [-88, 88],
+Softmax rows of 5, 7, 16, 17, 37, 300 and 1,024). MatMul: 1-2 rows four lanes, 4 rows a fused-multiply-add chain;
+ReduceMean: 512-element blocks of 32 lanes, then 8 groups. On the native seed-777 build, `quant_axmodel.json`
+matches go from 48 of 114 (the windowed forward) to 77 of 114, and the ReduceMean-derived ones from 5 of 21 to 14 of 21.
+Still open: the 128-wide means (`qm`, `km`) differ from Pulsar2's sum order by one ulp in 5 of 32 rows (the sum of 128
+squares), so `qm` is 3 ulps off, and the float dump of the layer's `yq` agrees on 86% of its elements. Graphs without
+NEW_OPS keep the reference forward.
+
 Rebuilt variants (template + native seed-777 build each, one Pulsar2 build at a time, `S4/templates`), with the
 identity gate of `retarget_graph` and then `compare_jobs`:
 

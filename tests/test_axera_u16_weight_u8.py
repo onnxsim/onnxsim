@@ -114,7 +114,10 @@ NATIVE = {
     "m": 1.5258858184097335e-05,
 }
 #: the ReduceMean outputs with the float weights are 0.1-0.24% off (26987 ulp for m0_1)
-ULP = {"m0_1": 32, "m0": 32, "qm": 2, "km": 2, "um": 2, "m_1": 2, "m": 2}
+#: with Pulsar2's float ops (``u16_retarget._pulsar_forward``, the default for NEW_OPS
+#: graphs) the scales sit 0-5 ulps off; ``qm`` (a 128-wide mean) is 3 ulps off, one row
+#: of 32 short by 1 ulp in its sum (the width-128 ReduceMean order is still open)
+ULP = {"m0_1": 0, "m0": 5, "qm": 3, "km": 0, "um": 0, "m_1": 0, "m": 0}
 
 
 @pytest.mark.skipif(
