@@ -372,7 +372,7 @@ jobs:
           python-version: ${{ matrix.py_ver }}
       # uv installs (and links) much faster than pip; its global cache (keyed on
       # the requirements + this workflow) caches the packages, torch included.
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           # Per-Python cache: setup-uv's key omits the interpreter version, so
