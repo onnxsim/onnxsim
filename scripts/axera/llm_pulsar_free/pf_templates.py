@@ -851,6 +851,20 @@ KSPLIT_ALYR_EXTRA = (
     (3, 0, 0.8),
     (3, 2, 0.8),
 )
+#: Qwen3-1.7B's (H = 2048) further ``alyrqkrk`` variants after ``KSPLIT_ALYR_EXTRA``
+#: (v13, ...): the first norm's variant 3 (the residual Add can shift 14, the one case
+#: the 4B fix used) with RoPE variants and k-branch scales not built before. Layer 26 of
+#: the layout-8 first set was refused by all 13 (2026-11-03: the n32 Add shift 14, ties
+#: ck / cq, gate / q, b_1 / s_a). Gated on H = 2048 so the 4B variant list, and its key,
+#: are unchanged.
+KSPLIT_ALYR_WIDE = (
+    (3, 1, 0.8),
+    (3, 1, 1.25),
+    (3, 2, 1.25),
+    (3, 3, 0.8),
+    (3, 3, 1.25),
+    (3, 0, 1.5),
+)
 #: ``alyrf``'s variants (no RoPE): ``alanorm``'s v0 with each ``slanorm`` variant
 ALYRF_VARIANTS = ((0, 0, 1), (0, 1, 1), (0, 2, 1), (0, 3, 1))
 
@@ -937,6 +951,8 @@ def _lyr_graph(
         variants = [v for v in variants if v[0] == 0]
     if ksplit and attn:  # the K-split variants after the six (``KSPLIT_ALYR_EXTRA``)
         variants = [*variants, *KSPLIT_ALYR_EXTRA]
+        if d.H == 2048:  # Qwen3-1.7B: its own further variants (``KSPLIT_ALYR_WIDE``)
+            variants = [*variants, *KSPLIT_ALYR_WIDE]
     for i, j, ks in variants if qk else ALYRF_VARIANTS:
         ga, gb = g1s[i], g2s[j]
         gb, ws = gb if isinstance(gb, tuple) else (gb, {})
