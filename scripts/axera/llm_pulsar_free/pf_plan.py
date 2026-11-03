@@ -140,6 +140,13 @@ class Plan:
         self.io = {st: self.bind_set(st) for st in self.sets}
         self.run("setup")
 
+    def _cached(self, key, make):
+        """``make()`` once per ``key`` (fake mode's float weights, shared by the sets)."""
+        cache = self.__dict__.setdefault("_wcache", {})
+        if key not in cache:
+            cache[key] = make()
+        return cache[key]
+
     def _float_fn(self, wh, k, pk, e):
         """A program's float function keyed by its input names (fake mode)."""
         cfg = self.cfg
@@ -149,18 +156,32 @@ class Plan:
         )
         if leaf["kind"] == "add":
             return lambda f: f["a"] + f["b"]
+        # memory: the weights below are cached per (linear, layer, path): each one
+        # was rebuilt for every entry (both sets, both K halves), a full copy each
         if pf_ksplit.in_ksplit(e, k, pk):
             _, path = pf_ksplit.find(e, k, pk)
-            w = pf_ksplit.leaf_weight(cfg, k, li, path)
+            w = self._cached(
+                ("leaf", k, li, tuple(tuple(p) for p in path)),
+                lambda: pf_ksplit.leaf_weight(cfg, k, li, path),
+            )
             return lambda f: f["x"] @ w
         if e["kind"] == "split":
-            q, r = cfg.split_weights(cfg.merged_weight(k, li, gptq=False))
-            w = q if pk.endswith("_hi") else r
+            qr = self._cached(
+                ("split", k, li),
+                lambda: cfg.split_weights(cfg.merged_weight(k, li, gptq=False)),
+            )
+            w = qr[0] if pk.endswith("_hi") else qr[1]
             return lambda f: f["x"] @ w
         if e["kind"] == "linear":
-            w = cfg.merged_weight(k, li)
+            w = self._cached(("linear", k, li), lambda: cfg.merged_weight(k, li))
             return lambda f: f["x"] @ w
-        ev = FusedEval(os.path.join(self.root, e["model"]), {}, ())
+        # one evaluator per model file: the first set's entries are symlinks to the
+        # rest set's files (write_float_set), so both sets' programs share its weights
+        real = os.path.realpath(os.path.join(self.root, e["model"]))
+        cache = self.__dict__.setdefault("_fev", {})
+        if real not in cache:
+            cache[real] = FusedEval(real, {}, ())
+        ev = cache[real]
         return lambda f: ev(**f)
 
     def buf(self, n):
@@ -852,6 +873,23 @@ def write_float_set(cfg: pf_model.Config, root: str) -> None:
                     and k in man_rest[wh]
                 ):
                     ml[k] = dict(man_rest[wh][k], shared="rest")
+                elif (
+                    # memory: a fused float program of a layer without a split has the
+                    # same graph and weights in both sets. The first set's entry is its
+                    # own program (its own bindings; a ``shared`` entry would reuse the
+                    # rest set's bindings, which is wrong) whose file is a symlink to the
+                    # rest set's, so the float weights are one evaluator (``_float_fn``)
+                    st == "first"
+                    and os.environ.get("LLM_PF_FIRST_SHARE", "1") == "1"
+                    and k in man_rest.get(wh, {})
+                    and man_rest[wh][k].get("kind") == "fused"
+                    and (li is None or li not in cfg.split_first["layers"])
+                ):
+                    src = os.path.join(root, man_rest[wh][k]["model"])
+                    path = os.path.join(D, f"{k}.axmodel")
+                    if not os.path.lexists(path):
+                        os.symlink(os.path.relpath(src, D), path)
+                    ml[k] = dict(man_rest[wh][k], model=os.path.relpath(path, root))
                 elif k in fused or k in MERGED_LINEAR:
                     path = os.path.join(D, f"{k}.axmodel")
                     onnx.save(_float_program(cfg, d, wh, k, ml, fused), path)
@@ -878,6 +916,16 @@ def write_float_set(cfg: pf_model.Config, root: str) -> None:
             man_rest = man
 
 
+def _trim_heap() -> None:
+    """Return the freed heap to the OS (glibc ``malloc_trim``); a no-op elsewhere."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def decode(plan: Plan, cfg: pf_model.Config, ids) -> list[dict]:
     """Teacher-forced steps over ``ids`` vs ``float_step``; one row per step."""
     fK, fV = cfg.new_cache()
@@ -889,6 +937,12 @@ def decode(plan: Plan, cfg: pf_model.Config, ids) -> list[dict]:
         lg, tm = plan.step(tok, p)
         wall = time.time() - ts
         flg, _ = cfg.float_step(fK, fV, tok, p)
+        # memory: the float reference's per-call evaluators sit in reference cycles
+        # (a full layer of weights each): collect them, then return the heap
+        import gc
+
+        gc.collect()
+        _trim_heap()
         rows.append(
             dict(
                 p=p,

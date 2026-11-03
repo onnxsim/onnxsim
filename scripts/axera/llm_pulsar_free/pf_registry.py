@@ -259,6 +259,11 @@ SPECS = {
         "llama160m", H=768, I=3072, nh=12, nkv=12, hd=64, eps=1e-06,
         vocab=32000, layers=12, qk_norm=False, default_layout=3,
     ),
+    "qwen3_1.7b": ModelSpec(
+        "qwen3_1.7b", H=2048, I=6144, nh=16, nkv=8, hd=128, eps=1e-06,
+        vocab=151936, layers=28, qk_norm=True, split_layers=(0, 1, 2),
+        split_keys=("gu", "down_proj"), default_layout=8, ksplit_down=True,
+    ),
     "qwen3_4b": ModelSpec(
         "qwen3_4b", H=2560, I=9728, nh=32, nkv=8, hd=128, eps=1e-06,
         vocab=151936, layers=36, qk_norm=True, split_layers=(0, 1, 2),

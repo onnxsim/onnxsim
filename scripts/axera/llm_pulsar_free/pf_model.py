@@ -109,6 +109,19 @@ MODELS = {
         add_offset="exact",
         ksplit=True,
     ),
+    # Qwen3-1.7B (2048 / 6144, 28 layers): the K = 6144 down projection is
+    # absent from the shipped templates, so it is split (ksplit).
+    "qwen3_1.7b": dict(
+        repo="Qwen/Qwen3-1.7B",
+        revision="70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        first_pos=0,
+        zero_pos0=False,
+        share_linears=True,
+        split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
+        fuse=8,
+        add_offset="exact",
+        ksplit=True,
+    ),
     "qwen3_0.6b": dict(
         repo="Qwen/Qwen3-0.6B",
         revision="c1899de289a04d12100db370d81485cdf75e47ca",
@@ -230,8 +243,18 @@ class Config:
         return z, [a.copy() for a in z]
 
     def float_layer(self, li, x, K, V, p) -> dict:
-        if li not in self._lg:
+        # memory: the evaluator of a layer copies all its float weights, so the
+        # per-layer cache holds a second float copy of the model (about 7 GB for
+        # Qwen3-1.7B); by default the layer's evaluator is built for this call and
+        # released after it. LLM_PF_KEEP_FLOAT_LAYERS=1 keeps the cache (faster).
+        keep = os.environ.get("LLM_PF_KEEP_FLOAT_LAYERS") == "1"
+        if keep and li not in self._lg:
             self._lg[li] = ReferenceEvaluator(ld.layer_graph(self.model, li, self.S))
+        ev = (
+            self._lg[li]
+            if keep
+            else ReferenceEvaluator(ld.layer_graph(self.model, li, self.S))
+        )
         feeds = {
             "input": np.asarray(x, F32).reshape(1, self.H),
             "K_cache": K,
@@ -239,7 +262,7 @@ class Config:
             "mask": self.mask_ref(p),
             **ld.rope_inputs(self.model, p),
         }
-        t = self._lg[li].run(None, feeds, intermediate=True)
+        t = ev.run(None, feeds, intermediate=True)
         return {k: np.asarray(v, F32) for k, v in t.items()}
 
     def embed_row(self, token) -> np.ndarray:
