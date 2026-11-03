@@ -400,9 +400,15 @@ class Config:
             sin_k=tile(r["sink"], nkv),
         )
         if self.qk_norm:
-            lw = self.model.layer_weights(li)
+            # only the two gains: ``layer_weights`` widens every weight of the layer
+            # (about 2.9 s of a 1.7B step in host time, 2026-11-03)
+            pre = f"model.layers.{li}.self_attn."
+            qn, kn = (
+                self.model.weight(pre + "q_norm.weight"),
+                self.model.weight(pre + "k_norm.weight"),
+            )
             P = rr.perm_matrix(self.hd)
-            for key, g, n in (("q", lw["qn"], nh), ("k", lw["kn"], nkv)):
+            for key, g, n in (("q", qn, nh), ("k", kn, nkv)):
                 g = np.asarray(g, F32).reshape(1, self.hd)
                 out[f"cos_{key}"] = (out[f"cos_{key}"] * tile(g, n)).astype(F32)
                 out[f"sin_{key}"] = (out[f"sin_{key}"] * tile(g @ P, n)).astype(F32)
