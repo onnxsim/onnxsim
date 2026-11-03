@@ -81,12 +81,8 @@ class Chain:
                         continue
                     _, r = cfg.split_weights(w)
                     sp = e["split"]
-                    hi = LinearEval(
-                        w, sp["hi"]["calibration"]["x"], sp["hi"]["calibration"]["y"]
-                    )
-                    lo = LinearEval(
-                        r, sp["lo"]["calibration"]["x"], sp["lo"]["calibration"]["y"]
-                    )
+                    hi = self._half(sp["hi"], w, e, card_add)
+                    lo = self._half(sp["lo"], r, e, card_add)
                     ad = AddEval(
                         sp["add"]["calibration"],
                         card_add,
@@ -112,6 +108,27 @@ class Chain:
                             e["calibration"], card_add, e.get("add_offset") == "exact"
                         )
                     )
+
+    @staticmethod
+    def _half(entry, w, parent, card_add):
+        """One half (``hi`` / ``lo``) of a split linear: a linear (``LinearEval``), or a
+        ``ksplit`` of two K slices of ``w`` and their Add (each part reads its slice of
+        the input on the input's grid, as the card's Split does)."""
+        if entry["kind"] != "ksplit":
+            return LinearEval(w, entry["calibration"]["x"], entry["calibration"]["y"])
+        kp, parts = entry["k_part"], entry["parts"]
+        if len(parts) != 2:
+            raise ValueError(f"ksplit with {len(parts)} parts: two expected")
+        evs = [
+            LinearEval(
+                w[i * kp : (i + 1) * kp], p["calibration"]["x"], p["calibration"]["y"]
+            )
+            for i, p in enumerate(parts)
+        ]
+        ad = AddEval(
+            entry["add"]["calibration"], card_add, parent.get("add_offset") == "exact"
+        )
+        return lambda x: ad(evs[0](x[:, :kp]), evs[1](x[:, kp:]))
 
     def layer_fused(self, li, x, K, V, p):
         """A layer of the merged layout. ``x``: the embedding row (layer 0) or
@@ -387,8 +404,11 @@ class Chain:
         return self.f[("post", "lm_head")](xn).reshape(-1)
 
 
-def run(cfg, ids, chains) -> list[dict]:
-    """Teacher-forced steps over ``ids``; one row per step vs ``float_step``."""
+def run(cfg, ids, chains, make=None) -> list[dict]:
+    """Teacher-forced steps over ``ids``; one row per step vs ``float_step``.
+    ``chains`` maps each set to its ``Chain`` or ``None``; ``make(st)`` builds one on
+    first use. Memory: every set but ``rest`` (used at most at one position, e.g.
+    ``first`` at ``first_pos``) is released after its step."""
     K = [np.zeros((cfg.S + 1, cfg.kvd), F32) for _ in range(cfg.L)]
     V = [np.zeros((cfg.S + 1, cfg.kvd), F32) for _ in range(cfg.L)]
     fK, fV = cfg.new_cache()
@@ -397,11 +417,33 @@ def run(cfg, ids, chains) -> list[dict]:
         if p == 0 and cfg.zero_pos0:
             continue  # zero end to end (the float caches stay zero there too)
         flg, _ = cfg.float_step(fK, fV, tok, p)
-        c = chains[cfg.set_of(tok, p, chains)]
+        st = cfg.set_of(tok, p, list(chains))
+        if chains[st] is None:
+            chains[st] = make(st)
+        c = chains[st]
         x = cfg.model.embed([int(tok)]).reshape(1, cfg.H).astype(F32)
         for li in range(cfg.L):
             x = c.layer(li, x, K[li], V[li], p)
         lg = c.post(x)
+        if make is not None and st != "rest":  # built lazily: release after use
+            chains[st] = None
+            del c
+        # memory: per-token temporaries (the float reference's cycles, fragmented
+        # heap); the same as ``pf_plan.decode``. Progress and RSS per token.
+        import gc
+
+        gc.collect()
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
+        with open("/proc/self/status") as f:
+            rss_mb = (
+                int([ln for ln in f if ln.startswith("VmRSS")][0].split()[1]) // 1024
+            )
+        print(f"p={p} set={st} rss {rss_mb} MB", flush=True)
         rows.append(
             dict(
                 p=p,
@@ -430,10 +472,13 @@ def main():
     ids = cfg.passage_ids(lay.EVAL_DOCS[a.doc])[: a.prompt]
     keys = set(filter(None, a.exact.split(",")))
     fw = set(filter(None, a.float_weights.split(",")))
-    chains = {
-        st: Chain(cfg, st, a.float, keys, fw, card_add=a.card_add) for st in cfg.sets()
-    }
-    rows = run(cfg, ids, chains)
+    chains = {st: None for st in cfg.sets()}  # built on first use (``run``)
+    rows = run(
+        cfg,
+        ids,
+        chains,
+        lambda st: Chain(cfg, st, a.float, keys, fw, card_add=a.card_add),
+    )
     res = dict(
         model=cfg.name,
         doc=lay.EVAL_DOCS[a.doc],
