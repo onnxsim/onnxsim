@@ -81,6 +81,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -207,6 +208,16 @@ def wdown(w):
     return {"w": w[:kp].astype(F32), "wl": w[kp:].astype(F32)}
 
 
+#: template variants the host gate accepts but the card does not (``pf_check --set``):
+#: ``(template, variant dir, layer)`` -> the measured reason. The generator skips them
+#: and takes the next variant that the gate accepts (Qwen3-1.7B layout 8, 2026-11-03).
+CARD_REJECTED = {
+    ("slanormk6144", "v1", 27): (
+        "card: the last layer's dn off by 1.79 (first set) and 0.045 (rest) on the card"
+    ),
+}
+
+
 class Generator:
     def __init__(self, cfg: pf_model.Config, root: str):
         self.cfg, self.root, self.out = cfg, root, cfg.out
@@ -271,9 +282,15 @@ class Generator:
             tdirs += [
                 os.path.join(base, v) for v in sorted(vs, key=lambda v: int(v[1:]))
             ]
+        mlayer = re.search(r"/L(\d+)/", dst.replace(os.sep, "/"))
+        layer = int(mlayer.group(1)) if mlayer else None
         for tdir in tdirs:
             axm = os.path.join(tdir, "out", "compiled.axmodel")
             if not os.path.exists(axm):
+                continue
+            rej = CARD_REJECTED.get((name, os.path.basename(tdir), layer))
+            if rej:
+                refused.append(f"{self._rel(tdir, self.root)}: {rej}")
                 continue
             try:
                 qt = q(tdir) if callable(q) else q
