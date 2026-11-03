@@ -246,11 +246,21 @@ class cmake_build(setuptools.Command):
                     cmake_args.append(
                         '-DONNX_CUSTOM_PROTOC_EXECUTABLE={}'.format(protoc))
             if COVERAGE:
-                cmake_args.append('-DONNX_COVERAGE=ON')
                 # Instrument onnxsim's own C++ (onnxsim.cpp, cpp2py_export.cc,
-                # ...) too, so a pytest run reports coverage for the code that
-                # actually runs behind the Python extension, not just vendored
-                # ONNX. gcovr collects the resulting .gcda from the build dir.
+                # ...) so a pytest run reports coverage for the code that
+                # actually runs behind the Python extension. gcovr collects the
+                # resulting .gcda from the build dir.
+                #
+                # Deliberately NOT setting -DONNX_COVERAGE=ON: that applies
+                # --coverage to the whole ONNX build, including the protobuf
+                # that onnx fetches. With GCC 15 (ubuntu-26.04 runners) the
+                # instrumented protobuf 31.1 fails to compile:
+                #   "cannot tail-call: call may throw exception caught locally
+                #    or perform cleanups"
+                # (GCC 15 accepts [[clang::musttail]], which protobuf enables,
+                # and -fprofile-arcs cleanups break it). The coverage report is
+                # filtered to onnxsim/ anyway (scripts/coverage/run_coverage.sh
+                # excludes third_party), so vendored ONNX coverage was dropped.
                 cmake_args.append('-DONNXSIM_COVERAGE=ON')
             if COVERAGE or DEBUG:
                 # in order to get accurate coverage information, the
