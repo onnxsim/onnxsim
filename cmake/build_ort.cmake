@@ -34,6 +34,14 @@ set(_ort_cmake_args
   "-Donnxruntime_BUILD_SHARED_LIB=ON"
   "-Donnxruntime_BUILD_UNIT_TESTS=OFF")
 
+# ORT compiles with -Wall -Wextra -Werror. GCC 15's libstdc++ <bits/unicode.h>
+# trips a false-positive -Wmaybe-uninitialized inside ORT's logging.cc, which
+# fails the build on that toolchain. Downgrade only that one diagnostic to a
+# warning for ORT's build; -Werror stays in force for everything else.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  list(APPEND _ort_cmake_args "-DCMAKE_CXX_FLAGS=-Wno-error=maybe-uninitialized")
+endif()
+
 # Forward the toolchain explicitly: unlike add_subdirectory, ExternalProject_Add
 # configures ORT as a fully separate CMake invocation and inherits nothing from
 # the parent configure automatically.
