@@ -299,3 +299,18 @@ tokens; none of the three variants is identical to float on any prompt:
 
 So the patched files also run correctly on the 64-row layout, and both methods are better
 than plain on SmolLM2 as well. All three repeat themselves after the first sentence.
+
+## Column solver backends and the plain-rounding fallback
+
+`llm_int4_requant.py` has two options for the GPTQ solve (the model is unchanged):
+
+- The GPTQ column solve is onnxsim's own solver (`onnxsim.gptq._gptq_quantize_columns`). It
+  is the only solver; the numpy loop is kept only as the test reference. It takes the rule's
+  code range (rule A [-8, 7], rule B [-7, 7]) and matches the numpy loop exactly on both.
+- `--plain-fallback` keeps plain rounding for a matrix when its GPTQ codes have a larger
+  H-weighted error on the true weights. On the 4B s4 build (chat-calibrated, 36 layers) the
+  down projection of the last layer went from 0.033 to 0.518 under GPTQ, which the fallback
+  is meant to catch. The fallback is off by default, so existing results reproduce.
+
+Tests: `tests/test_axera_requant_backend.py` (the onnxsim comparison skips when onnxsim's
+GPTQ solver can't be imported).
