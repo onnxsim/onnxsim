@@ -48,18 +48,15 @@ def test_keep_better_keeps_gptq_when_it_is_better():
     assert chosen is good
 
 
-def test_backend_default_is_numpy():
-    assert rq.CODE_BACKEND == "numpy"
-
-
+@pytest.mark.parametrize("rule", ["A", "B"])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_onnxsim_codes_match_numpy(seed):
+def test_onnxsim_codes_match_numpy(rule, seed):
     try:
         from onnxsim.gptq import _gptq_quantize_columns  # noqa: F401
     except ImportError as exc:
         pytest.skip(f"onnxsim GPTQ solver not available: {exc!r}")
     w, h, u, s = _problem(rows=96, cin=300, seed=seed)
-    lo, hi = rq.CODE_RANGE["B"]
+    lo, hi = rq.CODE_RANGE[rule]
     cpu = rq._gptq_codes(w, u, s, lo, hi)
     got = rq._onnxsim_codes(w, h, s, lo, hi, 0.01)
     # the two solvers agree on every code (both float64)

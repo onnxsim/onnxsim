@@ -304,10 +304,9 @@ than plain on SmolLM2 as well. All three repeat themselves after the first sente
 
 `llm_int4_requant.py` has two options for the GPTQ solve (the model is unchanged):
 
-- `--backend onnxsim` runs the column loop with onnxsim's own GPTQ solver
-  (`onnxsim.gptq._gptq_quantize_columns`, C++ on the CPU). It gives the same codes as the
-  numpy loop (the default, `--backend numpy`). On a 2560 x 9728 down projection one scale
-  candidate takes 15.6 s with this solver.
+- The GPTQ column solve is onnxsim's own solver (`onnxsim.gptq._gptq_quantize_columns`). It
+  is the only solver; the numpy loop is kept only as the test reference. It takes the rule's
+  code range (rule A [-8, 7], rule B [-7, 7]) and matches the numpy loop exactly on both.
 - `--plain-fallback` keeps plain rounding for a matrix when its GPTQ codes have a larger
   H-weighted error on the true weights. On the 4B s4 build (chat-calibrated, 36 layers) the
   down projection of the last layer went from 0.033 to 0.518 under GPTQ, which the fallback

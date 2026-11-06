@@ -436,20 +436,12 @@ def _base_scale(w: np.ndarray, rule: str) -> np.ndarray:
     return (np.abs(w).max(axis=1) / 7).astype(np.float64)
 
 
-#: which column solver ``gptq`` uses: "numpy" (``_gptq_codes`` below) or "onnxsim"
-#: (onnxsim's own GPTQ column loop, ``onnxsim.gptq._gptq_quantize_columns``, C++ on the CPU;
-#: it gives the same codes as the numpy loop)
-CODE_BACKEND = "numpy"
-
-
 def _onnxsim_codes(w, h, s, lo, hi, damping):
-    """GPTQ codes from onnxsim's column solver, per-row scale ``s``. ``h`` is the
-    dead-diagonal-fixed Hessian ``gptq`` builds; onnxsim applies ``damping`` itself.
-    onnxsim clips to [-7, 7] only (rule B), so other rules are refused."""
+    """GPTQ codes from onnxsim's column solver for the rule's code range ``[lo, hi]``,
+    per-row scale ``s``. ``h`` is the dead-diagonal-fixed Hessian ``gptq`` builds; onnxsim
+    applies ``damping`` itself."""
     from onnxsim.gptq import _gptq_quantize_columns
 
-    if (lo, hi) != (-7, 7):
-        raise ValueError(f"onnxsim solver clips to [-7, 7] (rule B), not [{lo}, {hi}]")
     q = _gptq_quantize_columns(
         np.ascontiguousarray(w, np.float64),
         np.ascontiguousarray(s, np.float64)[:, None],
@@ -457,6 +449,8 @@ def _onnxsim_codes(w, h, s, lo, hi, damping):
         np.ascontiguousarray(h, np.float64),
         damping,
         128,
+        qmin=float(lo),
+        qmax=float(hi),
     )
     return np.asarray(q, np.float64)
 
@@ -506,18 +500,13 @@ def gptq(
     dead = np.diag(h) == 0  # inputs that were never non-zero
     h[dead, dead] = 1.0
     w64[:, dead] = 0.0
-    hinv = np.linalg.inv(h + damping * np.mean(np.diag(h)) * np.eye(len(h)))
-    u = np.linalg.cholesky((hinv + hinv.T) / 2).T  # H^-1 = u^T u
     s0 = _base_scale(w.astype(np.float64), rule)
     best_e = np.full(len(w64), np.inf)
     best_s = s0.copy()
     best_q = np.zeros_like(w64)
     for a in scale_candidates:
         s = s0 * a
-        if CODE_BACKEND == "onnxsim":
-            q = _onnxsim_codes(w64, h, s, lo, hi, damping)
-        else:
-            q = _gptq_codes(w64, u, s, lo, hi)
+        q = _onnxsim_codes(w64, h, s, lo, hi, damping)
         qh = q @ h
         den = (qh * q).sum(axis=1)
         num = (qh * w64).sum(axis=1)
@@ -1076,12 +1065,6 @@ def main(argv=None) -> int:
     ap.add_argument("--ridge", type=float, default=0.3, help="gptqa: ridge towards W")
     ap.add_argument("--damping", type=float, default=0.01, help="gptq: Hessian damping")
     ap.add_argument(
-        "--backend",
-        default="numpy",
-        choices=("numpy", "onnxsim"),
-        help="gptq column solver: numpy (default) or onnxsim's own column loop (C++)",
-    )
-    ap.add_argument(
         "--plain-fallback",
         action="store_true",
         help="per matrix, keep plain rounding when the gptq codes have a larger "
@@ -1089,8 +1072,6 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--report", help="write the verification report to this JSON file")
     args = ap.parse_args(argv)
-    global CODE_BACKEND
-    CODE_BACKEND = args.backend
     seqs = None
     if args.method in ("gptq", "gptqa"):
         seqs = load_calibration(args.calibration, args.checkpoint, args.seq_len)
