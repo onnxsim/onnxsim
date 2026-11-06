@@ -600,5 +600,69 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+def quantize_int_qwen3(w: np.ndarray, bits: int = 8) -> tuple[np.ndarray, np.ndarray]:
+    """The s8 rule of the Qwen3 builds (verified on Qwen3-0.6B layer 0, every projection,
+    and on the Qwen3-config tiny build): ``scale = max|w| / 2**(bits-1)-1``, positive, and
+    ``q = floor(w / scale + 0.5)`` clipped to the signed range. The synthetic Llama builds
+    use ``quantize_int`` above (``-peak / 2**(bits-1)``). The two families differ, so
+    ``s8_scale_rule`` picks one by model type."""
+    w = np.asarray(w, np.float32)
+    top = (1 << (bits - 1)) - 1
+    peak = w[np.arange(len(w)), np.argmax(np.abs(w), axis=1)]
+    scale = (np.abs(peak) / np.float32(top)).astype(np.float32)
+    q = np.floor(w / scale[:, None] + np.float32(0.5))
+    return np.clip(q, -(top + 1), top).astype(np.int64), scale
+
+
+def s8_scale_rule(model_type: str):
+    """``quantize_int_qwen3`` for Qwen3 checkpoints, ``quantize_int`` otherwise."""
+    return quantize_int_qwen3 if model_type == "qwen3" else quantize_int
+
+
+def s8_code_site(row: int, col: int, cin: int) -> tuple[int, int, int]:
+    """``(low-nibble byte, shift, row-sum tail offset)`` of ``w[row, col]`` inside its
+    32-row block, in the block's own bytes. The high nibble is ``CHUNK`` bytes after the
+    low one. Each column block has its own row-sum tail (one int32 per row, Q16.16 of
+    ``-sum(q) / 2``); the tail of the block that holds ``col`` is returned."""
+    pos = cum = 0
+    for width in column_blocks(cin):
+        if col < cum + width:
+            off, sh = _int_offsets("s8", width)
+            r, lc = row % ROW_BLOCK, col - cum
+            return (
+                int(off[r, lc]) + pos,
+                int(sh[r, lc]),
+                pos + _part_bytes("s8", width) - 512,
+            )
+        pos += _part_bytes("s8", width)
+        cum += width
+    raise IndexError(f"column {col} outside {cin}")
+
+
+def s8_add_to_codes(
+    params: bytes, block_start: int, cin: int, edits: Sequence[tuple[int, int, int]]
+) -> bytes:
+    """``params`` with ``delta`` added to each code ``(row, col, delta)`` of the s8 block
+    at ``block_start`` (rows 0..31 of the block). Only those codes' nibble bytes and the
+    row sums of the affected column blocks change; every other byte is kept. Codes must
+    stay in the signed range."""
+    import struct
+
+    b = bytearray(params)
+    for row, col, delta in edits:
+        byte, sh, tail = s8_code_site(row, col, cin)
+        byte += block_start
+        tail += block_start
+        code = ((b[byte] >> sh) & 15) | (((b[byte + CHUNK] >> sh) & 15) << 4)
+        new = code + delta
+        if not 0 <= new <= 255:
+            raise ValueError(f"code of ({row}, {col}) would leave the range: {code - 128} + {delta}")
+        b[byte] = (b[byte] & ~(15 << sh) & 0xFF) | ((new & 15) << sh)
+        b[byte + CHUNK] = (b[byte + CHUNK] & ~(15 << sh) & 0xFF) | (((new >> 4) & 15) << sh)
+        ro = tail + (row % ROW_BLOCK) * 8
+        struct.pack_into("<i", b, ro, struct.unpack_from("<i", b, ro)[0] - int(round(delta / 2 * 65536)))
+    return bytes(b)
+
+
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
