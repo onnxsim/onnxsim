@@ -436,6 +436,23 @@ def _base_scale(w: np.ndarray, rule: str) -> np.ndarray:
     return (np.abs(w).max(axis=1) / 7).astype(np.float64)
 
 
+#: which column solver ``gptq`` uses: "numpy" (``_gptq_codes`` below) or "webgpu"
+#: (``gpu_gptq.GpuGptq``, float32 on a WebGPU adapter; the codes match numpy up to rounding ties)
+CODE_BACKEND = "numpy"
+_GPU = None
+
+
+def _solve_codes(w, u, s, lo, hi):
+    global _GPU
+    if CODE_BACKEND == "webgpu":
+        if _GPU is None:
+            from gpu_gptq import GpuGptq
+
+            _GPU = GpuGptq()
+        return _GPU.codes(w, u, s, lo, hi).astype(np.float64)
+    return _gptq_codes(w, u, s, lo, hi)
+
+
 def _gptq_codes(w, u, s, lo, hi, block=128):
     """Column-sequential rounding of ``w`` (float64, ``[rows, cin]``) at per-row scale
     ``s``. ``u`` is the upper Cholesky factor of ``H^-1``; each column's rounding error
@@ -489,7 +506,7 @@ def gptq(
     best_q = np.zeros_like(w64)
     for a in scale_candidates:
         s = s0 * a
-        q = _gptq_codes(w64, u, s, lo, hi)
+        q = _solve_codes(w64, u, s, lo, hi)
         qh = q @ h
         den = (qh * q).sum(axis=1)
         num = (qh * w64).sum(axis=1)
@@ -578,6 +595,16 @@ class Calibration:
         ]
 
 
+def _keep_better(w: np.ndarray, codes: tuple, h: np.ndarray, rule: str) -> tuple:
+    """``codes`` (GPTQ) or plain rounding of ``w``, whichever has the lower H-weighted
+    error on the true weights ``w``. Both are ``(q int8, scale float32)``."""
+    w64 = w.astype(np.float64)
+    plain = _as_codes(*quantize_plain(w, rule))
+    e_gptq = h_error(w64, dequantize(*codes).astype(np.float64), h).sum()
+    e_plain = h_error(w64, dequantize(*plain).astype(np.float64), h).sum()
+    return plain if e_plain < e_gptq else codes
+
+
 class SequentialQuantizer:
     """Codes for every layer of ``model``, one ``layer(li)`` call per layer, in order.
 
@@ -594,12 +621,14 @@ class SequentialQuantizer:
         ridge: float = 0.3,
         damping: float = 0.01,
         scale_candidates: Sequence[float] = SCALE_CANDIDATES,
+        plain_fallback: bool = False,
     ):
         if method not in ("plain", "gptq", "gptqa"):
             raise ValueError(f"method {method!r}: one of plain, gptq, gptqa")
         if rule not in CODE_RANGE:
             raise ValueError(f"quantizer rule {rule!r}: 'A' or 'B'")
         self.model, self.rule, self.method = model, rule, method
+        self.plain_fallback = plain_fallback
         self.ridge, self.damping, self.candidates = (
             ridge,
             damping,
@@ -640,6 +669,8 @@ class SequentialQuantizer:
             for k in keys:
                 target = fw[k] if c is None else retarget(fw[k], c, h, self.ridge)
                 codes[k] = gptq(target, h, self.rule, self.damping, self.candidates)
+                if self.plain_fallback:
+                    codes[k] = _keep_better(fw[k], codes[k], h, self.rule)
                 w64 = fw[k].astype(np.float64)
                 energy = h_error(w64, 0 * w64, h).sum()
                 stats[k] = {
@@ -844,6 +875,7 @@ def requantize_directory(
     damping: float = 0.01,
     scale_candidates: Sequence[float] = SCALE_CANDIDATES,
     log: Optional[Callable[[str], None]] = None,
+    plain_fallback: bool = False,
 ) -> dict:
     """Copy the compiled s4 directory ``src_dir`` to ``dst_dir`` (which must not exist
     or be empty) and rewrite each layer file's weight blocks with ``method``'s codes
@@ -894,7 +926,14 @@ def requantize_directory(
     quantizer = None
     if method != "identity":
         quantizer = SequentialQuantizer(
-            model, rule, method, calibration_token_ids, ridge, damping, scale_candidates
+            model,
+            rule,
+            method,
+            calibration_token_ids,
+            ridge,
+            damping,
+            scale_candidates,
+            plain_fallback=plain_fallback,
         )
     os.makedirs(dst_dir, exist_ok=True)
     report = {
@@ -1025,8 +1064,22 @@ def main(argv=None) -> int:
     ap.add_argument("--seq-len", type=int, default=128, help="tokens per text sequence")
     ap.add_argument("--ridge", type=float, default=0.3, help="gptqa: ridge towards W")
     ap.add_argument("--damping", type=float, default=0.01, help="gptq: Hessian damping")
+    ap.add_argument(
+        "--backend",
+        default="numpy",
+        choices=("numpy", "webgpu"),
+        help="gptq column solver: numpy (default) or webgpu (needs wgpu and an adapter)",
+    )
+    ap.add_argument(
+        "--plain-fallback",
+        action="store_true",
+        help="per matrix, keep plain rounding when the gptq codes have a larger "
+        "H-weighted error (guards matrices where calibration makes gptq worse)",
+    )
     ap.add_argument("--report", help="write the verification report to this JSON file")
     args = ap.parse_args(argv)
+    global CODE_BACKEND
+    CODE_BACKEND = args.backend
     seqs = None
     if args.method in ("gptq", "gptqa"):
         seqs = load_calibration(args.calibration, args.checkpoint, args.seq_len)
@@ -1043,6 +1096,7 @@ def main(argv=None) -> int:
         ridge=args.ridge,
         damping=args.damping,
         log=lambda line: print(line, flush=True),
+        plain_fallback=args.plain_fallback,
     )
     if args.report:
         with open(args.report, "w") as f:

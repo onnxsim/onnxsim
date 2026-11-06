@@ -299,3 +299,21 @@ tokens; none of the three variants is identical to float on any prompt:
 
 So the patched files also run correctly on the 64-row layout, and both methods are better
 than plain on SmolLM2 as well. All three repeat themselves after the first sentence.
+
+## Column solver backends and the plain-rounding fallback
+
+`llm_int4_requant.py` has two options for the GPTQ solve (the model is unchanged):
+
+- `--backend webgpu` runs the column loop on a WebGPU adapter (`gpu_gptq.py`, through the
+  optional `wgpu` package: `pip install wgpu`). One thread per row, the block update as a GEMM,
+  float32 on the GPU. On a 2560 x 9728 down projection one scale candidate takes 1.4 s, against
+  15.6 s for the onnxsim solver on the CPU. Codes differ from the float64 CPU solve only at
+  rounding ties (0.06% of codes on that matrix; H-error within 0.003%). The default stays
+  `--backend numpy`.
+- `--plain-fallback` keeps plain rounding for a matrix when its GPTQ codes have a larger
+  H-weighted error on the true weights. On the 4B s4 build (chat-calibrated, 36 layers) the
+  down projection of the last layer went from 0.033 to 0.518 under GPTQ, which the fallback
+  is meant to catch. The fallback is off by default, so existing results reproduce.
+
+Tests: `tests/test_axera_requant_backend.py` (the WebGPU comparison skips without `wgpu` or an
+adapter; the fallback choice needs neither).
