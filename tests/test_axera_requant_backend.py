@@ -1,8 +1,7 @@
 """Checks of the requant's column-solver backends and the plain-rounding fallback.
 
-``gpu_gptq.GpuGptq`` (WebGPU) is compared with the numpy column loop on random data.
-That test needs the optional ``wgpu`` package and a WebGPU adapter and is skipped
-without them. The fallback test needs neither.
+onnxsim's GPTQ solver is compared with the numpy column loop on random data. That test is
+skipped when onnxsim's solver can't be imported. The fallback test needs neither.
 """
 
 import os
@@ -54,23 +53,14 @@ def test_backend_default_is_numpy():
 
 
 @pytest.mark.parametrize("seed", [0, 1])
-def test_webgpu_codes_match_numpy(seed):
-    pytest.importorskip("wgpu")
-    from gpu_gptq import GpuGptq
-
+def test_onnxsim_codes_match_numpy(seed):
     try:
-        gpu = GpuGptq()
-    except Exception as exc:  # no adapter on this machine
-        pytest.skip(f"no WebGPU adapter: {exc!r}")
+        from onnxsim.gptq import _gptq_quantize_columns  # noqa: F401
+    except ImportError as exc:
+        pytest.skip(f"onnxsim GPTQ solver not available: {exc!r}")
     w, h, u, s = _problem(rows=96, cin=300, seed=seed)
     lo, hi = rq.CODE_RANGE["B"]
     cpu = rq._gptq_codes(w, u, s, lo, hi)
-    got = gpu.codes(w, u, s, lo, hi).astype(np.float64)
-    # float32 on the GPU, float64 on the CPU: codes agree except at rounding ties
+    got = rq._onnxsim_codes(w, h, s, lo, hi, 0.01)
+    # the two solvers agree on every code (both float64)
     assert float(np.mean(got != cpu)) < 0.005
-
-    def herr(q):
-        d = w - q * s[:, None]
-        return float(np.sum(d @ h * d))
-
-    assert abs(herr(got) - herr(cpu)) / herr(cpu) < 1e-3

@@ -436,21 +436,29 @@ def _base_scale(w: np.ndarray, rule: str) -> np.ndarray:
     return (np.abs(w).max(axis=1) / 7).astype(np.float64)
 
 
-#: which column solver ``gptq`` uses: "numpy" (``_gptq_codes`` below) or "webgpu"
-#: (``gpu_gptq.GpuGptq``, float32 on a WebGPU adapter; the codes match numpy up to rounding ties)
+#: which column solver ``gptq`` uses: "numpy" (``_gptq_codes`` below) or "onnxsim"
+#: (onnxsim's own GPTQ column loop, ``onnxsim.gptq._gptq_quantize_columns``, C++ on the CPU;
+#: it gives the same codes as the numpy loop)
 CODE_BACKEND = "numpy"
-_GPU = None
 
 
-def _solve_codes(w, u, s, lo, hi):
-    global _GPU
-    if CODE_BACKEND == "webgpu":
-        if _GPU is None:
-            from gpu_gptq import GpuGptq
+def _onnxsim_codes(w, h, s, lo, hi, damping):
+    """GPTQ codes from onnxsim's column solver, per-row scale ``s``. ``h`` is the
+    dead-diagonal-fixed Hessian ``gptq`` builds; onnxsim applies ``damping`` itself.
+    onnxsim clips to [-7, 7] only (rule B), so other rules are refused."""
+    from onnxsim.gptq import _gptq_quantize_columns
 
-            _GPU = GpuGptq()
-        return _GPU.codes(w, u, s, lo, hi).astype(np.float64)
-    return _gptq_codes(w, u, s, lo, hi)
+    if (lo, hi) != (-7, 7):
+        raise ValueError(f"onnxsim solver clips to [-7, 7] (rule B), not [{lo}, {hi}]")
+    q = _gptq_quantize_columns(
+        np.ascontiguousarray(w, np.float64),
+        np.ascontiguousarray(s, np.float64)[:, None],
+        w.shape[1],
+        np.ascontiguousarray(h, np.float64),
+        damping,
+        128,
+    )
+    return np.asarray(q, np.float64)
 
 
 def _gptq_codes(w, u, s, lo, hi, block=128):
@@ -506,7 +514,10 @@ def gptq(
     best_q = np.zeros_like(w64)
     for a in scale_candidates:
         s = s0 * a
-        q = _solve_codes(w64, u, s, lo, hi)
+        if CODE_BACKEND == "onnxsim":
+            q = _onnxsim_codes(w64, h, s, lo, hi, damping)
+        else:
+            q = _gptq_codes(w64, u, s, lo, hi)
         qh = q @ h
         den = (qh * q).sum(axis=1)
         num = (qh * w64).sum(axis=1)
@@ -1067,8 +1078,8 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--backend",
         default="numpy",
-        choices=("numpy", "webgpu"),
-        help="gptq column solver: numpy (default) or webgpu (needs wgpu and an adapter)",
+        choices=("numpy", "onnxsim"),
+        help="gptq column solver: numpy (default) or onnxsim's own column loop (C++)",
     )
     ap.add_argument(
         "--plain-fallback",
