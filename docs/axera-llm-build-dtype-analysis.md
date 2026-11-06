@@ -156,3 +156,63 @@ byte map of a whole layer file are in `docs/axera-llm-int4-requant.md`.
 - What selects the quantizer rule and the 64-row blocks.
 - Activation dtypes other than `--hidden_state_type bf16`.
 - Any on-device run. This task did no device work.
+
+## llm_build dtype coverage (Qwen3-0.6B, pulsar2:7.0-lite)
+
+`scripts/axera/pulsar2_docker.llm_build` takes every value `pulsar2 llm_build` 7.0 lists
+(`--hidden_state_type`, `--weight_type`, `--post_weight_type`; validated before Docker, see
+`tests/test_axera_llm_build_dtypes.py`). Each combination below was built once, one change
+from the control, on Qwen3-0.6B (`--prefill_len 512 --kv_cache_len 1023 --parallel 8`):
+
+| combination | hidden | layer weights | post weights | compiled | build |
+| --- | --- | --- | --- | --- | --- |
+| control | bf16 | s8 | s8 | yes | 477 s |
+| hidden fp16 | fp16 | s8 | s8 | yes | 476 s |
+| weights fp8_e4m3 | bf16 | fp8_e4m3 | s8 | yes | 406 s |
+| weights fp16 | bf16 | fp16 | s8 | yes | 403 s |
+| post bf16 | bf16 | s8 | bf16 | yes | 345 s |
+| post fp8_e4m3 | bf16 | s8 | fp8_e4m3 | yes | 355 s |
+
+`--post_weight_type s4` is rejected by the container's argument parser (its choices are
+`bf16`, `s8`, `fp8_e5m2`, `fp8_e4m3`). Compiling says nothing about the card: none of these
+builds has been run on the card or checked against the float reference. Only s4 layer
+weights halve the weight bytes; fp8 weights are the same size as s8, and fp16 weights double
+them. The emitter and requant tools still accept only the s4 and s8 layouts; any other
+dtype needs its record layout learned from a build before it can be emitted.
+
+## s8 weights of a real Qwen3 build, and a card edit (2026-11-06, milestone 1)
+
+**Scale rule depends on the model family.** The synthetic Llama builds use
+`quantize_int` (`s = -peak / 128`). Qwen3 builds use `s = |peak| / 127`,
+`q = floor(w / s + 0.5)`, clipped to [-128, 127] (`quantize_int_qwen3`,
+`s8_scale_rule("qwen3")`). Checked three ways:
+
+- Qwen3-0.6B, layer 0 (`llm_build --weight_type s8`, prefill 512): every projection
+  (q, k, v, o, gate, up, down) at the rule. Codes differ from the rule only at rounding ties
+  (|w/s - round| < 1e-3): 781 to 3158 codes per projection of 1 to 3 M, none elsewhere.
+- Qwen3-0.6B post model (`lm_head`): the first scales match the same rule.
+- The same random weights built with a Qwen3 config (hidden 1024, q/k norm weights of ones):
+  the same rule, the same tie-only mismatches (at most 6 codes per projection).
+- The same weights built with a Llama config (tiny, f32 and bf16 checkpoints): the synthetic
+  `-peak / 128` rule.
+
+**Where the scales are.** Each column block keeps its own copy of the 32 row scales in its
+tail, so a 32-row scale array occurs once per column block. Locate a block from its first
+occurrence minus the offset of the scale array inside an encoded block (taken from
+`encode_block`). Do not assume the scales sit at the end of the block.
+
+**Edits on the card (Qwen3-0.6B layer 0, `out_ctrl`; health check before and after each run,
+all 0.0):**
+
+- Post model, `lm_head` row 5, code -4 -> 60 (+64), only that row's nibble bytes and row sum
+  changed. Logits: exactly logit 5 changed (+0.0225); the other 151,935 did not.
+- Layer 0, `down_proj` row 0, the same 3033 columns (39 skipped for overflow), +32 and +64:
+  the residual output changed only at channel 0, and the change doubled (0.0518 -> 0.1035).
+  K and V outputs were identical to the control.
+- A single code step (+8, +16) on one column moved the output by less than one bf16 step,
+  so it showed no change. Larger edits are needed to see one code on a 1024-wide row.
+
+The helpers are `s8_code_site`, `s8_add_to_codes` (edits codes and the affected row sums,
+refuses out-of-range codes) and `quantize_int_qwen3`. Tests: `tests/test_axera_s8_patch.py`.
+This establishes that a weight edit made outside Pulsar2 is read by the card and changes
+only the outputs the weight feeds. It does not establish that an edited program is accurate.

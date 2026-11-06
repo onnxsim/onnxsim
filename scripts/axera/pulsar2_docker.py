@@ -589,6 +589,12 @@ class LLMBuildResult:
     stdout_tail: str = ""
 
 
+#: every value ``pulsar2 llm_build`` 7.0 accepts (its --help): hidden state, layer weights, post weights
+LLM_BUILD_HIDDEN_TYPES = ("fp16", "bf16", "fp32")
+LLM_BUILD_WEIGHT_TYPES = ("fp16", "bf16", "fp32", "s8", "s4", "fp8_e5m2", "fp8_e4m3")
+LLM_BUILD_POST_TYPES = ("bf16", "s8", "fp8_e5m2", "fp8_e4m3")
+
+
 def llm_build(
     work_dir: str,
     hf_checkpoint_rel_path: str,
@@ -596,6 +602,7 @@ def llm_build(
     *,
     hidden_state_type: str = "bf16",
     weight_type: str = "s8",
+    post_weight_type: str = "s8",
     prefill_len: int = 512,
     kv_cache_len: int = 1023,
     chip: str = "AX650",
@@ -616,6 +623,12 @@ def llm_build(
     Confirmed real timing: ~7-8 minutes for a 0.6B model with `parallel=8`
     on a 32-core host.
     """
+    if hidden_state_type not in LLM_BUILD_HIDDEN_TYPES:
+        raise ValueError(f"hidden_state_type {hidden_state_type!r}: {LLM_BUILD_HIDDEN_TYPES}")
+    if weight_type not in LLM_BUILD_WEIGHT_TYPES:
+        raise ValueError(f"weight_type {weight_type!r}: {LLM_BUILD_WEIGHT_TYPES}")
+    if post_weight_type not in LLM_BUILD_POST_TYPES:
+        raise ValueError(f"post_weight_type {post_weight_type!r}: {LLM_BUILD_POST_TYPES}")
     if not docker_image_available(image):
         return LLMBuildResult(success=False, error=f"docker image not loaded: {image}")
 
@@ -640,6 +653,8 @@ def llm_build(
         hidden_state_type,
         "--weight_type",
         weight_type,
+        "--post_weight_type",
+        post_weight_type,
         "--prefill_len",
         str(prefill_len),
         "--kv_cache_len",
