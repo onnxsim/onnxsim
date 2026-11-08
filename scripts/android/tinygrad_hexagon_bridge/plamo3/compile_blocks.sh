@@ -6,6 +6,10 @@
 # Needs TINYGRAD_ROOT, HEXAGON_SDK_ROOT, HEXAGON_TOOLCHAIN (see onnx_remote/compile_v69.sh).
 set -eo pipefail
 src=$1; out=$2
+: "${TINYGRAD_ROOT:?set TINYGRAD_ROOT to the tinygrad fork checkout}"
+: "${HEXAGON_SDK_ROOT:?set HEXAGON_SDK_ROOT}"
+: "${HEXAGON_TOOLCHAIN:?set HEXAGON_TOOLCHAIN}"
+export PYTHON="${PYTHON:-python3}" CC="${CC:-clang-19}"
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"
 for onnx in "$src"/chunk_*.onnx; do
