@@ -8,7 +8,7 @@ coprocessor 3120 series (Knights Corner) with the k1om GCC 5.1.1 toolchain (`NFC
 ```sh
 tools/onnx-remote/knc/gemm/build_gemm_knc.sh          # -> build/knc-gemm/gemm_knc, bench_kernel
 # on the card (copy the binary over SSH as in tools/onnx-remote/knc/README.md):
-./gemm_knc M N K THREADS REPS                         # e.g. ./gemm_knc 2048 2048 2048 114 8
+./gemm_knc M N K THREADS REPS                         # e.g. ./gemm_knc 2048 2048 2048 171 8
 ./bench_kernel THREADS REPS PIN                       # kernel only, L1-resident, PIN=1 pins threads
 ```
 
@@ -22,8 +22,9 @@ Output: max error on 64 sampled entries against a double-precision reference, an
   are aligned 64-byte loads, and the k loop is unrolled by four with software prefetch.
 - **Packing**: B is packed into 32-column panels once (`sgemm_knc_pack_B`, for weights); A is packed as plain 8-row
   segments on each call (`sgemm_knc_run`).
-- **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 32 rows by 2 panels, so a B sub-panel is reused
-  across the rows of an item while it is in L1.
+- **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 32 rows by 4 panels (128 columns), so a B sub-panel is
+  reused across the rows of an item while it is in L1. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
+  slower (325 vs 382 GFLOPS) and is off by default.
 - **Threads**: a persistent pool; each thread is pinned to one hardware thread. The card numbers CPUs in groups of four per
   core, and spreading the first hardware thread of each core before the second is measured at 1.4x at 228 threads.
 - **K split** (`-DKS=n`): each K group writes a partial C, reduced at the end. It is measured slower on this card (the
@@ -39,6 +40,9 @@ Output: max error on 64 sampled entries against a double-precision reference, an
 | pinned threads, 114 threads | 290 | 14% |
 | B packed once, 114 threads | 390 | 19.5% |
 | small work items (PG=1, RC=32), 228 threads | 360 | 18% |
+| work items of 32 rows x 4 panels, 171 threads (default) | 419 | 21% |
+| same, 114 threads | 408 | 20% |
+| same, 228 threads | 376 | 19% |
 | kernel microbenchmark, 228 pinned threads (no GEMM overhead) | 765 | 38% |
 
 The nominal peak is 57 cores x 1.1 GHz x 32 flops per cycle. Run-to-run variation is about +-10%. The GEMM is not at its

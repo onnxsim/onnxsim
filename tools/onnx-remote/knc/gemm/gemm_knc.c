@@ -16,7 +16,7 @@
 #error "the KNC microkernel is written for KC == 128"
 #endif
 #ifndef PG
-#define PG 2     // 32-column panels per work item
+#define PG 4     // 32-column panels per work item
 #endif
 #ifndef RC
 #define RC 32    // rows per work item
@@ -223,7 +223,7 @@ static void pool_run(task_fn fn, void *arg) {
 // ---- GEMM ----
 typedef struct {
   const float *A, *B; float *C; float *Apk, *Bpk;
-  int M, N, K, nkc; volatile int next; int nA, nB, items, groups_n, do_pack_B; float *Cpart;
+  int M, N, K, nkc; volatile int next; int nA, nB, items, groups_n, do_pack_B; float *Cpart; int A_src;
 } job_t;
 
 static void pack_task(void *argp, int id) {
@@ -250,7 +250,8 @@ static void pack_task(void *argp, int id) {
 static void compute_task(void *argp, int id) {
   job_t *j = (job_t *)argp;
   (void)id;
-  const int N = j->N, nkc = j->nkc;
+  const int N = j->N, K = j->K, nkc = j->nkc;
+  float *Ab = aligned_alloc(64, (size_t)RC * KC * 4);   // this item's A rows for one K block (row-major, KC per row)
   for (;;) {
     int item = __sync_fetch_and_add(&j->next, 1);
     if (item >= j->items) break;
@@ -259,14 +260,21 @@ static void compute_task(void *argp, int id) {
     int rb0 = rchunk * (RC / 8), p0 = pg * PG;
     int kc_lo = g * nkc / KS, kc_hi = (g + 1) * nkc / KS;
     float *Cg = g == 0 ? j->C : j->Cpart + (size_t)(g - 1) * j->M * N;
-    for (int kc = kc_lo; kc < kc_hi; kc++)
+    for (int kc = kc_lo; kc < kc_hi; kc++) {
+      if (j->A_src) {   // pack A in place: rows rb0*8 .. rb0*8+RC-1, K block kc
+        for (int r = 0; r < RC; r++)
+          memcpy(Ab + (size_t)r * KC, j->A + (size_t)(rb0 * 8 + r) * K + kc * KC, KC * 4);
+      }
       for (int q = 0; q < PG; q++) {
         const float *Bp = j->Bpk + (((size_t)(p0 + q)) * nkc + kc) * KC * 32;   // 32 KB, reused over the chunk
-        for (int rb = rb0; rb < rb0 + RC / 8; rb++)
-          kernel_8x32(j->Apk + ((size_t)rb * nkc + kc) * KC * 8, Bp, Cg + (size_t)(rb * 8) * N + (p0 + q) * 32,
-                      N, KC, kc == kc_lo);
+        for (int rb = rb0; rb < rb0 + RC / 8; rb++) {
+          const float *Ap = j->A_src ? Ab + (size_t)(rb - rb0) * 8 * KC : j->Apk + ((size_t)rb * nkc + kc) * KC * 8;
+          kernel_8x32(Ap, Bp, Cg + (size_t)(rb * 8) * N + (p0 + q) * 32, N, KC, kc == kc_lo);
+        }
       }
+    }
   }
+  free(Ab);
 }
 
 // C += Cpart[g] for g = 1..KS-1, over row chunks.
@@ -303,6 +311,10 @@ void sgemm_knc_run(const float *A, const float *Bpk, float *C, float *Apk, int M
   j.A = A; j.Bpk = Bpk; j.C = C; j.Apk = Apk;
   j.M = M; j.N = N; j.K = K; j.nkc = K / KC;
   j.nA = M / 8; j.nB = 0; j.do_pack_B = 0;
+#ifndef INLINE_A
+#define INLINE_A 0
+#endif
+  j.A_src = INLINE_A;
   j.groups_n = N / (32 * PG);
   j.items = (M / RC) * j.groups_n * KS;
   if (KS > 1) {
@@ -311,7 +323,7 @@ void sgemm_knc_run(const float *A, const float *Bpk, float *C, float *Apk, int M
     j.Cpart = Cpart_buf;
   }
   double t0 = now_s();
-  j.next = 0; pool_run(pack_task, &j);
+  j.next = 0; if (!j.A_src) pool_run(pack_task, &j);
   double t1 = now_s();
   j.next = 0; pool_run(compute_task, &j);
   if (KS > 1) { j.next = 0; pool_run(reduce_task, &j); }
@@ -339,7 +351,7 @@ static double maxerr_sampled(const float *A, const float *B, const float *C, int
 
 int main(int argc, char **argv) {
   int M = argc > 1 ? atoi(argv[1]) : 2048, N = argc > 2 ? atoi(argv[2]) : 2048, K = argc > 3 ? atoi(argv[3]) : 2048;
-  int nth = argc > 4 ? atoi(argv[4]) : 114, reps = argc > 5 ? atoi(argv[5]) : 3;
+  int nth = argc > 4 ? atoi(argv[4]) : 171, reps = argc > 5 ? atoi(argv[5]) : 3;
   float *A = aligned_alloc(64, (size_t)M * K * 4), *B = aligned_alloc(64, (size_t)K * N * 4), *C = aligned_alloc(64, (size_t)M * N * 4);
   srand(1);
   for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (float)rand() / RAND_MAX - 0.5f;
