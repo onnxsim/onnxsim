@@ -596,3 +596,203 @@ def build_block(
     proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
     proto.ir_version = 9
     return _save(proto, out_path, external)
+
+
+#: the residual channel with massive activations in PLaMo 3 2B (layers 7-23); see build_layer_split
+MASSIVE_CHANNEL = 380
+
+
+def build_layer_split(
+    model, layer_idx, out_path, cache_len=1023, external=False, massive=MASSIVE_CHANNEL
+):
+    """One decoder layer with the residual stream split into the ordinary channels and one
+    ``massive`` channel, so that a quantized compile gives each its own range.
+
+    Inputs : hidden_m float32 [1, H-1] (all channels but ``massive``), hidden_c float32 [1, 1]
+             (the ``massive`` channel), position_ids int64 [1], past_k / past_v float32
+             [nkv, C, hd], attn_mask float32 [1, C+1] (0 for valid slots and the new token)
+    Outputs: hidden_m_out float32 [1, H-1], hidden_c_out float32 [1, 1],
+             k_new / v_new float32 [nkv, 1, hd]
+
+    Every norm is computed from the full mean square (the two parts added), and every linear
+    that reads the residual is the ordinary-channel rows plus the massive channel's row, so the
+    result equals ``build_layer``'s up to float rounding.
+    """
+    b = _Builder()
+    c = _common(b, model)
+    H, inter, nh, nkv, hd = model.H, model.I, model.nh, model.nkv, model.hd
+    g = nh // nkv
+    q_dim, k_dim = nh * hd, nkv * hd
+    keep = np.array([i for i in range(H) if i != massive])
+    full = (layer_idx + 1) % model.pattern == 0
+    inv = model.inv_full if full else model.inv_local
+    conc = model.conc if full else 1.0
+    freqs = np.outer(np.arange(MAX_POS, dtype=np.float64), inv)
+    emb_ = np.concatenate([freqs, freqs], axis=-1)
+    cos_p = b.node(
+        "Gather",
+        [b.const("sp_cos", (np.cos(emb_) * conc).astype(np.float32)), "position_ids"],
+        axis=0,
+    )
+    sin_p = b.node(
+        "Gather",
+        [b.const("sp_sin", (np.sin(emb_) * conc).astype(np.float32)), "position_ids"],
+        axis=0,
+    )
+    p = f"model.layers.layers.{layer_idx}."
+    Hm = float(H - 1)
+    hm_c = b.const("sp_Hm", np.array(Hm, np.float32))
+    hh_c = b.const("sp_H", np.array(float(H), np.float32))
+
+    def gain_split(name, offset, tag):
+        gg = offset + model.w(p + name)
+        return b.const(f"sp_{tag}_m", gg[keep].copy()), b.const(
+            f"sp_{tag}_c", gg[massive : massive + 1].copy()
+        )
+
+    def rms_split(xm, xc, gm, gc):
+        """RMS-normalize the split vector with the full-vector mean square; returns the parts."""
+        msm = b.node("ReduceMean", [b.node("Mul", [xm, xm])], axes=[-1], keepdims=1)
+        ms = b.node(
+            "Div",
+            [
+                b.node("Add", [b.node("Mul", [msm, hm_c]), b.node("Mul", [xc, xc])]),
+                hh_c,
+            ],
+        )
+        r = b.node("Sqrt", [b.node("Add", [ms, c["eps"]])])
+        return b.node("Mul", [b.node("Div", [xm, r]), gm]), b.node(
+            "Mul", [b.node("Div", [xc, r]), gc]
+        )
+
+    def cut(x, lo, hi):
+        tag = b.tmp("sp_cut")
+        return b.node(
+            "Slice",
+            [
+                x,
+                b.const(f"{tag}_s", np.array([lo], np.int64)),
+                b.const(f"{tag}_e", np.array([hi], np.int64)),
+                c["axl"],
+            ],
+        )
+
+    def split_full(x):
+        """A full-width tensor (no massive channel in it) split into the two parts."""
+        xm = b.node("Concat", [cut(x, 0, massive), cut(x, massive + 1, H)], axis=-1)
+        return xm, cut(x, massive, massive + 1)
+
+    hm_in, hc_in = "hidden_m", "hidden_c"
+    gpre_m, gpre_c = gain_split("pre_mixer_norm.weight", 1.0, "gpre")
+    xm, xc = rms_split(hm_in, hc_in, gpre_m, gpre_c)
+    Wqkv = model.w(p + "mixer.qkv_proj.weight").T
+    qkv = b.node(
+        "Add",
+        [
+            b.node("MatMul", [xm, b.const("sp_Wqkv_m", Wqkv[keep].copy())]),
+            b.node(
+                "Mul", [xc, b.const("sp_Wqkv_c", Wqkv[massive : massive + 1].copy())]
+            ),
+        ],
+    )
+    q, k, v = b.node_multi(
+        "Split",
+        [qkv, b.const("sp_split_qkv", np.array([q_dim, k_dim, k_dim], np.int64))],
+        3,
+        axis=-1,
+    )
+    shape_q = b.const("sp_shape_q", np.array([1, nh, hd], np.int64))
+    shape_kv = b.const("sp_shape_kv", np.array([1, nkv, hd], np.int64))
+    q = b.node("Transpose", [b.node("Reshape", [q, shape_q])], perm=[1, 0, 2])
+    k = b.node("Transpose", [b.node("Reshape", [k, shape_kv])], perm=[1, 0, 2])
+    v = b.node("Transpose", [b.node("Reshape", [v, shape_kv])], perm=[1, 0, 2])
+    q = b.rms(q, b.const("sp_gq", 1.0 + model.w(p + "mixer.q_norm.weight")), c["eps"])
+    k = b.rms(k, b.const("sp_gk", 1.0 + model.w(p + "mixer.k_norm.weight")), c["eps"])
+
+    def rope(x):
+        x1 = b.node("Slice", [x, c["s0"], c["sh"], c["axl"]])
+        x2 = b.node("Slice", [x, c["sh"], c["shd"], c["axl"]])
+        rot = b.node("Concat", [b.node("Neg", [x2]), x1], axis=-1)
+        return b.node("Add", [b.node("Mul", [x, cos_p]), b.node("Mul", [rot, sin_p])])
+
+    q, k = rope(q), rope(k)
+    kall = b.node("Concat", ["past_k", k], axis=1)
+    vall = b.node("Concat", ["past_v", v], axis=1)
+    qg = b.node(
+        "Reshape", [q, b.const("sp_shape_qg", np.array([nkv, g, 1, hd], np.int64))]
+    )
+    kt = b.node("Transpose", [b.node("Unsqueeze", [kall, c["ax1"]])], perm=[0, 1, 3, 2])
+    vg = b.node("Unsqueeze", [vall, c["ax1"]])
+    s = b.node(
+        "Add", [b.node("Mul", [b.node("MatMul", [qg, kt]), c["scale"]]), "attn_mask"]
+    )
+    att = b.node(
+        "Reshape",
+        [
+            b.node(
+                "Transpose",
+                [b.node("MatMul", [b.node("Softmax", [s], axis=-1), vg])],
+                perm=[2, 0, 1, 3],
+            ),
+            b.const("sp_shape_att", np.array([1, q_dim], np.int64)),
+        ],
+    )
+    o = b.node(
+        "MatMul", [att, b.const("sp_Wo", model.w(p + "mixer.o_proj.weight").T.copy())]
+    )
+    on = b.rms(
+        o, b.const("sp_gpm", 0.2 + model.w(p + "post_mixer_norm.weight")), c["eps"]
+    )
+    on_m, on_c = split_full(on)
+    h1m = b.node("Add", [hm_in, on_m])
+    h1c = b.node("Add", [hc_in, on_c])
+    gpm_m, gpm_c = gain_split("pre_mlp_norm.weight", 1.0, "gpre2")
+    xm2, xc2 = rms_split(h1m, h1c, gpm_m, gpm_c)
+    Wgu = model.w(p + "mlp.gate_up_proj.weight").T
+    gu = b.node(
+        "Add",
+        [
+            b.node("MatMul", [xm2, b.const("sp_Wgu_m", Wgu[keep].copy())]),
+            b.node(
+                "Mul", [xc2, b.const("sp_Wgu_c", Wgu[massive : massive + 1].copy())]
+            ),
+        ],
+    )
+    gate, up = b.node_multi(
+        "Split",
+        [gu, b.const("sp_split_gu", np.array([inter, inter], np.int64))],
+        2,
+        axis=-1,
+    )
+    a = b.node("Mul", [b.node("Mul", [gate, b.node("Sigmoid", [gate])]), up])
+    mo = b.node(
+        "MatMul", [a, b.const("sp_Wd", model.w(p + "mlp.down_proj.weight").T.copy())]
+    )
+    mo = b.rms(
+        mo, b.const("sp_gpM", 0.2**1.5 + model.w(p + "post_mlp_norm.weight")), c["eps"]
+    )
+    mo_m, mo_c = split_full(mo)
+    b.nodes.append(h.make_node("Add", [h1m, mo_m], ["hidden_m_out"]))
+    b.nodes.append(h.make_node("Add", [h1c, mo_c], ["hidden_c_out"]))
+    b.nodes.append(h.make_node("Identity", [k], ["k_new"]))
+    b.nodes.append(h.make_node("Identity", [v], ["v_new"]))
+    inputs = [
+        h.make_tensor_value_info("hidden_m", T.FLOAT, [1, H - 1]),
+        h.make_tensor_value_info("hidden_c", T.FLOAT, [1, 1]),
+        h.make_tensor_value_info("position_ids", T.INT64, [1]),
+        h.make_tensor_value_info("past_k", T.FLOAT, [nkv, cache_len, hd]),
+        h.make_tensor_value_info("past_v", T.FLOAT, [nkv, cache_len, hd]),
+        h.make_tensor_value_info("attn_mask", T.FLOAT, [1, cache_len + 1]),
+    ]
+    outputs = [
+        h.make_tensor_value_info("hidden_m_out", T.FLOAT, [1, H - 1]),
+        h.make_tensor_value_info("hidden_c_out", T.FLOAT, [1, 1]),
+        h.make_tensor_value_info("k_new", T.FLOAT, [nkv, 1, hd]),
+        h.make_tensor_value_info("v_new", T.FLOAT, [nkv, 1, hd]),
+    ]
+    graph = h.make_graph(
+        b.nodes, f"plamo3_layer{layer_idx}_split", inputs, outputs, b.inits
+    )
+    proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
+    proto.ir_version = 9
+    return _save(proto, out_path, external)
