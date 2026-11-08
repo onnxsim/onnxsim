@@ -38,11 +38,23 @@ def main() -> int:
         help="store the layer matrices as per-column int4, packed two per byte",
     )
     ap.add_argument(
+        "--rows",
+        type=int,
+        default=0,
+        help="export row-block graphs (prefill, or a padded decode step) with this many rows",
+    )
+    ap.add_argument(
+        "--split",
+        default="",
+        help="column slices per matrix for row-block graphs, e.g. qkv:2,o:2,gu:8,d:4",
+    )
+    ap.add_argument(
         "--head",
         action="store_true",
         help="also export the final norm + lm_head (1.1 GB: over the wire limit)",
     )
     a = ap.parse_args()
+    split = {k: int(v) for k, v in (kv.split(":") for kv in a.split.split(",") if kv)}
     os.makedirs(a.out, exist_ok=True)
     model = R.Plamo3Reference.from_checkpoint(a.checkpoint)
     lo, hi = (0, model.L - 1) if a.layers is None else map(int, a.layers.split("-"))
@@ -50,14 +62,26 @@ def main() -> int:
     for start in range(lo, hi + 1, a.chunk):
         end = min(start + a.chunk - 1, hi)
         path = os.path.join(a.out, f"chunk_{start:02d}_{end:02d}.onnx")
-        O.build_chunk(
-            model,
-            range(start, end + 1),
-            path,
-            cache_len=a.cache_len,
-            int8=a.int8,
-            int4=a.int4,
-        )
+        if a.rows:
+            O.build_block(
+                model,
+                range(start, end + 1),
+                path,
+                cache_len=a.cache_len,
+                rows=a.rows,
+                int8=a.int8,
+                int4=a.int4,
+                split=split,
+            )
+        else:
+            O.build_chunk(
+                model,
+                range(start, end + 1),
+                path,
+                cache_len=a.cache_len,
+                int8=a.int8,
+                int4=a.int4,
+            )
         chunks.append((start, end, path))
         print("chunk", start, end, path, flush=True)
     if a.head and hi == model.L - 1:

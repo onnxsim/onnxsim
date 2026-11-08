@@ -127,15 +127,30 @@ def _qconst4(b, name, B):
     return b.node("Mul", [f, b.const(name + "_s", s.astype(np.float32))])
 
 
-def _layer_weights(b, model, i, int8=False, int4=False):
+def _layer_weights(b, model, i, int8=False, int4=False, split=None):
+    """split: {"qkv"|"o"|"gu"|"d": n} column slices per matrix; each slice is quantized and multiplied on its own, so the HMX
+    fp16 copy of a weight is 1/n of the matrix (the per-program scratch that bounds how many programs stay resident).
+    Do not split "o": on the phone's HMX path the split O projection (its input is a transposed attention view used by
+    two matmuls) gave a 24% error at layer 0, while the qkv, gu and d splits matched the unsplit program exactly."""
     p = f"model.layers.layers.{i}."
-    mat = (
+    base = (
         (lambda name, B: _qconst4(b, name, B))
         if int4
         else (lambda name, B: _qconst(b, name, B))
         if int8
         else (lambda name, B: b.const(name, B))
     )
+    split = split or {}
+
+    def mat(name, B):
+        n = split.get(name.rsplit("_", 1)[-1], 1)
+        if n == 1:
+            return base(name, B)
+        return [
+            base(f"{name}_c{j}", part)
+            for j, part in enumerate(np.array_split(B, n, axis=1))
+        ]
+
     return {
         "g_pre_mix": b.const(
             f"l{i}_g_pre_mix", 1.0 + model.w(p + "pre_mixer_norm.weight")
@@ -200,14 +215,14 @@ def _layer_body(
     pr = b.node("Softmax", [s], axis=-1)
     att = b.node("MatMul", [pr, vg])
     att = b.node("Reshape", [b.node("Transpose", [att], perm=[2, 0, 1, 3]), shape_att])
-    o = b.node("MatMul", [att, W["w_o"]])
+    o = _mm(b, att, W["w_o"], "o")
     o = b.rms(o, W["g_post_mix"], c["eps"])
     h1 = b.node("Add", [hidden, o])
     x = b.rms(h1, W["g_pre_mlp"], c["eps"])
-    gu = b.node("MatMul", [x, W["w_gu"]])
+    gu = _mm(b, x, W["w_gu"], "gu")
     gate, up = b.node_multi("Split", [gu, split_mlp], 2, axis=-1)
     a = b.node("Mul", [b.node("Mul", [gate, b.node("Sigmoid", [gate])]), up])
-    mo = b.node("MatMul", [a, W["w_d"]])
+    mo = _mm(b, a, W["w_d"], "d")
     mo = b.rms(mo, W["g_post_mlp"], c["eps"])
     return b.node("Add", [h1, mo]), k, v, kall, vall
 
@@ -394,6 +409,164 @@ def build_head(model, out_path, external=False):
     inputs = [h.make_tensor_value_info("hidden", T.FLOAT, [1, H])]
     outputs = [h.make_tensor_value_info("logits", T.FLOAT, [1, V])]
     graph = h.make_graph(b.nodes, "plamo3_head", inputs, outputs, b.inits)
+    proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
+    proto.ir_version = 9
+    return _save(proto, out_path, external)
+
+
+def _mm(b, x, entry, name):
+    """x @ W for a weight entry: one node, or a list of per-column slices whose products are concatenated."""
+    if isinstance(entry, str):
+        return b.node("MatMul", [x, entry])
+    return b.node("Concat", [b.node("MatMul", [x, e]) for e in entry], axis=-1)
+
+
+def _layer_body_rows(
+    b,
+    model,
+    c,
+    i,
+    hidden,
+    cos_p,
+    sin_p,
+    past_k,
+    past_v,
+    mask,
+    rows,
+    int8=False,
+    int4=False,
+    split=None,
+):
+    """One decoder layer over ``rows`` tokens at once (a block of prompt positions, or one token padded to the block): the
+    keys and values of the block are appended after the cache, and the mask ([rows, C + rows]) carries causality and the
+    padding. Returns (hidden_out, k_new, v_new) as [rows, H], [nkv, rows, hd], [nkv, rows, hd]."""
+    inter, nh, nkv, hd = model.I, model.nh, model.nkv, model.hd
+    g = nh // nkv
+    q_dim, k_dim = nh * hd, nkv * hd
+    W = _layer_weights(b, model, i, int8, int4, split=split)
+    shape_q = b.const(f"l{i}_rq", np.array([rows, nh, hd], np.int64))
+    shape_kv = b.const(f"l{i}_rkv", np.array([rows, nkv, hd], np.int64))
+    shape_qg = b.const(f"l{i}_rqg", np.array([nkv, g, rows, hd], np.int64))
+    shape_att = b.const(f"l{i}_ratt", np.array([rows, q_dim], np.int64))
+    split_qkv = b.const(f"l{i}_rsplit", np.array([q_dim, k_dim, k_dim], np.int64))
+    split_mlp = b.const(f"l{i}_rsplit_mlp", np.array([inter, inter], np.int64))
+
+    def rope(x):
+        x1 = b.node("Slice", [x, c["s0"], c["sh"], c["axl"]])
+        x2 = b.node("Slice", [x, c["sh"], c["shd"], c["axl"]])
+        rot = b.node("Concat", [b.node("Neg", [x2]), x1], axis=-1)
+        return b.node("Add", [b.node("Mul", [x, cos_p]), b.node("Mul", [rot, sin_p])])
+
+    x = b.rms(hidden, W["g_pre_mix"], c["eps"])
+    qkv = _mm(b, x, W["w_qkv"], "qkv")
+    q, k, v = b.node_multi("Split", [qkv, split_qkv], 3, axis=-1)
+    q = b.node(
+        "Transpose", [b.node("Reshape", [q, shape_q])], perm=[1, 0, 2]
+    )  # [nh, rows, hd]
+    k = b.node(
+        "Transpose", [b.node("Reshape", [k, shape_kv])], perm=[1, 0, 2]
+    )  # [nkv, rows, hd]
+    v = b.node("Transpose", [b.node("Reshape", [v, shape_kv])], perm=[1, 0, 2])
+    q = b.rms(q, W["g_q"], c["eps"])
+    k = b.rms(k, W["g_k"], c["eps"])
+    q = rope(q)
+    k = rope(k)
+    kall = b.node("Concat", [past_k, k], axis=1)  # [nkv, C + rows, hd]
+    vall = b.node("Concat", [past_v, v], axis=1)
+    qg = b.node("Reshape", [q, shape_qg])  # [nkv, g, rows, hd]
+    kt = b.node(
+        "Transpose", [b.node("Unsqueeze", [kall, c["ax1"]])], perm=[0, 1, 3, 2]
+    )  # [nkv, 1, hd, C + rows]
+    vg = b.node("Unsqueeze", [vall, c["ax1"]])  # [nkv, 1, C + rows, hd]
+    s = b.node(
+        "Mul", [b.node("MatMul", [qg, kt]), c["scale"]]
+    )  # [nkv, g, rows, C + rows]
+    s = b.node("Add", [s, mask])
+    pr = b.node("Softmax", [s], axis=-1)
+    att = b.node("MatMul", [pr, vg])  # [nkv, g, rows, hd]
+    att = b.node("Reshape", [b.node("Transpose", [att], perm=[2, 0, 1, 3]), shape_att])
+    o = _mm(b, att, W["w_o"], "o")
+    o = b.rms(o, W["g_post_mix"], c["eps"])
+    h1 = b.node("Add", [hidden, o])
+    x = b.rms(h1, W["g_pre_mlp"], c["eps"])
+    gu = _mm(b, x, W["w_gu"], "gu")
+    gate, up = b.node_multi("Split", [gu, split_mlp], 2, axis=-1)
+    a = b.node("Mul", [b.node("Mul", [gate, b.node("Sigmoid", [gate])]), up])
+    mo = _mm(b, a, W["w_d"], "d")
+    mo = b.rms(mo, W["g_post_mlp"], c["eps"])
+    return b.node("Add", [h1, mo]), k, v
+
+
+def build_block(
+    model,
+    layers,
+    out_path,
+    cache_len=128,
+    rows=32,
+    external=False,
+    int8=False,
+    int4=False,
+    split=None,
+):
+    """Consecutive decoder layers over a block of ``rows`` token positions with static caches (the prefill graph; a decode
+    step is a block with one real row). Inputs: hidden [rows, H], position_ids int64 [rows], attn_mask [rows, C + rows],
+    past_k_{i}, past_v_{i} [nkv, C, hd]. Outputs: hidden_out [rows, H], k_new_{i}, v_new_{i} [nkv, rows, hd]."""
+    layers = list(layers)
+    b = _Builder()
+    c = _common(b, model)
+    tabs = {}
+    for full in (False, True):
+        cos, sin = _rope_tables(model, full, MAX_POS)
+        tabs[full] = (
+            b.const(f"cos_tab_{int(full)}", cos),
+            b.const(f"sin_tab_{int(full)}", sin),
+        )
+    pos_cs = {}
+    for full in (False, True):
+        cos_t, sin_t = tabs[full]
+        pos_cs[full] = (
+            b.node("Gather", [cos_t, "position_ids"], axis=0),
+            b.node("Gather", [sin_t, "position_ids"], axis=0),
+        )
+    nkv, hd, H = model.nkv, model.hd, model.H
+    inputs = [
+        h.make_tensor_value_info("hidden", T.FLOAT, [rows, H]),
+        h.make_tensor_value_info("position_ids", T.INT64, [rows]),
+        h.make_tensor_value_info("attn_mask", T.FLOAT, [rows, cache_len + rows]),
+    ]
+    outputs = []
+    hidden = "hidden"
+    for i in layers:
+        full = (i + 1) % model.pattern == 0
+        cos_p, sin_p = pos_cs[full]
+        pk, pv = f"past_k_{i}", f"past_v_{i}"
+        inputs.append(h.make_tensor_value_info(pk, T.FLOAT, [nkv, cache_len, hd]))
+        inputs.append(h.make_tensor_value_info(pv, T.FLOAT, [nkv, cache_len, hd]))
+        hidden, k, v = _layer_body_rows(
+            b,
+            model,
+            c,
+            i,
+            hidden,
+            cos_p,
+            sin_p,
+            pk,
+            pv,
+            "attn_mask",
+            rows,
+            int8,
+            int4,
+            split,
+        )
+        b.nodes.append(h.make_node("Identity", [k], [f"k_new_{i}"]))
+        b.nodes.append(h.make_node("Identity", [v], [f"v_new_{i}"]))
+        outputs.append(h.make_tensor_value_info(f"k_new_{i}", T.FLOAT, [nkv, rows, hd]))
+        outputs.append(h.make_tensor_value_info(f"v_new_{i}", T.FLOAT, [nkv, rows, hd]))
+    b.nodes.append(h.make_node("Identity", [hidden], ["hidden_out"]))
+    outputs.insert(0, h.make_tensor_value_info("hidden_out", T.FLOAT, [rows, H]))
+    graph = h.make_graph(
+        b.nodes, f"plamo3_block_{layers[0]}_{layers[-1]}", inputs, outputs, b.inits
+    )
     proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
     proto.ir_version = 9
     return _save(proto, out_path, external)

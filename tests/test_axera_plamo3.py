@@ -224,3 +224,38 @@ def test_quantized_chunk_matches_reference(model, tmp_path, bits, fidelity):
     # and the quantized model stays a usable approximation of the float one
     err = np.max(np.abs(got - float_ref)) / np.max(np.abs(float_ref))
     assert err < fidelity, f"int{bits} chunk relative error vs float {err:.3e}"
+
+
+def test_block_graph_matches_reference(model, tmp_path):
+    """The row-block graph (a prompt block padded to the block size, cache empty) equals the reference layer on the real
+    rows; the padding rows attend one slot only and are ignored."""
+    layer, rows, cache = 1, 8, 16
+    ids = IDS[:6]
+    h = model.w("model.embed_tokens.weight")[np.asarray(ids)].astype(np.float32)
+    ref_out = model.layer(layer, h)
+    path = O.build_block(
+        model, [layer], str(tmp_path / "block.onnx"), cache_len=cache, rows=rows
+    )
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+    hid = np.zeros((rows, CFG["hidden_size"]), np.float32)
+    hid[: len(ids)] = h
+    pos = np.array([min(r, len(ids) - 1) for r in range(rows)], np.int64)
+    mask = np.full((rows, cache + rows), -1000.0, np.float32)
+    for r in range(rows):
+        if r < len(ids):
+            mask[r, cache : cache + r + 1] = 0.0
+        else:
+            mask[r, cache] = 0.0
+    zeros = np.zeros((nkv, cache, hd), np.float32)
+    out = sess.run(
+        None,
+        {
+            "hidden": hid,
+            "position_ids": pos,
+            "attn_mask": mask,
+            f"past_k_{layer}": zeros,
+            f"past_v_{layer}": zeros,
+        },
+    )
+    np.testing.assert_allclose(out[0][: len(ids)], ref_out, rtol=1e-4, atol=1e-4)
