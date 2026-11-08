@@ -155,3 +155,72 @@ def test_layer_graph_matches_reference(model, tmp_path, layer):
         pk[:, pos, :] = res[1][:, 0, :]
         pv[:, pos, :] = res[2][:, 0, :]
     np.testing.assert_allclose(np.stack(outs), ref_out, rtol=1e-4, atol=1e-4)
+
+
+def _quantized_model(model, bits):
+    """The same reference with each layer matrix rounded the way the graph stores it: per output column, symmetric int8 or
+    int4 (rounded through the grid, then back to float)."""
+    qmax = {8: 127.0, 4: 7.0}[bits]
+    lo = {8: -127.0, 4: -8.0}[bits]
+    tensors = {}
+    for name in model.src.keys():
+        a = model.src.f32(name)
+        if a.ndim == 2 and "layers" in name:
+            B = a.T
+            sc = np.abs(B).max(axis=0, keepdims=True) / qmax
+            sc[sc == 0] = 1.0
+            a = (np.clip(np.round(B / sc), lo, qmax) * sc).T
+        tensors[name] = a
+    return R.Plamo3Reference(CFG, R.DictWeights(tensors))
+
+
+@pytest.mark.parametrize("bits, fidelity", [(8, 2e-2), (4, 5e-1)])
+def test_quantized_chunk_matches_reference(model, tmp_path, bits, fidelity):
+    layers = range(0, 2)
+    qmodel = _quantized_model(model, bits)
+    h = qmodel.w("model.embed_tokens.weight")[np.asarray(IDS)].astype(np.float32)
+    for i in layers:
+        h = qmodel.layer(i, h)
+    quant_ref = h
+    h = model.w("model.embed_tokens.weight")[np.asarray(IDS)].astype(np.float32)
+    for i in layers:
+        h = model.layer(i, h)
+    float_ref = h
+    path = O.build_chunk(
+        model,
+        layers,
+        str(tmp_path / f"chunk{bits}.onnx"),
+        cache_len=16,
+        int8=bits == 8,
+        int4=bits == 4,
+    )
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+    emb = model.w("model.embed_tokens.weight")[np.asarray(IDS)].astype(np.float32)
+    past = {
+        i: (np.zeros((nkv, 16, hd), np.float32), np.zeros((nkv, 16, hd), np.float32))
+        for i in layers
+    }
+    outs = []
+    for pos in range(len(IDS)):
+        mask = np.full((1, 17), -1000.0, np.float32)
+        mask[0, :pos] = 0.0
+        mask[0, 16] = 0.0
+        feeds = {
+            "hidden": emb[pos : pos + 1],
+            "position_ids": np.array([pos], np.int64),
+            "attn_mask": mask,
+        }
+        for i in layers:
+            feeds[f"past_k_{i}"], feeds[f"past_v_{i}"] = past[i]
+        res = dict(zip([o.name for o in sess.get_outputs()], sess.run(None, feeds)))
+        outs.append(res["hidden_out"][0])
+        for i in layers:
+            past[i][0][:, pos, :] = res[f"k_new_{i}"][:, 0, :]
+            past[i][1][:, pos, :] = res[f"v_new_{i}"][:, 0, :]
+    got = np.stack(outs)
+    # the graph is the quantized reference (packing and dequantization exact up to float rounding)
+    np.testing.assert_allclose(got, quant_ref, rtol=1e-4, atol=1e-4)
+    # and the quantized model stays a usable approximation of the float one
+    err = np.max(np.abs(got - float_ref)) / np.max(np.abs(float_ref))
+    assert err < fidelity, f"int{bits} chunk relative error vs float {err:.3e}"
