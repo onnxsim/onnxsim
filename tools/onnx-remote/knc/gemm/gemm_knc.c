@@ -413,6 +413,40 @@ void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K
   free(Ap); free(Bp); free(Cp);
 }
 
+
+// ---- core-shared schedule ----
+// The four hardware threads of a core (threads c, c+57, c+114, c+171 under pin_thread's mapping) work on the same
+// 128-column panel group at the same time, so they share one B panel in L1 (measured: 1112 vs 903 GFLOPS kernel-only
+// at 228 threads). A unit is one panel group x four row chunks (one per hardware thread of the core); core c takes
+// units c, c+57, c+114, ... The packing of A is a separate phase before this (requires M % 128 == 0).
+#define NCORES 57
+typedef struct { const float *A, *Bpk, *Apk; float *C; int M, N, K, nkc, nsr, npg; } static_job_t;
+static void static_task(void *argp, int id) {
+  static_job_t *j = (static_job_t *)argp;
+  const int N = j->N, nkc = j->nkc, BPC = RC / 8;
+  if (id >= 4 * NCORES) return;
+  int c = id % NCORES, jj = id / NCORES;
+  int units = j->nsr * j->npg;
+  for (int u = c; u < units; u += NCORES) {
+    int pg = u / j->nsr, sr = u % j->nsr;
+    int rchunk = sr * 4 + jj, rb0 = rchunk * BPC, p0 = pg * PG;
+    for (int kc = 0; kc < nkc; kc++)
+      for (int q = 0; q < PG; q++) {
+        const float *Bp = j->Bpk + (((size_t)(p0 + q)) * nkc + kc) * KC * 32;
+        for (int rb = rb0; rb < rb0 + BPC; rb++)
+          kernel_8x32(j->Apk + ((size_t)rb * nkc + kc) * KC * 8, Bp, j->C + (size_t)(rb * 8) * N + (p0 + q) * 32, N, KC, kc == 0);
+      }
+  }
+}
+void sgemm_knc_run_static(const float *A, const float *Bpk, float *C, float *Apk, int M, int N, int K, int nthreads) {
+  pool_init(nthreads);
+  job_t pj = {0};
+  pj.A = A; pj.Apk = Apk; pj.M = M; pj.N = N; pj.K = K; pj.nkc = K / KC; pj.nA = M / 8; pj.nB = 0; pj.do_pack_B = 0;
+  pj.next = 0; pool_run(pack_task, &pj);
+  static_job_t j = {A, Bpk, Apk, C, M, N, K, K / KC, M / (RC * 4), N / (32 * PG)};
+  pool_run(static_task, &j);
+}
+
 static double maxerr_sampled(const float *A, const float *B, const float *C, int M, int N, int K) {
   double maxerr = 0;
   for (int t = 0; t < 64; t++) {
@@ -442,6 +476,7 @@ int main(int argc, char **argv) {
     double t0 = now_s();
     if (!fast) sgemm_knc_any(A, B, C, M, N, K, nth);
     else if (getenv("PHASED")) sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
+    else if (getenv("STATIC") && M % (RC * 4) == 0 && nth == 4 * NCORES) sgemm_knc_run_static(A, Bpk, C, Apk, M, N, K, nth);   // opt-in: measured slower
     else sgemm_knc_run_overlap(A, Bpk, C, Apk, M, N, K, nth);
     double dt = now_s() - t0; if (dt < best) best = dt;
   }
