@@ -223,7 +223,7 @@ static void pool_run(task_fn fn, void *arg) {
 // ---- GEMM ----
 typedef struct {
   const float *A, *B; float *C; float *Apk, *Bpk;
-  int M, N, K, nkc; volatile int next; int nA, nB, items, groups_n, do_pack_B; float *Cpart; int A_src;
+  int M, N, K, nkc; volatile int next; int nA, nB, items, groups_n, do_pack_B; float *Cpart; int A_src; int *pdone; int nPack;
 } job_t;
 
 static void pack_task(void *argp, int id) {
@@ -304,6 +304,64 @@ void sgemm_knc_pack_B(const float *B, float *Bpk, int K, int N, int nthreads) {
   j.next = 0; pool_run(pack_task, &j);
 }
 
+// Overlapped run: one pass over a shared counter. Items [0, nPack) pack one 8-row block of A; items after that compute
+// one work item, and wait until the blocks of its row chunk are packed (pdone counts packed blocks per chunk).
+static void overlap_task(void *argp, int id) {
+  job_t *j = (job_t *)argp;
+  (void)id;
+  const int K = j->K, N = j->N, nkc = j->nkc, BPC = RC / 8;
+  for (;;) {
+    int item = __sync_fetch_and_add(&j->next, 1);
+    if (item >= j->nPack + j->items) break;
+    if (item < j->nPack) {
+      int rb = item;
+      for (int kc = 0; kc < nkc; kc++)
+        for (int i = 0; i < 8; i++)
+          memcpy(j->Apk + (((size_t)rb * nkc + kc) * 8 + i) * KC, j->A + (size_t)(rb * 8 + i) * K + kc * KC, KC * 4);
+      __sync_fetch_and_add(&j->pdone[rb / BPC], 1);
+      continue;
+    }
+    int w = item - j->nPack;
+    int g = w % KS, rest = w / KS;
+    int rchunk = rest / j->groups_n, pg = rest % j->groups_n;
+    while (__sync_fetch_and_add(&j->pdone[rchunk], 0) < BPC) { }   // wait for this chunk's A blocks
+    int rb0 = rchunk * BPC, p0 = pg * PG;
+    int kc_lo = g * nkc / KS, kc_hi = (g + 1) * nkc / KS;
+    float *Cg = g == 0 ? j->C : j->Cpart + (size_t)(g - 1) * j->M * N;
+    for (int kc = kc_lo; kc < kc_hi; kc++)
+      for (int q = 0; q < PG; q++) {
+        const float *Bp = j->Bpk + (((size_t)(p0 + q)) * nkc + kc) * KC * 32;
+        for (int rb = rb0; rb < rb0 + BPC; rb++)
+          kernel_8x32(j->Apk + ((size_t)rb * nkc + kc) * KC * 8, Bp, Cg + (size_t)(rb * 8) * N + (p0 + q) * 32,
+                      N, KC, kc == kc_lo);
+      }
+  }
+}
+
+// C = A*B with A packing overlapped with the compute (see overlap_task). B must be packed.
+void sgemm_knc_run_overlap(const float *A, const float *Bpk, float *C, float *Apk, int M, int N, int K, int nthreads) {
+  pool_init(nthreads);
+  static int *pdone = NULL; static int pdone_cap = 0;
+  int nchunks = M / RC;
+  if (nchunks > pdone_cap) { free(pdone); pdone = malloc(sizeof(int) * nchunks); pdone_cap = nchunks; }
+  memset(pdone, 0, sizeof(int) * nchunks);
+  job_t j = {0};
+  j.A = A; j.Bpk = Bpk; j.C = C; j.Apk = Apk;
+  j.M = M; j.N = N; j.K = K; j.nkc = K / KC;
+  j.nA = M / 8; j.nB = 0; j.do_pack_B = 0;
+  j.groups_n = N / (32 * PG);
+  j.items = nchunks * j.groups_n * KS;
+  j.nPack = M / 8;
+  j.pdone = pdone;
+  if (KS > 1) {
+    size_t need = (size_t)(KS - 1) * M * N;
+    if (need > Cpart_cap) { free(Cpart_buf); Cpart_buf = aligned_alloc(64, need * 4); Cpart_cap = need; }
+    j.Cpart = Cpart_buf;
+  }
+  j.next = 0; pool_run(overlap_task, &j);
+  if (KS > 1) { j.next = 0; pool_run(reduce_task, &j); }
+}
+
 // C = A*B with B already packed by sgemm_knc_pack_B. Packs A into Apk (scratch, M*K floats), then computes.
 void sgemm_knc_run(const float *A, const float *Bpk, float *C, float *Apk, int M, int N, int K, int nthreads) {
   pool_init(nthreads);
@@ -362,7 +420,7 @@ int main(int argc, char **argv) {
   double maxerr = maxerr_sampled(A, B, C, M, N, K);
   double best = 1e30;
   for (int r = 0; r < reps; r++) {
-    double t0 = now_s(); sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth); double dt = now_s() - t0; if (dt < best) best = dt;
+    double t0 = now_s(); if (getenv("PHASED")) sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth); else sgemm_knc_run_overlap(A, Bpk, C, Apk, M, N, K, nth); double dt = now_s() - t0; if (dt < best) best = dt;
   }
   double gflops = 2.0 * M * N * K / best * 1e-9;
   printf("M=%d N=%d K=%d threads=%d maxerr(sampled)=%g\n", M, N, K, nth, maxerr);

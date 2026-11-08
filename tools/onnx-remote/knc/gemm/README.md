@@ -20,8 +20,10 @@ Output: max error on 64 sampled entries against a double-precision reference, an
   assembly: the k1om GCC turns generic vector code into x87 scalar code, and its `-mavx512f` mode emits AVX-512
   encodings the card does not implement. A reads are FMA memory broadcasts (`{1to16}`, escaped as `%{1to16%}`), B rows
   are aligned 64-byte loads, and the k loop is unrolled by four with software prefetch.
-- **Packing**: B is packed into 32-column panels once (`sgemm_knc_pack_B`, for weights); A is packed as plain 8-row
-  segments on each call (`sgemm_knc_run`).
+- **Packing**: B is packed into 32-column panels once (`sgemm_knc_pack_B`, for weights). A is packed as plain 8-row
+  segments in the same pool pass as the compute (`sgemm_knc_run_overlap`, the default): packing items come first in the
+  shared counter, and each compute item waits only for the packed blocks of its row chunk. `PHASED=1` selects the
+  older two-phase path (`sgemm_knc_run`).
 - **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 32 rows by 4 panels (128 columns), so a B sub-panel is
   reused across the rows of an item while it is in L1. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
   slower (325 vs 382 GFLOPS) and is off by default.
@@ -43,6 +45,8 @@ Output: max error on 64 sampled entries against a double-precision reference, an
 | work items of 32 rows x 4 panels, 171 threads (default) | 419 | 21% |
 | same, 114 threads | 408 | 20% |
 | same, 228 threads | 376 | 19% |
+| A packing overlapped with compute (default), 171 threads | 468-509 | 23-25% |
+| same, 228 threads | 489 | 24% |
 | kernel microbenchmark, 228 pinned threads (no GEMM overhead) | 765 | 38% |
 
 The nominal peak is 57 cores x 1.1 GHz x 32 flops per cycle. Run-to-run variation is about +-10%. The GEMM is not at its
