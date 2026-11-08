@@ -87,8 +87,55 @@ def _rope_tables(model, full, max_pos):
     )
 
 
-def _layer_weights(b, model, i):
+def _qconst(b, name, B):
+    """A [K, N] float matrix as per-column symmetric int8 (an int8 initializer and an fp32 scale), dequantized in the graph:
+    Cast -> Mul -> the MatMul's B. The initializer is what the program stores (a quarter of the fp32 bytes)."""
+    s = np.abs(B).max(axis=0, keepdims=True) / 127.0
+    s[s == 0] = 1.0
+    q = np.clip(np.round(B / s), -127, 127).astype(np.int8)
+    c = b.node("Cast", [b.const(name + "_q", q)], to=T.FLOAT)
+    return b.node("Mul", [c, b.const(name + "_s", s.astype(np.float32))])
+
+
+def _qconst4(b, name, B):
+    """A [K, N] float matrix (K even) as per-column symmetric int4 packed two per byte along K: byte j of column n holds
+    q[2j] + 16 * q[2j+1] (q + 8 in 0..15). The graph unpacks with Mod / Div on int32 (the importer has no bit shifts),
+    dequantizes with the fp32 scale, and the MatMul sees the usual fp32 B. The initializer is half the int8 bytes."""
+    K, N = B.shape
+    assert K % 2 == 0
+    s = np.abs(B).max(axis=0, keepdims=True) / 7.0
+    s[s == 0] = 1.0
+    q = (np.clip(np.round(B / s), -8, 7) + 8).astype(np.uint8)
+    packed = (q[0::2] + 16 * q[1::2]).astype(np.uint8)  # [K/2, N]
+    x = b.node("Cast", [b.const(name + "_p", packed)], to=T.INT32)
+    lo = b.node("Mod", [x, b.const(name + "_c16", np.array(16, np.int32))])
+    hi = b.node("Div", [x, b.const(name + "_c16b", np.array(16, np.int32))])
+    ax = b.const(name + "_ax1", np.array([1], np.int64))
+    stacked = b.node(
+        "Concat", [b.node("Unsqueeze", [lo, ax]), b.node("Unsqueeze", [hi, ax])], axis=1
+    )  # [K/2, 2, N]
+    w = b.node(
+        "Reshape", [stacked, b.const(name + "_shape", np.array([K, N], np.int64))]
+    )
+    f = b.node(
+        "Sub",
+        [
+            b.node("Cast", [w], to=T.FLOAT),
+            b.const(name + "_c8", np.array(8.0, np.float32)),
+        ],
+    )
+    return b.node("Mul", [f, b.const(name + "_s", s.astype(np.float32))])
+
+
+def _layer_weights(b, model, i, int8=False, int4=False):
     p = f"model.layers.layers.{i}."
+    mat = (
+        (lambda name, B: _qconst4(b, name, B))
+        if int4
+        else (lambda name, B: _qconst(b, name, B))
+        if int8
+        else (lambda name, B: b.const(name, B))
+    )
     return {
         "g_pre_mix": b.const(
             f"l{i}_g_pre_mix", 1.0 + model.w(p + "pre_mixer_norm.weight")
@@ -104,19 +151,21 @@ def _layer_weights(b, model, i):
         ),
         "g_q": b.const(f"l{i}_g_q", 1.0 + model.w(p + "mixer.q_norm.weight")),
         "g_k": b.const(f"l{i}_g_k", 1.0 + model.w(p + "mixer.k_norm.weight")),
-        "w_qkv": b.const(f"l{i}_w_qkv", model.w(p + "mixer.qkv_proj.weight").T.copy()),
-        "w_o": b.const(f"l{i}_w_o", model.w(p + "mixer.o_proj.weight").T.copy()),
-        "w_gu": b.const(f"l{i}_w_gu", model.w(p + "mlp.gate_up_proj.weight").T.copy()),
-        "w_d": b.const(f"l{i}_w_d", model.w(p + "mlp.down_proj.weight").T.copy()),
+        "w_qkv": mat(f"l{i}_w_qkv", model.w(p + "mixer.qkv_proj.weight").T.copy()),
+        "w_o": mat(f"l{i}_w_o", model.w(p + "mixer.o_proj.weight").T.copy()),
+        "w_gu": mat(f"l{i}_w_gu", model.w(p + "mlp.gate_up_proj.weight").T.copy()),
+        "w_d": mat(f"l{i}_w_d", model.w(p + "mlp.down_proj.weight").T.copy()),
     }
 
 
-def _layer_body(b, model, c, i, hidden, cos_p, sin_p, past_k, past_v, mask):
+def _layer_body(
+    b, model, c, i, hidden, cos_p, sin_p, past_k, past_v, mask, int8=False, int4=False
+):
     """One decoder layer on a single token. Returns (hidden_out, k_new, v_new) tensor names."""
     inter, nh, nkv, hd = model.I, model.nh, model.nkv, model.hd
     g = nh // nkv
     q_dim, k_dim = nh * hd, nkv * hd
-    W = _layer_weights(b, model, i)
+    W = _layer_weights(b, model, i, int8, int4)
     shape_q = b.const(f"l{i}_shape_q", np.array([1, nh, hd], np.int64))
     shape_kv = b.const(f"l{i}_shape_kv", np.array([1, nkv, hd], np.int64))
     shape_qg = b.const(f"l{i}_shape_qg", np.array([nkv, g, 1, hd], np.int64))
@@ -269,6 +318,82 @@ def build_layer(model, layer_idx, out_path, cache_len=1023, external=False):
         h.make_tensor_value_info("v_new", T.FLOAT, [nkv, 1, hd]),
     ]
     graph = h.make_graph(b.nodes, f"plamo3_layer{layer_idx}", inputs, outputs, b.inits)
+    proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
+    proto.ir_version = 9
+    return _save(proto, out_path, external)
+
+
+def build_chunk(
+    model, layers, out_path, cache_len=15, external=False, int8=False, int4=False
+):
+    """Consecutive decoder layers ``layers`` (a range) with static caches, one token.
+
+    Used to split the model into phone-sized programs: the host runs the embedding and feeds each
+    chunk's hidden state into the next one, keeping every layer's cache on the host.
+    Inputs : hidden float32 [1, H], position_ids int64 [1], attn_mask float32 [1, C+1],
+             past_k_{i}, past_v_{i} float32 [nkv, C, hd] for each layer i in the chunk
+    Outputs: hidden_out float32 [1, H], k_new_{i}, v_new_{i} float32 [nkv, 1, hd]
+    """
+    layers = list(layers)
+    b = _Builder()
+    c = _common(b, model)
+    tabs = {}
+    for full in (False, True):
+        cos, sin = _rope_tables(model, full, MAX_POS)
+        tabs[full] = (
+            b.const(f"cos_tab_{int(full)}", cos),
+            b.const(f"sin_tab_{int(full)}", sin),
+        )
+    pos_cs = {}
+    for full in (False, True):
+        cos_t, sin_t = tabs[full]
+        pos_cs[full] = (
+            b.node("Gather", [cos_t, "position_ids"], axis=0),
+            b.node("Gather", [sin_t, "position_ids"], axis=0),
+        )
+    nkv, hd, H = model.nkv, model.hd, model.H
+    inputs = [
+        h.make_tensor_value_info("hidden", T.FLOAT, [1, H]),
+        h.make_tensor_value_info("position_ids", T.INT64, [1]),
+        h.make_tensor_value_info("attn_mask", T.FLOAT, [1, cache_len + 1]),
+    ]
+    outputs = []
+    hidden = "hidden"
+    for i in layers:
+        full = (i + 1) % model.pattern == 0
+        cos_p, sin_p = pos_cs[full]
+        pk, pv = f"past_k_{i}", f"past_v_{i}"
+        inputs.append(h.make_tensor_value_info(pk, T.FLOAT, [nkv, cache_len, hd]))
+        inputs.append(h.make_tensor_value_info(pv, T.FLOAT, [nkv, cache_len, hd]))
+        hidden, k, v, _, _ = _layer_body(
+            b, model, c, i, hidden, cos_p, sin_p, pk, pv, "attn_mask", int8, int4
+        )
+        b.nodes.append(h.make_node("Identity", [k], [f"k_new_{i}"]))
+        b.nodes.append(h.make_node("Identity", [v], [f"v_new_{i}"]))
+        outputs.append(h.make_tensor_value_info(f"k_new_{i}", T.FLOAT, [nkv, 1, hd]))
+        outputs.append(h.make_tensor_value_info(f"v_new_{i}", T.FLOAT, [nkv, 1, hd]))
+    b.nodes.append(h.make_node("Identity", [hidden], ["hidden_out"]))
+    outputs.insert(0, h.make_tensor_value_info("hidden_out", T.FLOAT, [1, H]))
+    graph = h.make_graph(
+        b.nodes, f"plamo3_chunk_{layers[0]}_{layers[-1]}", inputs, outputs, b.inits
+    )
+    proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
+    proto.ir_version = 9
+    return _save(proto, out_path, external)
+
+
+def build_head(model, out_path, external=False):
+    """Final RMSNorm and the LM head: hidden float32 [1, H] -> logits float32 [1, vocab]."""
+    b = _Builder()
+    c = _common(b, model)
+    gn = b.const("g_norm", 1.0 + model.w("model.norm.weight"))
+    x = b.rms("hidden", gn, c["eps"])
+    w_lm = b.const("lm_head_T", model.w("lm_head.weight").T.copy())
+    b.nodes.append(h.make_node("MatMul", [x, w_lm], ["logits"]))
+    H, V = model.H, model.c["vocab_size"]
+    inputs = [h.make_tensor_value_info("hidden", T.FLOAT, [1, H])]
+    outputs = [h.make_tensor_value_info("logits", T.FLOAT, [1, V])]
+    graph = h.make_graph(b.nodes, "plamo3_head", inputs, outputs, b.inits)
     proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
     proto.ir_version = 9
     return _save(proto, out_path, external)
