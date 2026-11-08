@@ -320,3 +320,105 @@ def test_resident_state_block_matches_host_cache(model, tmp_path):
         return np.concatenate(outs)
 
     np.testing.assert_allclose(run(True), run(False), rtol=1e-6, atol=1e-6)
+
+
+def test_grouped_int4_block_matches_dequantized_reference(model, tmp_path):
+    """Group-scaled int4 (codes and one scale per group of G input rows and output column, as the GPTQ export writes them)
+    gives the graph the same result as a float model with the dequantized matrices. G = 8 divides every K of CFG."""
+    G, layer, rows, cache = 8, 1, 8, 16
+    mats = {
+        "qkv": "mixer.qkv_proj.weight",
+        "o": "mixer.o_proj.weight",
+        "gu": "mlp.gate_up_proj.weight",
+        "d": "mlp.down_proj.weight",
+    }
+    codes, scales, deq = {}, {}, {}
+    p = f"model.layers.layers.{layer}."
+    for key, wn in mats.items():
+        W = model.src.f32(p + wn)  # [out, in]
+        Bt = W.T.copy()  # [K, N]
+        K, N = Bt.shape
+        Bg = Bt.reshape(K // G, G, N)
+        s = np.abs(Bg).max(axis=1) / 7.0
+        s[s == 0] = 1.0
+        q = np.clip(np.round(Bg / s[:, None, :]), -8, 7).astype(np.int8).reshape(K, N)
+        codes[key], scales[key] = q, s.astype(np.float32)
+        deq[p + wn] = (
+            (q.astype(np.float32).reshape(K // G, G, N) * s[:, None, :])
+            .reshape(K, N)
+            .T.copy()
+        )
+
+    def qsource(li, key, B):
+        return codes[key], scales[key]
+
+    tensors = {k: model.src.f32(k) for k in model.src.keys()}
+    tensors.update(deq)
+    ref_model = R.Plamo3Reference(CFG, R.DictWeights(tensors))
+    path = O.build_block(
+        model,
+        [layer],
+        str(tmp_path / "grouped.onnx"),
+        cache_len=cache,
+        rows=rows,
+        int4=True,
+        qsource=qsource,
+    )
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    ids = IDS[:6]
+    h = ref_model.w("model.embed_tokens.weight")[np.asarray(ids)].astype(np.float32)
+    ref_out = ref_model.layer(layer, h)
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+    hid = np.zeros((rows, CFG["hidden_size"]), np.float32)
+    hid[: len(ids)] = h
+    pos = np.array([min(r, len(ids) - 1) for r in range(rows)], np.int64)
+    mask = np.full((rows, cache + rows), -1000.0, np.float32)
+    for r in range(rows):
+        if r < len(ids):
+            mask[r, cache : cache + r + 1] = 0.0
+        else:
+            mask[r, cache] = 0.0
+    zeros = np.zeros((nkv, cache, hd), np.float32)
+    out = sess.run(
+        None,
+        {
+            "hidden": hid,
+            "position_ids": pos,
+            "attn_mask": mask,
+            f"past_k_{layer}": zeros,
+            f"past_v_{layer}": zeros,
+        },
+    )
+    np.testing.assert_allclose(out[0][: len(ids)], ref_out, rtol=1e-4, atol=1e-4)
+
+
+def test_layer_capture_matches_reference(model):
+    """plamo3_gptq.layer_capture is the reference layer with the four matmul inputs returned."""
+    import plamo3_gptq as G
+
+    h = model.w("model.embed_tokens.weight")[np.asarray(IDS)].astype(np.float32)
+    out, cap = G.layer_capture(model, 1, h.copy())
+    np.testing.assert_allclose(out, model.layer(1, h.copy()), rtol=1e-5, atol=1e-5)
+    assert cap["o"].shape == (len(IDS), CFG["num_attention_heads"] * CFG["head_dim"])
+    assert cap["d"].shape == (len(IDS), CFG["intermediate_size"])
+
+
+def test_gptq_group_beats_rounding_on_correlated_inputs():
+    """On correlated inputs (as real activations are) GPTQ's error compensation lowers the output error well below
+    group-wise round-to-nearest."""
+    import plamo3_gptq as G
+
+    rng = np.random.RandomState(0)
+    X = rng.randn(2048, 64) @ rng.randn(64, 128) + 0.05 * rng.randn(2048, 128)
+    W = rng.randn(32, 128) * 0.05
+    H = X.T @ X
+    rc, rs = G.rtn_int4_group(W, G=16)
+    gc, gs = G.gptq_int4_group(W, H, G=16)
+    ref = X @ W.T
+    e_rtn = np.linalg.norm(X @ G.dequant_group(rc, rs, G=16).T - ref) / np.linalg.norm(
+        ref
+    )
+    e_gptq = np.linalg.norm(X @ G.dequant_group(gc, gs, G=16).T - ref) / np.linalg.norm(
+        ref
+    )
+    assert e_gptq < 0.7 * e_rtn, (e_gptq, e_rtn)
