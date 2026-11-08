@@ -9,7 +9,7 @@ coprocessor 3120 series (Knights Corner) with the k1om GCC 5.1.1 toolchain (`NFC
 tools/onnx-remote/knc/gemm/build_gemm_knc.sh          # -> build/knc-gemm/gemm_knc, bench_kernel
 # on the card (copy the binary over SSH as in tools/onnx-remote/knc/README.md):
 ./gemm_knc M N K THREADS REPS                         # e.g. ./gemm_knc 2048 2048 2048 171 8
-./bench_kernel THREADS REPS PIN                       # kernel only, L1-resident, PIN=1 pins threads
+./bench_kernel THREADS REPS [PIN]                      # kernel only, L1-resident; threads pinned unless PIN=0
 ```
 
 Output: max error on 64 sampled entries against a double-precision reference, and the best time per call.
