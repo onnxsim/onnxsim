@@ -507,10 +507,16 @@ def build_block(
     int8=False,
     int4=False,
     split=None,
+    state=False,
 ):
     """Consecutive decoder layers over a block of ``rows`` token positions with static caches (the prefill graph; a decode
     step is a block with one real row). Inputs: hidden [rows, H], position_ids int64 [rows], attn_mask [rows, C + rows],
-    past_k_{i}, past_v_{i} [nkv, C, hd]. Outputs: hidden_out [rows, H], k_new_{i}, v_new_{i} [nkv, rows, hd]."""
+    past_k_{i}, past_v_{i} [nkv, C, hd]. Outputs: hidden_out [rows, H], k_new_{i}, v_new_{i} [nkv, rows, hd].
+
+    state=True keeps the caches on the device (onnx-remote's recurrent state: program.txt "state"): the inputs
+    past_k_{i} / past_v_{i} are the caches, the outputs next_past_k_{i} / next_past_v_{i} the caches after this block
+    (the old slots, and the block's rows written to the slots given by wsel [C, rows] / wmask [C, 1]). The caller sends
+    the caches in full once, then sends them empty; no cache crosses the wire after that."""
     layers = list(layers)
     b = _Builder()
     c = _common(b, model)
@@ -534,6 +540,13 @@ def build_block(
         h.make_tensor_value_info("position_ids", T.INT64, [rows]),
         h.make_tensor_value_info("attn_mask", T.FLOAT, [rows, cache_len + rows]),
     ]
+    if state:
+        inputs.append(h.make_tensor_value_info("wsel", T.FLOAT, [cache_len, rows]))
+        inputs.append(h.make_tensor_value_info("wmask", T.FLOAT, [cache_len, 1]))
+        one = b.const("one_c", np.array(1.0, np.float32))
+        keep_m = b.node(
+            "Sub", [one, "wmask"]
+        )  # 1 - wmask: the slots this block leaves alone
     outputs = []
     hidden = "hidden"
     for i in layers:
@@ -558,10 +571,23 @@ def build_block(
             int4,
             split,
         )
-        b.nodes.append(h.make_node("Identity", [k], [f"k_new_{i}"]))
-        b.nodes.append(h.make_node("Identity", [v], [f"v_new_{i}"]))
-        outputs.append(h.make_tensor_value_info(f"k_new_{i}", T.FLOAT, [nkv, rows, hd]))
-        outputs.append(h.make_tensor_value_info(f"v_new_{i}", T.FLOAT, [nkv, rows, hd]))
+        if state:
+            for past, new, name in ((pk, k, f"next_{pk}"), (pv, v, f"next_{pv}")):
+                kept = b.node("Mul", [past, keep_m])
+                written = b.node("MatMul", ["wsel", new])  # [nkv, C, hd]
+                b.nodes.append(h.make_node("Add", [kept, written], [name]))
+                outputs.append(
+                    h.make_tensor_value_info(name, T.FLOAT, [nkv, cache_len, hd])
+                )
+        else:
+            b.nodes.append(h.make_node("Identity", [k], [f"k_new_{i}"]))
+            b.nodes.append(h.make_node("Identity", [v], [f"v_new_{i}"]))
+            outputs.append(
+                h.make_tensor_value_info(f"k_new_{i}", T.FLOAT, [nkv, rows, hd])
+            )
+            outputs.append(
+                h.make_tensor_value_info(f"v_new_{i}", T.FLOAT, [nkv, rows, hd])
+            )
     b.nodes.append(h.make_node("Identity", [hidden], ["hidden_out"]))
     outputs.insert(0, h.make_tensor_value_info("hidden_out", T.FLOAT, [rows, H]))
     graph = h.make_graph(

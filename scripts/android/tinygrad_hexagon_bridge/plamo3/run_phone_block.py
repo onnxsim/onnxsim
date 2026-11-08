@@ -42,6 +42,11 @@ def main() -> int:
         help="compare every step's logits with the NumPy reference",
     )
     ap.add_argument(
+        "--kv-state",
+        action="store_true",
+        help="the programs were exported with --state: the KV caches stay on the phone",
+    )
+    ap.add_argument(
         "--trace",
         action="store_true",
         help="compare each layer's hidden state of the first block with the reference",
@@ -75,6 +80,7 @@ def main() -> int:
     kc = [np.zeros((nkv, C_, hd), np.float32) for _ in range(L)]
     vc = [np.zeros((nkv, C_, hd), np.float32) for _ in range(L)]
     eos = {int(x) for x in a.eos.split(",")}
+    ran = set()  # programs that have run (their device-resident caches are valid)
 
     def block(tokens, p0):
         """run tokens (<= RW) at cache offset p0; returns the logits of the last real row"""
@@ -96,16 +102,36 @@ def main() -> int:
             if (a.trace and p0 == 0)
             else None
         )
+        if a.kv_state:
+            wsel = np.zeros((C_, RW), np.float32)
+            wmask = np.zeros((C_, 1), np.float32)
+            for r in range(n):
+                wsel[p0 + r, r] = 1.0
+                wmask[p0 + r, 0] = 1.0
         for name, lo, hi in progs:
             layers = range(lo, hi + 1)
             inputs = [hidden, pos, mask]
-            for i in layers:
-                inputs += [kc[i], vc[i]]
+            if a.kv_state:
+                inputs += [wsel, wmask]
+                for i in layers:
+                    # the caches live on the phone: the first call sends them (zeros), later calls send nothing
+                    if name in ran:
+                        inputs += [
+                            np.zeros((0,), np.float32),
+                            np.zeros((0,), np.float32),
+                        ]
+                    else:
+                        inputs += [kc[i], vc[i]]
+                ran.add(name)
+            else:
+                for i in layers:
+                    inputs += [kc[i], vc[i]]
             outs = cli.run_compiled(name, inputs)
             hidden = outs[0].reshape(RW, H).astype(np.float32)
-            for j, i in enumerate(layers):
-                kc[i][:, p0 : p0 + n] = outs[1 + 2 * j].reshape(nkv, RW, hd)[:, :n]
-                vc[i][:, p0 : p0 + n] = outs[2 + 2 * j].reshape(nkv, RW, hd)[:, :n]
+            if not a.kv_state:
+                for j, i in enumerate(layers):
+                    kc[i][:, p0 : p0 + n] = outs[1 + 2 * j].reshape(nkv, RW, hd)[:, :n]
+                    vc[i][:, p0 : p0 + n] = outs[2 + 2 * j].reshape(nkv, RW, hd)[:, :n]
             if href is not None:
                 for i in layers:
                     href = ref.layer(i, href)

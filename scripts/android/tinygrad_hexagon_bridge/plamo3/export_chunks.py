@@ -49,6 +49,11 @@ def main() -> int:
         help="column slices per matrix for row-block graphs, e.g. qkv:2,o:2,gu:8,d:4",
     )
     ap.add_argument(
+        "--state",
+        action="store_true",
+        help="row-block graphs keep the KV caches on the device (recurrent state)",
+    )
+    ap.add_argument(
         "--head",
         action="store_true",
         help="also export the final norm + lm_head (1.1 GB: over the wire limit)",
@@ -72,6 +77,7 @@ def main() -> int:
                 int8=a.int8,
                 int4=a.int4,
                 split=split,
+                state=a.state,
             )
         else:
             O.build_chunk(
