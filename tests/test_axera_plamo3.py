@@ -320,3 +320,53 @@ def test_resident_state_block_matches_host_cache(model, tmp_path):
         return np.concatenate(outs)
 
     np.testing.assert_allclose(run(True), run(False), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("layer", [0, 1])  # 0: plain RoPE, 1: YaRN full attention
+def test_split_layer_graph_matches_reference(model, tmp_path, layer):
+    """The split-residual layer (ordinary channels + one massive channel) equals the reference."""
+    massive = (
+        3  # the random test model has 32 channels; the real model uses MASSIVE_CHANNEL
+    )
+    cap = {}
+    h_in = model.w("model.embed_tokens.weight")[np.asarray(IDS)].astype(np.float32)
+    for i in range(layer):
+        h_in = model.layer(i, h_in)
+    ref_out = model.layer(layer, h_in, capture=cap)
+    path = O.build_layer_split(
+        model,
+        layer,
+        str(tmp_path / f"split{layer}.onnx"),
+        cache_len=16,
+        massive=massive,
+    )
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+    keep = np.arange(CFG["hidden_size"]) != massive
+    pk = np.zeros((nkv, 16, hd), np.float32)
+    pv = np.zeros((nkv, 16, hd), np.float32)
+    outs = []
+    for pos in range(len(IDS)):
+        mask = np.full((1, 17), -1000.0, np.float32)
+        mask[0, :pos] = 0.0
+        mask[0, 16] = 0.0
+        hin = h_in[pos : pos + 1]
+        res = sess.run(
+            None,
+            {
+                "hidden_m": hin[:, keep].copy(),
+                "hidden_c": hin[:, massive : massive + 1].copy(),
+                "position_ids": np.array([pos], np.int64),
+                "past_k": pk,
+                "past_v": pv,
+                "attn_mask": mask,
+            },
+        )
+        full = np.concatenate([res[0][0, :massive], res[1][0], res[0][0, massive:]])
+        outs.append(full)
+        np.testing.assert_allclose(
+            res[2][:, 0, :], cap["k"][:, pos, :], rtol=1e-4, atol=1e-4
+        )
+        pk[:, pos, :] = res[2][:, 0, :]
+        pv[:, pos, :] = res[3][:, 0, :]
+    np.testing.assert_allclose(np.stack(outs), ref_out, rtol=1e-4, atol=1e-4)
