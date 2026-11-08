@@ -55,11 +55,18 @@ def main() -> int:
     nkv, hd, H, L = ref.nkv, ref.hd, ref.H, ref.L
     C_, RW = a.cache_len, a.rows
     cli = C.Client(a.host, a.port, io_timeout=3600.0)
-    names = [
-        os.path.basename(p)
-        for p in sorted(glob.glob(os.path.join(a.tghx_dir, "chunk_*.tghx")))
-    ]
-    assert len(names) == L, f"expected {L} layer programs, found {len(names)}"
+    progs = []  # (artifact name, first layer, last layer); a program covers consecutive layers
+    for path in sorted(glob.glob(os.path.join(a.tghx_dir, "chunk_*.tghx"))):
+        lo, hi = (
+            int(x)
+            for x in os.path.basename(path)[len("chunk_") : -len(".tghx")].split("_")
+        )
+        progs.append((os.path.basename(path), lo, hi))
+    covered = [i for _, lo, hi in progs for i in range(lo, hi + 1)]
+    assert covered == list(range(L)), (
+        f"programs cover layers {covered}, expected 0..{L - 1}"
+    )
+    names = [n for n, _, _ in progs]
     t0 = time.time()
     for n in names:
         cli.load_compiled(n, open(os.path.join(a.tghx_dir, n), "rb").read())
@@ -89,15 +96,23 @@ def main() -> int:
             if (a.trace and p0 == 0)
             else None
         )
-        for i in range(L):
-            outs = cli.run_compiled(names[i], [hidden, pos, mask, kc[i], vc[i]])
+        for name, lo, hi in progs:
+            layers = range(lo, hi + 1)
+            inputs = [hidden, pos, mask]
+            for i in layers:
+                inputs += [kc[i], vc[i]]
+            outs = cli.run_compiled(name, inputs)
             hidden = outs[0].reshape(RW, H).astype(np.float32)
+            for j, i in enumerate(layers):
+                kc[i][:, p0 : p0 + n] = outs[1 + 2 * j].reshape(nkv, RW, hd)[:, :n]
+                vc[i][:, p0 : p0 + n] = outs[2 + 2 * j].reshape(nkv, RW, hd)[:, :n]
             if href is not None:
-                href = ref.layer(i, href)
+                for i in layers:
+                    href = ref.layer(i, href)
                 d = float(np.max(np.abs(hidden[:n] - href)) / np.max(np.abs(href)))
-                print(f"  trace layer {i}: rel-max-diff {d:.3e}", flush=True)
-            kc[i][:, p0 : p0 + n] = outs[1].reshape(nkv, RW, hd)[:, :n]
-            vc[i][:, p0 : p0 + n] = outs[2].reshape(nkv, RW, hd)[:, :n]
+                print(
+                    f"  trace after layers {lo}-{hi}: rel-max-diff {d:.3e}", flush=True
+                )
         last = R.Plamo3Reference.rms(hidden[n - 1 : n], gain, 1.0)
         return (last @ lm_T).reshape(-1)
 
