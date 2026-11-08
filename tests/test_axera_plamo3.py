@@ -224,3 +224,99 @@ def test_quantized_chunk_matches_reference(model, tmp_path, bits, fidelity):
     # and the quantized model stays a usable approximation of the float one
     err = np.max(np.abs(got - float_ref)) / np.max(np.abs(float_ref))
     assert err < fidelity, f"int{bits} chunk relative error vs float {err:.3e}"
+
+
+def test_block_graph_matches_reference(model, tmp_path):
+    """The row-block graph (a prompt block padded to the block size, cache empty) equals the reference layer on the real
+    rows; the padding rows attend one slot only and are ignored."""
+    layer, rows, cache = 1, 8, 16
+    ids = IDS[:6]
+    h = model.w("model.embed_tokens.weight")[np.asarray(ids)].astype(np.float32)
+    ref_out = model.layer(layer, h)
+    path = O.build_block(
+        model, [layer], str(tmp_path / "block.onnx"), cache_len=cache, rows=rows
+    )
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+    hid = np.zeros((rows, CFG["hidden_size"]), np.float32)
+    hid[: len(ids)] = h
+    pos = np.array([min(r, len(ids) - 1) for r in range(rows)], np.int64)
+    mask = np.full((rows, cache + rows), -1000.0, np.float32)
+    for r in range(rows):
+        if r < len(ids):
+            mask[r, cache : cache + r + 1] = 0.0
+        else:
+            mask[r, cache] = 0.0
+    zeros = np.zeros((nkv, cache, hd), np.float32)
+    out = sess.run(
+        None,
+        {
+            "hidden": hid,
+            "position_ids": pos,
+            "attn_mask": mask,
+            f"past_k_{layer}": zeros,
+            f"past_v_{layer}": zeros,
+        },
+    )
+    np.testing.assert_allclose(out[0][: len(ids)], ref_out, rtol=1e-4, atol=1e-4)
+
+
+def test_resident_state_block_matches_host_cache(model, tmp_path):
+    """build_block(state=True) keeps the KV caches in its own outputs: a prompt block then a decode block give the same
+    result as the host-managed cache path (same graph without state), slot for slot."""
+    layer, rows, cache = 0, 8, 16
+    ids = IDS[:7]
+    emb = model.w("model.embed_tokens.weight")
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+
+    def run(state):
+        path = O.build_block(
+            model,
+            [layer],
+            str(tmp_path / f"block_{state}.onnx"),
+            cache_len=cache,
+            rows=rows,
+            state=state,
+        )
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        kc = np.zeros((nkv, cache, hd), np.float32)
+        vc = np.zeros((nkv, cache, hd), np.float32)
+        outs = []
+        for p0, toks in [(0, ids[:6]), (6, ids[6:7])]:
+            n = len(toks)
+            hid = np.zeros((rows, CFG["hidden_size"]), np.float32)
+            hid[:n] = emb[np.asarray(toks)]
+            pos = np.array([p0 + min(r, n - 1) for r in range(rows)], np.int64)
+            mask = np.full((rows, cache + rows), -1000.0, np.float32)
+            for r in range(rows):
+                if r < n:
+                    mask[r, :p0] = 0.0
+                    mask[r, cache : cache + r + 1] = 0.0
+                else:
+                    mask[r, cache] = 0.0
+            feeds = {"hidden": hid, "position_ids": pos, "attn_mask": mask}
+            if state:
+                wsel = np.zeros((cache, rows), np.float32)
+                wmask = np.zeros((cache, 1), np.float32)
+                for r in range(n):
+                    wsel[p0 + r, r] = 1.0
+                    wmask[p0 + r, 0] = 1.0
+                feeds.update(wsel=wsel, wmask=wmask)
+                feeds[f"past_k_{layer}"], feeds[f"past_v_{layer}"] = kc, vc
+                res = dict(
+                    zip([o.name for o in sess.get_outputs()], sess.run(None, feeds))
+                )
+                kc, vc = res[f"next_past_k_{layer}"], res[f"next_past_v_{layer}"]
+            else:
+                feeds[f"past_k_{layer}"], feeds[f"past_v_{layer}"] = kc, vc
+                res = dict(
+                    zip([o.name for o in sess.get_outputs()], sess.run(None, feeds))
+                )
+                kc = kc.copy()
+                vc = vc.copy()
+                kc[:, p0 : p0 + n] = res[f"k_new_{layer}"][:, :n]
+                vc[:, p0 : p0 + n] = res[f"v_new_{layer}"][:, :n]
+            outs.append(res["hidden_out"][:n])
+        return np.concatenate(outs)
+
+    np.testing.assert_allclose(run(True), run(False), rtol=1e-6, atol=1e-6)
