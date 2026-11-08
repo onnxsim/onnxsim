@@ -53,8 +53,13 @@ The nominal peak is 57 cores x 1.1 GHz x 32 flops per cycle. Run-to-run variatio
 ideal: the remaining cost is packing A (about 7 ms of about 45 ms per call, serial in phase), and the compute phase
 reaches about 75% of the microkernel's own rate.
 
+## Shapes
+
+`sgemm_knc_any` accepts any M, N, K: it pads M to 32, N to 128 and K to 128 with zeros, runs the fast path, and copies
+the result back. Odd shapes are checked (for example 37x129x65, 33x257x130, 1000x1000x1000) against the reference. Small
+shapes are slow because the padding copies and the thread-pool wakeups cost more than the arithmetic.
+
 ## Limits
 
 - Requires the k1om toolchain and a card; the kernel is written for KNC (KC == 128 is enforced).
-- Dimension restrictions as above; no edge handling.
 - Tested on one card with MPSS 3.8.6.

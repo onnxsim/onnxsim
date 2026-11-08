@@ -397,6 +397,22 @@ void sgemm_knc(const float *A, const float *B, float *C, int M, int N, int K, in
   sgemm_knc_run(A, Bpk_buf, C, Apk_buf, M, N, K, nthreads);
 }
 
+
+// Any shape: pads M to 32, N to 128 and K to 128 with zeros (the fast path needs multiples), runs, and copies the
+// M x N result back. Zero padding leaves the valid part of C unchanged.
+static size_t pad_to(size_t x, size_t m) { return (x + m - 1) / m * m; }
+void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K, int nthreads) {
+  if (M % RC == 0 && N % (32 * PG) == 0 && K % KC == 0) { sgemm_knc(A, B, C, M, N, K, nthreads); return; }
+  size_t Mp = pad_to(M, RC), Np = pad_to(N, 32 * PG), Kp = pad_to(K, KC);
+  float *Ap = aligned_alloc(64, Mp * Kp * 4), *Bp = aligned_alloc(64, Kp * Np * 4), *Cp = aligned_alloc(64, Mp * Np * 4);
+  memset(Ap, 0, Mp * Kp * 4); memset(Bp, 0, Kp * Np * 4);
+  for (int i = 0; i < M; i++) memcpy(Ap + (size_t)i * Kp, A + (size_t)i * K, (size_t)K * 4);
+  for (int k = 0; k < K; k++) memcpy(Bp + (size_t)k * Np, B + (size_t)k * N, (size_t)N * 4);
+  sgemm_knc(Ap, Bp, Cp, (int)Mp, (int)Np, (int)Kp, nthreads);
+  for (int i = 0; i < M; i++) memcpy(C + (size_t)i * N, Cp + (size_t)i * Np, (size_t)N * 4);
+  free(Ap); free(Bp); free(Cp);
+}
+
 static double maxerr_sampled(const float *A, const float *B, const float *C, int M, int N, int K) {
   double maxerr = 0;
   for (int t = 0; t < 64; t++) {
@@ -415,12 +431,19 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (float)rand() / RAND_MAX - 0.5f;
   for (size_t i = 0; i < (size_t)K * N; i++) B[i] = (float)rand() / RAND_MAX - 0.5f;
   float *Bpk = aligned_alloc(64, (size_t)K * N * 4), *Apk = aligned_alloc(64, (size_t)M * K * 4);
-  sgemm_knc_pack_B(B, Bpk, K, N, nth);
-  sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
+  const int fast = (M % RC == 0 && N % (32 * PG) == 0 && K % KC == 0);
+  if (fast) {
+    sgemm_knc_pack_B(B, Bpk, K, N, nth);
+    sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
+  } else { sgemm_knc_any(A, B, C, M, N, K, nth); }
   double maxerr = maxerr_sampled(A, B, C, M, N, K);
   double best = 1e30;
   for (int r = 0; r < reps; r++) {
-    double t0 = now_s(); if (getenv("PHASED")) sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth); else sgemm_knc_run_overlap(A, Bpk, C, Apk, M, N, K, nth); double dt = now_s() - t0; if (dt < best) best = dt;
+    double t0 = now_s();
+    if (!fast) sgemm_knc_any(A, B, C, M, N, K, nth);
+    else if (getenv("PHASED")) sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
+    else sgemm_knc_run_overlap(A, Bpk, C, Apk, M, N, K, nth);
+    double dt = now_s() - t0; if (dt < best) best = dt;
   }
   double gflops = 2.0 * M * N * K / best * 1e-9;
   printf("M=%d N=%d K=%d threads=%d maxerr(sampled)=%g\n", M, N, K, nth, maxerr);
