@@ -414,6 +414,126 @@ void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K
 }
 
 
+// Full-K microkernel: C[8][32] = A[8][nkc*KC] * B[nkc*KC][32] with the accumulators kept in registers across all K
+// blocks (C written once). Ap: Apk block of row block rb, kc = 0 (kc blocks are 8*KC floats apart); Bp: panel, kc = 0
+// (kc blocks are KC*32 floats apart). The outer loop moves rdx by 3584 bytes so each K block starts at 4 KB.
+static inline void kernel_full(const float *Ap, const float *Bp, float *C, long ldc, long nkc) {
+  long cnt = KC / 4;
+  long ldc_b = ldc * 4;
+  __asm__ volatile(
+        "vpxord %%zmm0, %%zmm0, %%zmm0\n\t" "vpxord %%zmm1, %%zmm1, %%zmm1\n\t"
+    "vpxord %%zmm2, %%zmm2, %%zmm2\n\t" "vpxord %%zmm3, %%zmm3, %%zmm3\n\t"
+    "vpxord %%zmm4, %%zmm4, %%zmm4\n\t" "vpxord %%zmm5, %%zmm5, %%zmm5\n\t"
+    "vpxord %%zmm6, %%zmm6, %%zmm6\n\t" "vpxord %%zmm7, %%zmm7, %%zmm7\n\t"
+    "vpxord %%zmm8, %%zmm8, %%zmm8\n\t" "vpxord %%zmm9, %%zmm9, %%zmm9\n\t"
+    "vpxord %%zmm10, %%zmm10, %%zmm10\n\t" "vpxord %%zmm11, %%zmm11, %%zmm11\n\t"
+    "vpxord %%zmm12, %%zmm12, %%zmm12\n\t" "vpxord %%zmm13, %%zmm13, %%zmm13\n\t"
+    "vpxord %%zmm14, %%zmm14, %%zmm14\n\t" "vpxord %%zmm15, %%zmm15, %%zmm15\n\t"
+
+    "mov %[Ap], %%rdx\n\t"
+    "mov %[Bp], %%rbx\n\t"
+    "mov %[nkc], %%r8\n\t"
+    "5:\n\t"
+    "mov %[cnt], %%rcx\n\t"
+    "1:\n\t"
+    PREFETCH_ASM
+    "vmovaps 0(%%rbx), %%zmm16\n\t"
+    "vmovaps 64(%%rbx), %%zmm17\n\t"
+    "vfmadd231ps 0(%%rdx)%{1to16%}, %%zmm16, %%zmm0\n\t"
+    "vfmadd231ps 0(%%rdx)%{1to16%}, %%zmm17, %%zmm1\n\t"
+    "vfmadd231ps 512(%%rdx)%{1to16%}, %%zmm16, %%zmm2\n\t"
+    "vfmadd231ps 512(%%rdx)%{1to16%}, %%zmm17, %%zmm3\n\t"
+    "vfmadd231ps 1024(%%rdx)%{1to16%}, %%zmm16, %%zmm4\n\t"
+    "vfmadd231ps 1024(%%rdx)%{1to16%}, %%zmm17, %%zmm5\n\t"
+    "vfmadd231ps 1536(%%rdx)%{1to16%}, %%zmm16, %%zmm6\n\t"
+    "vfmadd231ps 1536(%%rdx)%{1to16%}, %%zmm17, %%zmm7\n\t"
+    "vfmadd231ps 2048(%%rdx)%{1to16%}, %%zmm16, %%zmm8\n\t"
+    "vfmadd231ps 2048(%%rdx)%{1to16%}, %%zmm17, %%zmm9\n\t"
+    "vfmadd231ps 2560(%%rdx)%{1to16%}, %%zmm16, %%zmm10\n\t"
+    "vfmadd231ps 2560(%%rdx)%{1to16%}, %%zmm17, %%zmm11\n\t"
+    "vfmadd231ps 3072(%%rdx)%{1to16%}, %%zmm16, %%zmm12\n\t"
+    "vfmadd231ps 3072(%%rdx)%{1to16%}, %%zmm17, %%zmm13\n\t"
+    "vfmadd231ps 3584(%%rdx)%{1to16%}, %%zmm16, %%zmm14\n\t"
+    "vfmadd231ps 3584(%%rdx)%{1to16%}, %%zmm17, %%zmm15\n\t"
+    "vmovaps 128(%%rbx), %%zmm18\n\t"
+    "vmovaps 192(%%rbx), %%zmm19\n\t"
+    "vfmadd231ps 4(%%rdx)%{1to16%}, %%zmm18, %%zmm0\n\t"
+    "vfmadd231ps 4(%%rdx)%{1to16%}, %%zmm19, %%zmm1\n\t"
+    "vfmadd231ps 516(%%rdx)%{1to16%}, %%zmm18, %%zmm2\n\t"
+    "vfmadd231ps 516(%%rdx)%{1to16%}, %%zmm19, %%zmm3\n\t"
+    "vfmadd231ps 1028(%%rdx)%{1to16%}, %%zmm18, %%zmm4\n\t"
+    "vfmadd231ps 1028(%%rdx)%{1to16%}, %%zmm19, %%zmm5\n\t"
+    "vfmadd231ps 1540(%%rdx)%{1to16%}, %%zmm18, %%zmm6\n\t"
+    "vfmadd231ps 1540(%%rdx)%{1to16%}, %%zmm19, %%zmm7\n\t"
+    "vfmadd231ps 2052(%%rdx)%{1to16%}, %%zmm18, %%zmm8\n\t"
+    "vfmadd231ps 2052(%%rdx)%{1to16%}, %%zmm19, %%zmm9\n\t"
+    "vfmadd231ps 2564(%%rdx)%{1to16%}, %%zmm18, %%zmm10\n\t"
+    "vfmadd231ps 2564(%%rdx)%{1to16%}, %%zmm19, %%zmm11\n\t"
+    "vfmadd231ps 3076(%%rdx)%{1to16%}, %%zmm18, %%zmm12\n\t"
+    "vfmadd231ps 3076(%%rdx)%{1to16%}, %%zmm19, %%zmm13\n\t"
+    "vfmadd231ps 3588(%%rdx)%{1to16%}, %%zmm18, %%zmm14\n\t"
+    "vfmadd231ps 3588(%%rdx)%{1to16%}, %%zmm19, %%zmm15\n\t"
+    "vmovaps 256(%%rbx), %%zmm16\n\t"
+    "vmovaps 320(%%rbx), %%zmm17\n\t"
+    "vfmadd231ps 8(%%rdx)%{1to16%}, %%zmm16, %%zmm0\n\t"
+    "vfmadd231ps 8(%%rdx)%{1to16%}, %%zmm17, %%zmm1\n\t"
+    "vfmadd231ps 520(%%rdx)%{1to16%}, %%zmm16, %%zmm2\n\t"
+    "vfmadd231ps 520(%%rdx)%{1to16%}, %%zmm17, %%zmm3\n\t"
+    "vfmadd231ps 1032(%%rdx)%{1to16%}, %%zmm16, %%zmm4\n\t"
+    "vfmadd231ps 1032(%%rdx)%{1to16%}, %%zmm17, %%zmm5\n\t"
+    "vfmadd231ps 1544(%%rdx)%{1to16%}, %%zmm16, %%zmm6\n\t"
+    "vfmadd231ps 1544(%%rdx)%{1to16%}, %%zmm17, %%zmm7\n\t"
+    "vfmadd231ps 2056(%%rdx)%{1to16%}, %%zmm16, %%zmm8\n\t"
+    "vfmadd231ps 2056(%%rdx)%{1to16%}, %%zmm17, %%zmm9\n\t"
+    "vfmadd231ps 2568(%%rdx)%{1to16%}, %%zmm16, %%zmm10\n\t"
+    "vfmadd231ps 2568(%%rdx)%{1to16%}, %%zmm17, %%zmm11\n\t"
+    "vfmadd231ps 3080(%%rdx)%{1to16%}, %%zmm16, %%zmm12\n\t"
+    "vfmadd231ps 3080(%%rdx)%{1to16%}, %%zmm17, %%zmm13\n\t"
+    "vfmadd231ps 3592(%%rdx)%{1to16%}, %%zmm16, %%zmm14\n\t"
+    "vfmadd231ps 3592(%%rdx)%{1to16%}, %%zmm17, %%zmm15\n\t"
+    "vmovaps 384(%%rbx), %%zmm18\n\t"
+    "vmovaps 448(%%rbx), %%zmm19\n\t"
+    "vfmadd231ps 12(%%rdx)%{1to16%}, %%zmm18, %%zmm0\n\t"
+    "vfmadd231ps 12(%%rdx)%{1to16%}, %%zmm19, %%zmm1\n\t"
+    "vfmadd231ps 524(%%rdx)%{1to16%}, %%zmm18, %%zmm2\n\t"
+    "vfmadd231ps 524(%%rdx)%{1to16%}, %%zmm19, %%zmm3\n\t"
+    "vfmadd231ps 1036(%%rdx)%{1to16%}, %%zmm18, %%zmm4\n\t"
+    "vfmadd231ps 1036(%%rdx)%{1to16%}, %%zmm19, %%zmm5\n\t"
+    "vfmadd231ps 1548(%%rdx)%{1to16%}, %%zmm18, %%zmm6\n\t"
+    "vfmadd231ps 1548(%%rdx)%{1to16%}, %%zmm19, %%zmm7\n\t"
+    "vfmadd231ps 2060(%%rdx)%{1to16%}, %%zmm18, %%zmm8\n\t"
+    "vfmadd231ps 2060(%%rdx)%{1to16%}, %%zmm19, %%zmm9\n\t"
+    "vfmadd231ps 2572(%%rdx)%{1to16%}, %%zmm18, %%zmm10\n\t"
+    "vfmadd231ps 2572(%%rdx)%{1to16%}, %%zmm19, %%zmm11\n\t"
+    "vfmadd231ps 3084(%%rdx)%{1to16%}, %%zmm18, %%zmm12\n\t"
+    "vfmadd231ps 3084(%%rdx)%{1to16%}, %%zmm19, %%zmm13\n\t"
+    "vfmadd231ps 3596(%%rdx)%{1to16%}, %%zmm18, %%zmm14\n\t"
+    "vfmadd231ps 3596(%%rdx)%{1to16%}, %%zmm19, %%zmm15\n\t"
+    "add $512, %%rbx\n\t"
+    "add $16, %%rdx\n\t"
+    "add $3584, %%rdx\n\t"
+    "dec %%r8\n\t"
+    "jnz 5b\n\t"
+        "mov %[C], %%rax\n\t"
+    "vmovaps %%zmm0, (%%rax)\n\t"   "vmovaps %%zmm1, 64(%%rax)\n\t"   "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm2, (%%rax)\n\t"   "vmovaps %%zmm3, 64(%%rax)\n\t"   "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm4, (%%rax)\n\t"   "vmovaps %%zmm5, 64(%%rax)\n\t"   "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm6, (%%rax)\n\t"   "vmovaps %%zmm7, 64(%%rax)\n\t"   "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm8, (%%rax)\n\t"   "vmovaps %%zmm9, 64(%%rax)\n\t"   "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm10, (%%rax)\n\t"  "vmovaps %%zmm11, 64(%%rax)\n\t"  "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm12, (%%rax)\n\t"  "vmovaps %%zmm13, 64(%%rax)\n\t"  "add %[ldc], %%rax\n\t"
+    "vmovaps %%zmm14, (%%rax)\n\t"  "vmovaps %%zmm15, 64(%%rax)\n\t"
+    :
+    : [C] "m"(C), [ldc] "r"(ldc_b), [Ap] "m"(Ap), [Bp] "m"(Bp), [cnt] "m"(cnt), [nkc] "m"(nkc),
+      [pfb] "i"(PF_DIST * 128), [pfb2] "i"(PF_DIST * 512), [pfa] "i"(PF_DIST * 16),
+      [pfa1] "i"(512 + PF_DIST * 16), [pfa2] "i"(1024 + PF_DIST * 16), [pfa3] "i"(1536 + PF_DIST * 16),
+      [pfa4] "i"(2048 + PF_DIST * 16), [pfa5] "i"(2560 + PF_DIST * 16), [pfa6] "i"(3072 + PF_DIST * 16), [pfa7] "i"(3584 + PF_DIST * 16)
+    : "rax", "rbx", "rcx", "rdx", "r8", "zmm0", "zmm1", "zmm2", "zmm3", "zmm4", "zmm5", "zmm6", "zmm7",
+      "zmm8", "zmm9", "zmm10", "zmm11", "zmm12", "zmm13", "zmm14", "zmm15", "zmm16", "zmm17", "zmm18", "zmm19",
+      "memory", "cc");
+}
+
+
 // ---- core-shared schedule ----
 // The four hardware threads of a core (threads c, c+57, c+114, c+171 under pin_thread's mapping) work on the same
 // 128-column panel group at the same time, so they share one B panel in L1 (measured: 1112 vs 903 GFLOPS kernel-only
@@ -447,6 +567,52 @@ void sgemm_knc_run_static(const float *A, const float *Bpk, float *C, float *Apk
   pool_run(static_task, &j);
 }
 
+
+// ---- shared-panel schedule ----
+// A unit is one panel group (PG panels) x four 8-row blocks, one per hardware thread of a core (thread c + 57*jj
+// with pin_thread's mapping), so the four threads of a core stream the same B panel together through one L1.
+// Cores claim units from a global counter; the leader thread of a core (jj == 0) claims for the core, and two
+// per-core barriers keep the four threads in step. Requires 228 threads and M % 32 == 0.
+#define SH_CORES 57
+static volatile int sh_next;
+static volatile int sh_arr[SH_CORES];
+static volatile int sh_val[SH_CORES];
+typedef struct { const float *Apk, *Bpk; float *C; int M, N, nkc, npg, nunits; } shared_job_t;
+static inline void sh_barrier(int c, int m) {
+  __sync_fetch_and_add(&sh_arr[c], 1);
+  while (__sync_fetch_and_add(&sh_arr[c], 0) < 4 * m) { }
+}
+static void shared_task(void *argp, int id) {
+  shared_job_t *j = (shared_job_t *)argp;
+  const int c = id % SH_CORES, jj = id / SH_CORES, N = j->N, nkc = j->nkc;
+  int m = 0;
+  for (;;) {
+    if (jj == 0) {
+      int u = __sync_fetch_and_add(&sh_next, 1);
+      sh_val[c] = u < j->nunits ? u : -1;
+    }
+    sh_barrier(c, ++m);                       // unit claimed and visible to the four threads
+    int u = sh_val[c];
+    if (u < 0) break;
+    int quad = u / j->npg, pg = u % j->npg;
+    int rb = quad * 4 + jj, p0 = pg * PG;
+    for (int q = 0; q < PG; q++)
+      kernel_full(j->Apk + (size_t)rb * nkc * 8 * KC, j->Bpk + ((size_t)(p0 + q) * nkc) * KC * 32,
+                  j->C + (size_t)(rb * 8) * N + (p0 + q) * 32, N, nkc);
+    sh_barrier(c, ++m);                       // all four done before the leader claims again
+  }
+}
+void sgemm_knc_run_shared(const float *A, const float *Bpk, float *C, float *Apk, int M, int N, int K, int nthreads) {
+  pool_init(nthreads);
+  job_t pj = {0};
+  pj.A = A; pj.Apk = Apk; pj.M = M; pj.N = N; pj.K = K; pj.nkc = K / KC; pj.nA = M / 8; pj.nB = 0; pj.do_pack_B = 0;
+  pj.next = 0; pool_run(pack_task, &pj);
+  for (int c = 0; c < SH_CORES; c++) { sh_arr[c] = 0; sh_val[c] = 0; }
+  sh_next = 0;
+  shared_job_t j = {Apk, Bpk, C, M, N, K / KC, N / (32 * PG), (M / 32) * (N / (32 * PG))};
+  pool_run(shared_task, &j);
+}
+
 static double maxerr_sampled(const float *A, const float *B, const float *C, int M, int N, int K) {
   double maxerr = 0;
   for (int t = 0; t < 64; t++) {
@@ -459,7 +625,7 @@ static double maxerr_sampled(const float *A, const float *B, const float *C, int
 
 int main(int argc, char **argv) {
   int M = argc > 1 ? atoi(argv[1]) : 2048, N = argc > 2 ? atoi(argv[2]) : 2048, K = argc > 3 ? atoi(argv[3]) : 2048;
-  int nth = argc > 4 ? atoi(argv[4]) : 171, reps = argc > 5 ? atoi(argv[5]) : 3;
+  int nth = argc > 4 ? atoi(argv[4]) : 228, reps = argc > 5 ? atoi(argv[5]) : 3;
   float *A = aligned_alloc(64, (size_t)M * K * 4), *B = aligned_alloc(64, (size_t)K * N * 4), *C = aligned_alloc(64, (size_t)M * N * 4);
   srand(1);
   for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (float)rand() / RAND_MAX - 0.5f;
@@ -476,6 +642,7 @@ int main(int argc, char **argv) {
     double t0 = now_s();
     if (!fast) sgemm_knc_any(A, B, C, M, N, K, nth);
     else if (getenv("PHASED")) sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
+    else if (!getenv("NOSHARED") && M % 32 == 0 && nth == 4 * SH_CORES) sgemm_knc_run_shared(A, Bpk, C, Apk, M, N, K, nth);
     else if (getenv("STATIC") && M % (RC * 4) == 0 && nth == 4 * NCORES) sgemm_knc_run_static(A, Bpk, C, Apk, M, N, K, nth);   // opt-in: measured slower
     else sgemm_knc_run_overlap(A, Bpk, C, Apk, M, N, K, nth);
     double dt = now_s() - t0; if (dt < best) best = dt;

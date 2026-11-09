@@ -27,6 +27,10 @@ Output: max error on 64 sampled entries against a double-precision reference, an
 - **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 32 rows by 4 panels (128 columns), so a B sub-panel is
   reused across the rows of an item while it is in L1. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
   slower (325 vs 382 GFLOPS) and is off by default.
+- **Shared-panel schedule** (default at 228 threads, `M % 32 == 0`): the four hardware threads of a core work on the same
+  panel group together, so they share one B panel in L1 (kernel-only: 1112 vs 903 GFLOPS). The microkernel keeps its 16
+  accumulators across all K blocks, so C is written once. Cores claim units from a global counter; two per-core barriers
+  keep the four threads in step. Other thread counts use the overlapped path.
 - **Threads**: a persistent pool; each thread is pinned to one hardware thread. The card numbers CPUs in groups of four per
   core, and spreading the first hardware thread of each core before the second is measured at 1.4x at 228 threads.
 - **K split** (`-DKS=n`): each K group writes a partial C, reduced at the end. It is measured slower on this card (the
@@ -45,7 +49,9 @@ Output: max error on 64 sampled entries against a double-precision reference, an
 | work items of 32 rows x 4 panels, 171 threads (default) | 419 | 21% |
 | same, 114 threads | 408 | 20% |
 | same, 228 threads | 376 | 19% |
-| A packing overlapped with compute (default), 171 threads | 468-509 | 23-25% |
+| A packing overlapped with compute, 171 threads | 468-509 | 23-25% |
+| shared-panel schedule (default at 228 threads), full-K kernel | 540-577 | 27-29% |
+| shared-panel schedule, 4096 x 2048 x 2048 | 890-1018 | 44-51% |
 | same, 228 threads | 489 | 24% |
 | kernel microbenchmark, 228 pinned threads (no GEMM overhead) | 765 | 38% |
 
