@@ -1,7 +1,7 @@
 # SGEMM for Intel Knights Corner (k1om)
 
 `gemm_knc.c` computes `C = A*B` in single precision (row-major; any shape through `sgemm_knc_any`, fastest with
-`M % 32 == 0`, `K % 128 == 0`, `N % 128 == 0`) on a Xeon Phi
+`M % 16 == 0`, `K % 128 == 0`, `N % 64 == 0`) on a Xeon Phi
 coprocessor 3120 series (Knights Corner) with the k1om GCC 5.1.1 toolchain (`NFCXX_K1OM_ROOT`, default `/opt/k1om`).
 
 ## Build and run
@@ -9,7 +9,7 @@ coprocessor 3120 series (Knights Corner) with the k1om GCC 5.1.1 toolchain (`NFC
 ```sh
 tools/onnx-remote/knc/gemm/build_gemm_knc.sh          # -> build/knc-gemm/gemm_knc, bench_kernel
 # on the card (copy the binary over SSH as in tools/onnx-remote/knc/README.md):
-./gemm_knc M N K THREADS REPS                         # e.g. ./gemm_knc 2048 2048 2048 171 8
+./gemm_knc M N K [THREADS] [REPS]                     # e.g. ./gemm_knc 2048 2048 2048 228 8 (default 228 threads)
 ./bench_kernel THREADS REPS [PIN]                      # kernel only, L1-resident; threads pinned unless PIN=0
 ```
 
@@ -27,8 +27,10 @@ runs on the output of the last timed call (C is filled with NaN before each call
   segments in the same pool pass as the compute (`sgemm_knc_run_overlap`, the default): packing items come first in the
   shared counter, and each compute item waits only for the packed blocks of its row chunk. `PHASED=1` selects the
   older two-phase path (`sgemm_knc_run`).
-- **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 32 rows by 4 panels (128 columns), so a B sub-panel is
-  reused across the rows of an item while it is in L1. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
+- **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 16 rows by 2 panels (64 columns, `-DRC`, `-DPG`), so
+  a B sub-panel is reused across the rows of an item while it is in L1. Measured at 228 threads (2048^3 / 1024^3 / 512^3):
+  RC=16 PG=2 802 / 629 / 352, RC=32 PG=4 748 / 489 / 213, RC=16 PG=1 732 / 669 / 420, RC=64 PG=4 610 / 425 / -,
+  RC=8 599-620 / 477-491 / -. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
   slower (325 vs 382 GFLOPS) and is off by default.
 - **Shared-panel schedule** (opt-in, `SHARED=1`, 228 threads, `M % 32 == 0`): the four hardware threads of a core work
   on the same panel group together, so they share one B panel in L1, with a full-K microkernel (`kernel_full`) that
@@ -40,25 +42,27 @@ runs on the output of the last timed call (C is filled with NaN before each call
   (default 100 ms), then sleep on a condition variable. An empty run costs about 0.03 ms (4-10 ms with condition
   variables alone), which also removed most of the run-to-run noise.
 - **Any shape** (`sgemm_knc_any`): A and B are packed straight from the caller's arrays in one parallel pass, with the
-  padding (M to 32, N to 128, K to 128) written as zeros; C is written in place when its layout allows, else into a kept
+  padding (M to RC, N to 32 x PG, K to 128) written as zeros; C is written in place when its layout allows, else into a kept
   scratch buffer that is copied back in parallel.
-- **K split** (`-DKS=n`): each K group writes a partial C, reduced at the end. It is measured slower on this card (the
-  partial buffers and the reduction cost more than the extra parallelism); the default is `KS=1`.
+- **K split** (`-DKS=n`): each K group writes a partial C, reduced at the end. With RC=32 PG=4 and the spinning pool,
+  `KS=2` measured 755 vs 744 GFLOPS at 2048^3 and 551 vs 485 at 1024^3, but 755 vs 796 at 4096 x 2048 x 2048; the
+  default is `KS=1`.
+- **Prefetch distance** (`-DPF_DIST`, default 4): 2 and 8 measured 715 and 737 vs 744 GFLOPS at 2048^3.
 
 ## Measurements (one card, 228 threads unless noted)
 
-Current default (overlapped A packing, spinning pool), medians of three interleaved rounds:
+Current default (overlapped A packing, spinning pool, RC=16 PG=2), medians of three interleaved rounds:
 
 | shape | GFLOPS | % of 2006 GFLOPS nominal peak |
 |---|---|---|
-| 2048 x 2048 x 2048 | 737-746 | 37% |
-| 4096 x 2048 x 2048 | 791 | 39% |
-| 4096 x 4096 x 4096 | 756 | 38% |
-| 1024 x 1024 x 1024 | 499 | 25% |
-| 1000 x 1000 x 1000 (padded, both operands packed per call) | 375 | 19% |
-| 512 x 512 x 512 | 205 | 10% |
-| 2048^3, 171 / 114 / 57 threads | 683 / 547 / 370 | |
-| 2048^3, `PHASED=1` / `SHARED=1` | 733 / 681 | |
+| 2048 x 2048 x 2048 | 777-802 | 39-40% |
+| 4096 x 2048 x 2048 | 780 | 39% |
+| 4096 x 4096 x 4096 | 788 | 39% |
+| 1024 x 1024 x 1024 | 629 | 31% |
+| 1000 x 1000 x 1000 (padded, both operands packed per call) | 478-488 | 24% |
+| 512 x 512 x 512 | 352 | 18% |
+| 2048^3 with RC=32 PG=4: 228 / 171 / 114 / 57 threads | 737 / 683 / 547 / 370 | |
+| 2048^3 with RC=32 PG=4: `PHASED=1` / `SHARED=1` | 733 / 681 | |
 | kernel microbenchmark, 228 pinned threads, 100000 repetitions | 1024 | 51% |
 
 History at 2048^3 (best of several runs, condition-variable pool):
@@ -71,10 +75,11 @@ History at 2048^3 (best of several runs, condition-variable pool):
 | pinned threads, 114 threads | 290 |
 | B packed once, 114 threads | 390 |
 | A packing overlapped with compute, 114-228 threads | 275-385 (interleaved medians) |
-| spinning pool, 228 threads (current) | 737-746 |
+| spinning pool, 228 threads | 737-746 |
+| work items of 16 rows x 2 panels (current) | 777-802 |
 
 The nominal peak is 57 cores x 1.1 GHz x 32 flops per cycle. With the spinning pool the run-to-run variation is about +-2%.
-At 2048^3 the GEMM runs at about 73% of the microkernel's own rate.
+At 2048^3 the GEMM runs at about 77% of the microkernel's own rate.
 
 **Correction.** Earlier revisions of this file reported 540-690 GFLOPS at 2048^3 and 1037-1214 GFLOPS at
 4096 x 2048 x 2048 for the shared-panel schedule. Those numbers were wrong: `kernel_full`'s inner k loop had lost its

@@ -1,6 +1,6 @@
-// Single-precision GEMM for Intel Knights Corner (k1om): C = A*B, row-major. Fast path: M % 32 == 0, K % 128 == 0,
-// N % 128 == 0; sgemm_knc_any takes any shape. KNC assembly microkernel (8 rows x 32 columns, 16 accumulators), A and B
-// packed into panels, a persistent pinned thread pool, work items of 32 rows x 128 columns over K blocks of 128.
+// Single-precision GEMM for Intel Knights Corner (k1om): C = A*B, row-major. Fast path: M % RC == 0, K % 128 == 0,
+// N % (32 * PG) == 0; sgemm_knc_any takes any shape. KNC assembly microkernel (8 rows x 32 columns, 16 accumulators), A and B
+// packed into panels, a persistent pinned thread pool, work items of RC rows x PG panels over K blocks of 128.
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -17,10 +17,10 @@
 #error "the KNC microkernel is written for KC == 128"
 #endif
 #ifndef PG
-#define PG 4     // 32-column panels per work item
+#define PG 2     // 32-column panels per work item (PG=2, RC=16 measured best overall; PG=1 is faster below 1024^3)
 #endif
 #ifndef RC
-#define RC 32    // rows per work item
+#define RC 16    // rows per work item
 #endif
 #ifndef KS
 #define KS 1     // K groups: each group is its own work item and writes its own partial C (reduced at the end)
@@ -678,7 +678,7 @@ void sgemm_knc_run_shared(const float *A, const float *Bpk, float *C, float *Apk
 // ---- any shape ----
 // The operands are packed straight from the caller's (unpadded) arrays, in parallel, with the padding written as
 // zeros; the compute runs on the padded shape (zero padding leaves the valid part of C unchanged), into C itself when
-// the padded C has the same layout (M % 32 == 0, N % 128 == 0), else into a scratch C that is copied back in parallel.
+// the padded C has the same layout (M % RC == 0, N % (32 * PG) == 0), else into a scratch C that is copied back in parallel.
 // Scratch buffers are kept between calls. (Measured: 1000^3 from 71 ms with serial padding copies to 42 ms.)
 typedef struct { const float *A, *B; float *Apk, *Bpk; const float *Cs; float *C;
                  int M, N, K, Mp, Np, Kp; volatile int next; int nA, nB; } any_job_t;
