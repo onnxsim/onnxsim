@@ -63,6 +63,16 @@ The nominal peak is 57 cores x 1.1 GHz x 32 flops per cycle. Run-to-run variatio
 ideal: the remaining cost is packing A (about 7 ms of about 45 ms per call, serial in phase), and the compute phase
 reaches about 75% of the microkernel's own rate.
 
+## Measured and not kept
+
+- **B reuse across quads** (a core works through several quads with the same panel group, so B is read from memory once per
+  unit): 2048^3 at 393-442 GFLOPS against 510-630 for the default. The traffic model predicted a 45% cut in B reads, but the
+  schedule was slower, so B re-reads are not the limit.
+- **Hardware counters:** the card's kernel accepts `perf_event_open`, but the call blocks in the kernel (uninterruptible
+  sleep), and the card needed a reset afterwards. Traffic figures are therefore model-based, not counted.
+- **Streaming bandwidth** (vector loads, 1 GB): 36 GB/s at 57 threads, 19 GB/s at 171, 14.5 GB/s at 228 (reads). It falls with
+  thread count, which points at contention; a true ceiling was not established.
+
 ## Shapes
 
 `sgemm_knc_any` accepts any M, N, K: it pads M to 32, N to 128 and K to 128 with zeros, runs the fast path, and copies
