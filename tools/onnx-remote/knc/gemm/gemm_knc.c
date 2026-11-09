@@ -14,7 +14,7 @@
 #define KC 128   // K block (B panel 16 KB: stays in L1 next to the A stream)
 #endif
 #if KC != 128
-#error "the KNC microkernel is written for KC == 128"
+#error "the KNC microkernel is written for KC == 128 (KC=64/32 fit the L1 better but measured slower in the GEMM)"
 #endif
 #ifndef PG
 #define PG 2     // 32-column panels per work item (PG=2, RC=16 measured best overall; PG=1 is faster below 1024^3)
@@ -275,7 +275,24 @@ static void pool_run(task_fn fn, void *arg) {
 typedef struct {
   const float *A, *B; float *C; float *Apk, *Bpk;
   int M, N, K, nkc; volatile int next; int nA, nB, items, groups_n, do_pack_B; float *Cpart; int A_src; int *pdone; int nPack;
+  int pg;   // panels per work item (choose_pg; PG is the largest)
+  int fullk;   // use kernel_full (use_fullk)
 } job_t;
+
+// Short K (at most FULLK_NKC blocks of 128): the full-K microkernel keeps the accumulators over all of K, so C is
+// written once per tile instead of read and written per K block. Measured at 228 threads (blocked vs full-K, GFLOPS):
+// 2048x2048x256 641 vs 786, 2048x2048x512 728 vs 807, 512^3 394 vs 446; 2048x2048x1024 776 vs 700, 2048^3 781 vs 601.
+#ifndef FULLK_NKC
+#define FULLK_NKC 4
+#endif
+static inline void kernel_full(const float *Ap, const float *Bp, float *C, long ldc, long nkc);
+static inline void fullk_item(const job_t *j, int rb0, int nrb, int p0, float *Cg) {
+  for (int q = 0; q < j->pg; q++)
+    for (int rb = rb0; rb < rb0 + nrb; rb++)
+      kernel_full(j->Apk + (size_t)rb * j->nkc * KC * 8, j->Bpk + (size_t)(p0 + q) * j->nkc * KC * 32,
+                  Cg + (size_t)(rb * 8) * j->N + (p0 + q) * 32, j->N, j->nkc);
+}
+static int use_fullk(int nkc) { return KS == 1 && KC == 128 && !getenv("NOFULLK") && nkc <= FULLK_NKC; }
 
 static void pack_task(void *argp, int id) {
   job_t *j = (job_t *)argp;
@@ -308,15 +325,16 @@ static void compute_task(void *argp, int id) {
     if (item >= j->items) break;
     int g = item % KS, rest = item / KS;
     int rchunk = rest / j->groups_n, pg = rest % j->groups_n;
-    int rb0 = rchunk * (RC / 8), p0 = pg * PG;
+    int rb0 = rchunk * (RC / 8), p0 = pg * j->pg;
     int kc_lo = g * nkc / KS, kc_hi = (g + 1) * nkc / KS;
     float *Cg = g == 0 ? j->C : j->Cpart + (size_t)(g - 1) * j->M * N;
+    if (j->fullk && !j->A_src) { fullk_item(j, rb0, RC / 8, p0, Cg); continue; }
     for (int kc = kc_lo; kc < kc_hi; kc++) {
       if (j->A_src) {   // pack A in place: rows rb0*8 .. rb0*8+RC-1, K block kc
         for (int r = 0; r < RC; r++)
           memcpy(Ab + (size_t)r * KC, j->A + (size_t)(rb0 * 8 + r) * K + kc * KC, KC * 4);
       }
-      for (int q = 0; q < PG; q++) {
+      for (int q = 0; q < j->pg; q++) {
         const float *Bp = j->Bpk + (((size_t)(p0 + q)) * nkc + kc) * KC * 32;   // 32 KB, reused over the chunk
         for (int rb = rb0; rb < rb0 + RC / 8; rb++) {
           const float *Ap = j->A_src ? Ab + (size_t)(rb - rb0) * 8 * KC : j->Apk + ((size_t)rb * nkc + kc) * KC * 8;
@@ -376,17 +394,33 @@ static void overlap_task(void *argp, int id) {
     int g = w % KS, rest = w / KS;
     int rchunk = rest / j->groups_n, pg = rest % j->groups_n;
     while (__sync_fetch_and_add(&j->pdone[rchunk], 0) < BPC) { }   // wait for this chunk's A blocks
-    int rb0 = rchunk * BPC, p0 = pg * PG;
+    int rb0 = rchunk * BPC, p0 = pg * j->pg;
     int kc_lo = g * nkc / KS, kc_hi = (g + 1) * nkc / KS;
     float *Cg = g == 0 ? j->C : j->Cpart + (size_t)(g - 1) * j->M * N;
+    if (j->fullk) { fullk_item(j, rb0, BPC, p0, Cg); continue; }
     for (int kc = kc_lo; kc < kc_hi; kc++)
-      for (int q = 0; q < PG; q++) {
+      for (int q = 0; q < j->pg; q++) {
         const float *Bp = j->Bpk + (((size_t)(p0 + q)) * nkc + kc) * KC * 32;
         for (int rb = rb0; rb < rb0 + BPC; rb++)
           kernel_8x32(j->Apk + ((size_t)rb * nkc + kc) * KC * 8, Bp, Cg + (size_t)(rb * 8) * N + (p0 + q) * 32,
                       N, KC, kc == kc_lo);
       }
   }
+}
+
+// Panels per work item: PG, or 1 when the call has too few work items to keep the threads busy (fewer than PG_MIN_ITEMS
+// per thread at PG). Measured at 228 threads (PG=2 vs 1, GFLOPS): 2048^3 802 vs 732, 1024^3 629 vs 669, 512^3 352 vs 420.
+// PGSEL=n overrides (testing).
+#ifndef PG_MIN_ITEMS
+#define PG_MIN_ITEMS 8
+#endif
+static int choose_pg(int M, int N, int nthreads) {
+  const char *e = getenv("PGSEL");
+  int pg = PG;
+  if (e) pg = atoi(e);
+  else if ((long)(M / RC) * (N / (32 * PG)) * KS < (long)PG_MIN_ITEMS * nthreads) pg = 1;
+  if (pg < 1 || pg > PG || N % (32 * pg)) pg = 1;
+  return pg;
 }
 
 // C = A*B with A packing overlapped with the compute (see overlap_task). B must be packed.
@@ -400,10 +434,10 @@ void sgemm_knc_run_overlap(const float *A, const float *Bpk, float *C, float *Ap
   j.A = A; j.Bpk = Bpk; j.C = C; j.Apk = Apk;
   j.M = M; j.N = N; j.K = K; j.nkc = K / KC;
   j.nA = M / 8; j.nB = 0; j.do_pack_B = 0;
-  j.groups_n = N / (32 * PG);
-  j.items = nchunks * j.groups_n * KS;
   j.nPack = M / 8;
   j.pdone = pdone;
+  j.fullk = use_fullk(K / KC);
+  j.pg = choose_pg(M, N, nthreads); j.groups_n = N / (32 * j.pg); j.items = nchunks * j.groups_n * KS;
   if (KS > 1) {
     size_t need = (size_t)(KS - 1) * M * N;
     if (need > Cpart_cap) { free(Cpart_buf); Cpart_buf = aligned_alloc(64, need * 4); Cpart_cap = need; }
@@ -424,7 +458,8 @@ void sgemm_knc_run(const float *A, const float *Bpk, float *C, float *Apk, int M
 #define INLINE_A 0
 #endif
   j.A_src = INLINE_A;
-  j.groups_n = N / (32 * PG);
+  j.pg = choose_pg(M, N, nthreads); j.fullk = use_fullk(K / KC);
+  j.groups_n = N / (32 * j.pg);
   j.items = (M / RC) * j.groups_n * KS;
   if (KS > 1) {
     size_t need = (size_t)(KS - 1) * M * N;
@@ -737,7 +772,8 @@ void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K
   float *Cd = direct ? C : any_scratch(&Cs_buf, &Cs_cap, (size_t)Mp * Np);
   job_t cj = {0};
   cj.Bpk = j.Bpk; cj.C = Cd; cj.Apk = j.Apk; cj.M = Mp; cj.N = Np; cj.K = Kp; cj.nkc = Kp / KC;
-  cj.groups_n = Np / (32 * PG); cj.items = (Mp / RC) * cj.groups_n * KS;
+  cj.pg = choose_pg(Mp, Np, nthreads); cj.fullk = use_fullk(Kp / KC);
+  cj.groups_n = Np / (32 * cj.pg); cj.items = (Mp / RC) * cj.groups_n * KS;
   if (KS > 1) cj.Cpart = any_scratch(&Cpart_buf, &Cpart_cap, (size_t)(KS - 1) * Mp * Np);
   cj.next = 0; pool_run(compute_task, &cj);
   if (KS > 1) { cj.next = 0; pool_run(reduce_task, &cj); }

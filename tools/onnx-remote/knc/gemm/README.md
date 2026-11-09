@@ -30,8 +30,15 @@ runs on the output of the last timed call (C is filled with NaN before each call
 - **Blocking**: K blocks of 128 (a B panel is 16 KB), work items of 16 rows by 2 panels (64 columns, `-DRC`, `-DPG`), so
   a B sub-panel is reused across the rows of an item while it is in L1. Measured at 228 threads (2048^3 / 1024^3 / 512^3):
   RC=16 PG=2 802 / 629 / 352, RC=32 PG=4 748 / 489 / 213, RC=16 PG=1 732 / 669 / 420, RC=64 PG=4 610 / 425 / -,
-  RC=8 599-620 / 477-491 / -. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
+  RC=8 599-620 / 477-491 / -. The panel count is chosen per call: PG=1 when there are fewer than `PG_MIN_ITEMS` (8)
+  work items per thread at PG=2, which picked the faster of the two on every shape measured (512^3 to 2048^3, and skinny
+  shapes such as 256 x 4096 x 1024); `PGSEL=n` overrides it. `-DINLINE_A=1` (packing A inside each item, no phase) was measured
   slower (325 vs 382 GFLOPS) and is off by default.
+- **Short K** (K at most 512, `FULLK_NKC`): work items use the full-K microkernel (`kernel_full`), which keeps the
+  accumulators in registers over all of K and writes C once instead of reading and writing it per K block. Measured
+  (blocked vs full-K): 2048 x 2048 x 256 641 vs 786, 2048 x 2048 x 512 728 vs 807, 512^3 394 vs 446; for longer K the
+  blocked kernel wins (2048 x 2048 x 1024 776 vs 700, 2048^3 781 vs 601) because it reuses each B sub-panel from L1.
+  `NOFULLK=1` disables it.
 - **Shared-panel schedule** (opt-in, `SHARED=1`, 228 threads, `M % 32 == 0`): the four hardware threads of a core work
   on the same panel group together, so they share one B panel in L1, with a full-K microkernel (`kernel_full`) that
   writes C once and A packing overlapped. It is measured slower than the default (681 vs 737 GFLOPS at 2048^3).
@@ -57,10 +64,13 @@ Current default (overlapped A packing, spinning pool, RC=16 PG=2), medians of th
 |---|---|---|
 | 2048 x 2048 x 2048 | 777-802 | 39-40% |
 | 4096 x 2048 x 2048 | 780 | 39% |
-| 4096 x 4096 x 4096 | 788 | 39% |
-| 1024 x 1024 x 1024 | 629 | 31% |
-| 1000 x 1000 x 1000 (padded, both operands packed per call) | 478-488 | 24% |
-| 512 x 512 x 512 | 352 | 18% |
+| 4096 x 4096 x 4096 | 775-788 | 39% |
+| 2048 x 2048 x 512 | 799-806 | 40% |
+| 2048 x 2048 x 256 | 751-786 | 37-39% |
+| 768 x 3072 x 768 | 731-743 | 37% |
+| 1024 x 1024 x 1024 | 657-667 | 33% |
+| 1000 x 1000 x 1000 (padded, both operands packed per call) | 490-500 | 25% |
+| 512 x 512 x 512 | 428-430 | 21% |
 | 2048^3 with RC=32 PG=4: 228 / 171 / 114 / 57 threads | 737 / 683 / 547 / 370 | |
 | 2048^3 with RC=32 PG=4: `PHASED=1` / `SHARED=1` | 733 / 681 | |
 | kernel microbenchmark, 228 pinned threads, 100000 repetitions | 1024 | 51% |
@@ -90,9 +100,17 @@ made against that broken default and under the old pool's noise; they are kept f
 
 ## Measured and not kept
 
-- **B reuse across quads** (a core works through several quads with the same panel group, so B is read from memory once per
-  unit): 2048^3 at 393-442 GFLOPS against 510-630 for the default. The traffic model predicted a 45% cut in B reads, but the
-  schedule was slower. (Compared against the broken shared-panel default; see the correction above.)
+- **B reuse through item order** (re-measured with the spinning pool): work items ordered panel-major in groups of G row
+  chunks, so the items running at the same time share B panels. 2048^3: 782 (default, row-chunk-major) vs 755-768 for
+  G = 4, 8, 16 and all; 4096^3: 779 vs 629-756. B re-reads from L2/memory are not the limit.
+- **What limits the kernel: L1 capacity.** In the kernel benchmark each thread has its own 16 KB B panel and 4 KB A block,
+  so four threads per core need 80 KB against a 32 KB L1. With K blocks that fit (KC=64 at 2 threads per core, KC=32 at 4)
+  the kernel reaches 1055 and 1207 GFLOPS (vs 658 and 1003 at KC=128). In the GEMM, KC=64 and KC=32 were slower (2048^3:
+  687 and 596 vs 786 at 228 threads), because C is read and written per K block and the calls are shorter, so KC stays 128.
+- **Microkernel encodings:** one base register per A row (all A displacements 8-bit, 6-7 byte instructions instead of
+  10-byte ones): no change (1012-1031 vs 1015-1020 GFLOPS kernel-only). A loaded once per 4 k with `vbroadcastf32x4` and
+  broadcast by register swizzles (`{aaaa}`..`{dddd}`, no memory operand in the FMAs): 884-890 with the FMAs of one row
+  back to back, 1009-1025 interleaved, so no gain.
 - **Hardware counters:** the card's kernel accepts `perf_event_open`, but the call blocks in the kernel (uninterruptible
   sleep), and the card needed a reset afterwards. Traffic figures are therefore model-based, not counted.
 - **Streaming bandwidth** (vector loads, 1 GB): 36 GB/s at 57 threads, 19 GB/s at 171, 14.5 GB/s at 228 (reads). It falls with
@@ -112,7 +130,8 @@ pool run). With the spinning pool it is about +-2%. Compare variants in interlea
 
 `sgemm_knc_any` accepts any M, N, K (see Design). Odd shapes are checked against the reference (for example 1x1x1,
 37x129x65, 33x257x130, 500x700x300, 1000^3, 2000^3). Measured per call: 37x129x65 0.43 ms (was 123 ms), 1000^3 5.3 ms
-(was 71 ms; serial padding copies and fresh allocations), 2000^3 24.9 ms (was 235 ms).
+(was 71 ms; serial padding copies and fresh allocations), 2000^3 24.9 ms (was 235 ms). With the per-call panel count
+and the short-K kernel: 37x129x65 0.23 ms, 1000^3 4.0 ms, 500x700x300 1.0 ms.
 
 ## Limits
 
