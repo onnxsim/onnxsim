@@ -107,6 +107,16 @@ made against that broken default and under the old pool's noise; they are kept f
   so four threads per core need 80 KB against a 32 KB L1. With K blocks that fit (KC=64 at 2 threads per core, KC=32 at 4)
   the kernel reaches 1055 and 1207 GFLOPS (vs 658 and 1003 at KC=128). In the GEMM, KC=64 and KC=32 were slower (2048^3:
   687 and 596 vs 786 at 228 threads), because C is read and written per K block and the calls are shorter, so KC stays 128.
+- **Sharing B within a core (effective sharing), re-measured.** Kernel only (`bench_kernel` variant with one B panel per
+  core, threads `id % 57` sharing): 1183-1190 GFLOPS vs 1017-1022 with private panels, so the sharing itself is worth
+  about +16%. In the GEMM the shared-panel schedule (`SHARED=1`) does not gain from it: at 2048^3 it measured 706-734
+  against 784 for the default; at 1024^3 517-520 against 664-677. Two causes, measured by removing each (`NOPACK`
+  experiment, results invalid, packing skipped):
+  - packing A inside the lockstep units costs about 35 GFLOPS at 2048^3 and about 200 at 1024^3 (where units are short);
+  - without packing, the lockstep schedule (762-765) is level with the default (770-775) at 2048^3, so the barriers
+    absorb the gain.
+  Panel-group size in the lockstep schedule: 4 panels give 798-807 at 2048^3 without packing (2% over the default, within
+  noise) but 447-457 at 1024^3, where there are too few units for 228 threads. Not adopted.
 - **Microkernel encodings:** one base register per A row (all A displacements 8-bit, 6-7 byte instructions instead of
   10-byte ones): no change (1012-1031 vs 1015-1020 GFLOPS kernel-only). A loaded once per 4 k with `vbroadcastf32x4` and
   broadcast by register swizzles (`{aaaa}`..`{dddd}`, no memory operand in the FMAs): 884-890 with the FMAs of one row
