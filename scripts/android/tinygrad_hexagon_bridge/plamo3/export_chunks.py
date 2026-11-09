@@ -54,12 +54,30 @@ def main() -> int:
         help="row-block graphs keep the KV caches on the device (recurrent state)",
     )
     ap.add_argument(
+        "--qdir",
+        default="",
+        help="int4 codes and group scales per layer (<qdir>/<layer>.npz: <key>_q [out, in], <key>_s [in/G, out]), e.g. from GPTQ",
+    )
+    ap.add_argument(
         "--head",
         action="store_true",
         help="also export the final norm + lm_head (1.1 GB: over the wire limit)",
     )
     a = ap.parse_args()
     split = {k: int(v) for k, v in (kv.split(":") for kv in a.split.split(",") if kv)}
+    qsource = None
+    if a.qdir:
+        import numpy as np
+
+        cache = {}
+
+        def qsource(li, key, B):
+            if li not in cache:
+                cache[li] = np.load(os.path.join(a.qdir, f"{li:02d}.npz"))
+            z = cache[li]
+            # codes are stored [out, in]; the graph wants B = [in, out]; scales [in/G, out] already match columns
+            return z[key + "_q"].T.astype(np.int8), z[key + "_s"].astype(np.float32)
+
     os.makedirs(a.out, exist_ok=True)
     model = R.Plamo3Reference.from_checkpoint(a.checkpoint)
     lo, hi = (0, model.L - 1) if a.layers is None else map(int, a.layers.split("-"))
@@ -78,6 +96,7 @@ def main() -> int:
                 int4=a.int4,
                 split=split,
                 state=a.state,
+                qsource=qsource,
             )
         else:
             O.build_chunk(

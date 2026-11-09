@@ -127,7 +127,41 @@ def _qconst4(b, name, B):
     return b.node("Mul", [f, b.const(name + "_s", s.astype(np.float32))])
 
 
-def _layer_weights(b, model, i, int8=False, int4=False, split=None):
+def _qconst4_grouped(b, name, q, s):
+    """q [K, N] integer codes in [-8, 7] and s [K / G, N] fp32 scales per (group of G rows, column): the same packed nibble
+    layout as _qconst4, dequantized per group (Mul by the group scale broadcast over the G rows)."""
+    K, N = q.shape
+    groups = s.shape[0]
+    qq = (q.astype(np.int16) + 8).astype(np.uint8)
+    packed = (qq[0::2] + 16 * qq[1::2]).astype(np.uint8)
+    x = b.node("Cast", [b.const(name + "_p", packed)], to=T.INT32)
+    lo = b.node("Mod", [x, b.const(name + "_c16", np.array(16, np.int32))])
+    hi = b.node("Div", [x, b.const(name + "_c16b", np.array(16, np.int32))])
+    ax = b.const(name + "_ax1", np.array([1], np.int64))
+    stacked = b.node(
+        "Concat", [b.node("Unsqueeze", [lo, ax]), b.node("Unsqueeze", [hi, ax])], axis=1
+    )
+    w = b.node(
+        "Reshape", [stacked, b.const(name + "_shape", np.array([K, N], np.int64))]
+    )
+    f = b.node(
+        "Sub",
+        [
+            b.node("Cast", [w], to=T.FLOAT),
+            b.const(name + "_c8", np.array(8.0, np.float32)),
+        ],
+    )
+    f = b.node(
+        "Reshape",
+        [f, b.const(name + "_gshape", np.array([groups, K // groups, N], np.int64))],
+    )
+    f = b.node(
+        "Mul", [f, b.const(name + "_s", s.reshape(groups, 1, N).astype(np.float32))]
+    )
+    return b.node("Reshape", [f, b.const(name + "_kshape", np.array([K, N], np.int64))])
+
+
+def _layer_weights(b, model, i, int8=False, int4=False, split=None, qsource=None):
     """split: {"qkv"|"o"|"gu"|"d": n} column slices per matrix; each slice is quantized and multiplied on its own, so the HMX
     fp16 copy of a weight is 1/n of the matrix (the per-program scratch that bounds how many programs stay resident).
     Do not split "o": on the phone's HMX path the split O projection (its input is a transposed attention view used by
@@ -143,7 +177,19 @@ def _layer_weights(b, model, i, int8=False, int4=False, split=None):
     split = split or {}
 
     def mat(name, B):
-        n = split.get(name.rsplit("_", 1)[-1], 1)
+        key = name.rsplit("_", 1)[-1]
+        n = split.get(key, 1)
+        if int4 and qsource is not None:
+            # precomputed codes and group scales (e.g. GPTQ), sliced like the matrix
+            q, sc = qsource(i, key, B)
+            if n == 1:
+                return _qconst4_grouped(b, name, q, sc)
+            return [
+                _qconst4_grouped(b, f"{name}_c{j}", qp, sp)
+                for j, (qp, sp) in enumerate(
+                    zip(np.array_split(q, n, axis=1), np.array_split(sc, n, axis=1))
+                )
+            ]
         if n == 1:
             return base(name, B)
         return [
@@ -436,6 +482,7 @@ def _layer_body_rows(
     int8=False,
     int4=False,
     split=None,
+    qsource=None,
 ):
     """One decoder layer over ``rows`` tokens at once (a block of prompt positions, or one token padded to the block): the
     keys and values of the block are appended after the cache, and the mask ([rows, C + rows]) carries causality and the
@@ -443,7 +490,7 @@ def _layer_body_rows(
     inter, nh, nkv, hd = model.I, model.nh, model.nkv, model.hd
     g = nh // nkv
     q_dim, k_dim = nh * hd, nkv * hd
-    W = _layer_weights(b, model, i, int8, int4, split=split)
+    W = _layer_weights(b, model, i, int8, int4, split=split, qsource=qsource)
     shape_q = b.const(f"l{i}_rq", np.array([rows, nh, hd], np.int64))
     shape_kv = b.const(f"l{i}_rkv", np.array([rows, nkv, hd], np.int64))
     shape_qg = b.const(f"l{i}_rqg", np.array([nkv, g, rows, hd], np.int64))
@@ -508,6 +555,7 @@ def build_block(
     int4=False,
     split=None,
     state=False,
+    qsource=None,
 ):
     """Consecutive decoder layers over a block of ``rows`` token positions with static caches (the prefill graph; a decode
     step is a block with one real row). Inputs: hidden [rows, H], position_ids int64 [rows], attn_mask [rows, C + rows],
@@ -570,6 +618,7 @@ def build_block(
             int8,
             int4,
             split,
+            qsource,
         )
         if state:
             for past, new, name in ((pk, k, f"next_{pk}"), (pv, v, f"next_{pv}")):
