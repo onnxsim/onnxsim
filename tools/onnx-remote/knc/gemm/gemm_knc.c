@@ -1,6 +1,6 @@
-// Single-precision GEMM for Intel Knights Corner (k1om): C = A*B, row-major, M % 64 == 0, K % 256 == 0, N % 128 == 0.
-// KNC assembly microkernel (8 rows x 32 columns, 16 accumulators), A and B packed into contiguous panels, a persistent
-// pthread pool, and work items of 64 rows x 128 columns over K blocks of 256.
+// Single-precision GEMM for Intel Knights Corner (k1om): C = A*B, row-major. Fast path: M % 32 == 0, K % 128 == 0,
+// N % 128 == 0; sgemm_knc_any takes any shape. KNC assembly microkernel (8 rows x 32 columns, 16 accumulators), A and B
+// packed into panels, a persistent pinned thread pool, work items of 32 rows x 128 columns over K blocks of 128.
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -206,6 +206,15 @@ static void pin_thread(int t) {
   sched_setaffinity(0, sizeof set, &set);
 }
 
+// Hand-off: a run publishes fn/arg and bumps gen; workers spin on gen (with the KNC `delay` instruction, which frees the
+// core's issue slots for the other hardware threads) for up to POOL_SPIN_MS after their last task, then sleep on the
+// condition variable. The caller spins on `remaining`. Measured: an empty run cost 4-10 ms with condition variables only.
+#ifndef POOL_SPIN_MS
+#define POOL_SPIN_MS 100
+#endif
+static volatile unsigned pool_gen;
+static volatile int pool_remaining, pool_sleepers;
+static inline void cpu_delay(long cycles) { __asm__ volatile("delay %0" :: "r"(cycles)); }
 static void *pool_thread(void *idp) {
   int id = (int)(long)idp;
 #ifndef NOPIN
@@ -213,15 +222,23 @@ static void *pool_thread(void *idp) {
 #endif
   unsigned seen = 0;
   for (;;) {
-    pthread_mutex_lock(&pool.m);
-    while (pool.gen == seen) pthread_cond_wait(&pool.start, &pool.m);
-    seen = pool.gen;
+    double t_end = now_s() + POOL_SPIN_MS * 1e-3;
+    long spins = 0;
+    while (pool_gen == seen) {
+      cpu_delay(200);
+      if ((++spins & 1023) == 0 && now_s() > t_end) {
+        pthread_mutex_lock(&pool.m);
+        pool_sleepers++;
+        while (pool_gen == seen) pthread_cond_wait(&pool.start, &pool.m);
+        pool_sleepers--;
+        pthread_mutex_unlock(&pool.m);
+      }
+    }
+    __sync_synchronize();
+    seen = pool_gen;
     task_fn fn = pool.fn; void *arg = pool.arg;
-    pthread_mutex_unlock(&pool.m);
     fn(arg, id);
-    pthread_mutex_lock(&pool.m);
-    if (--pool.remaining == 0) pthread_cond_signal(&pool.done);
-    pthread_mutex_unlock(&pool.m);
+    __sync_fetch_and_sub(&pool_remaining, 1);
   }
   return NULL;
 }
@@ -229,7 +246,12 @@ static void *pool_thread(void *idp) {
 static void pool_init(int n) {
   if (pool.started) return;
   pool.nthreads = n;
-  for (int t = 0; t < n; t++) {
+  // The calling thread is task 0 (and is pinned like it): with a pinned spinning worker on every hardware thread, an
+  // unpinned caller would time-share a CPU with one (measured: 39 ms per empty run at 228 threads).
+#ifndef NOPIN
+  pin_thread(0);
+#endif
+  for (int t = 1; t < n; t++) {
     pthread_t th;
     pthread_create(&th, NULL, pool_thread, (void *)(long)t);
     pthread_detach(th);
@@ -238,11 +260,15 @@ static void pool_init(int n) {
 }
 
 static void pool_run(task_fn fn, void *arg) {
-  pthread_mutex_lock(&pool.m);
-  pool.fn = fn; pool.arg = arg; pool.remaining = pool.nthreads; pool.gen++;
-  pthread_cond_broadcast(&pool.start);
-  while (pool.remaining > 0) pthread_cond_wait(&pool.done, &pool.m);
+  pool.fn = fn; pool.arg = arg; pool_remaining = pool.nthreads - 1;
+  __sync_synchronize();
+  pthread_mutex_lock(&pool.m);                          // a sleeper re-checks pool_gen under the mutex: no lost wake-up
+  pool_gen++;
+  if (pool_sleepers) pthread_cond_broadcast(&pool.start);
   pthread_mutex_unlock(&pool.m);
+  fn(arg, 0);
+  while (pool_remaining > 0) cpu_delay(100);
+  __sync_synchronize();
 }
 
 // ---- GEMM ----
@@ -426,17 +452,7 @@ void sgemm_knc(const float *A, const float *B, float *C, int M, int N, int K, in
 // Any shape: pads M to 32, N to 128 and K to 128 with zeros (the fast path needs multiples), runs, and copies the
 // M x N result back. Zero padding leaves the valid part of C unchanged.
 static size_t pad_to(size_t x, size_t m) { return (x + m - 1) / m * m; }
-void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K, int nthreads) {
-  if (M % RC == 0 && N % (32 * PG) == 0 && K % KC == 0) { sgemm_knc(A, B, C, M, N, K, nthreads); return; }
-  size_t Mp = pad_to(M, RC), Np = pad_to(N, 32 * PG), Kp = pad_to(K, KC);
-  float *Ap = aligned_alloc(64, Mp * Kp * 4), *Bp = aligned_alloc(64, Kp * Np * 4), *Cp = aligned_alloc(64, Mp * Np * 4);
-  memset(Ap, 0, Mp * Kp * 4); memset(Bp, 0, Kp * Np * 4);
-  for (int i = 0; i < M; i++) memcpy(Ap + (size_t)i * Kp, A + (size_t)i * K, (size_t)K * 4);
-  for (int k = 0; k < K; k++) memcpy(Bp + (size_t)k * Np, B + (size_t)k * N, (size_t)N * 4);
-  sgemm_knc(Ap, Bp, Cp, (int)Mp, (int)Np, (int)Kp, nthreads);
-  for (int i = 0; i < M; i++) memcpy(C + (size_t)i * N, Cp + (size_t)i * Np, (size_t)N * 4);
-  free(Ap); free(Bp); free(Cp);
-}
+void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K, int nthreads);   // defined below
 
 
 // Full-K microkernel: C[8][32] = A[8][nkc*KC] * B[nkc*KC][32] with the accumulators kept in registers across all K
@@ -536,6 +552,8 @@ static inline void kernel_full(const float *Ap, const float *Bp, float *C, long 
     "vfmadd231ps 3596(%%rdx)%{1to16%}, %%zmm19, %%zmm15\n\t"
     "add $512, %%rbx\n\t"
     "add $16, %%rdx\n\t"
+    "dec %%rcx\n\t"
+    "jnz 1b\n\t"
     "add $3584, %%rdx\n\t"
     "dec %%r8\n\t"
     "jnz 5b\n\t"
@@ -648,7 +666,7 @@ void sgemm_knc_run_shared(const float *A, const float *Bpk, float *C, float *Apk
   pool_init(nthreads);
   const int nquads = M / 32;
   job_t pj = {0};
-  pj.A = A; pj.Apk = Apk; pj.M = M; pj.N = N; pj.K = K; pj.nkc = K / KC; pj.nA = 16; pj.nB = 0; pj.do_pack_B = 0;
+  pj.A = A; pj.Apk = Apk; pj.M = M; pj.N = N; pj.K = K; pj.nkc = K / KC; pj.nA = nquads < 4 ? M / 8 : 16;
   pj.next = 0; pool_run(pack_task, &pj);                 // quads 0..3 (16 blocks) before the run
   for (int c = 0; c < SH_CORES; c++) { sh_arr[c] = 0; sh_val[c] = 0; sh_pk[c] = -1; }
   for (int q = 0; q < nquads && q < 1024; q++) sh_state[q] = (q < 4) ? 2 : 0;
@@ -657,12 +675,81 @@ void sgemm_knc_run_shared(const float *A, const float *Bpk, float *C, float *Apk
   pool_run(shared_task, &j);
 }
 
+// ---- any shape ----
+// The operands are packed straight from the caller's (unpadded) arrays, in parallel, with the padding written as
+// zeros; the compute runs on the padded shape (zero padding leaves the valid part of C unchanged), into C itself when
+// the padded C has the same layout (M % 32 == 0, N % 128 == 0), else into a scratch C that is copied back in parallel.
+// Scratch buffers are kept between calls. (Measured: 1000^3 from 71 ms with serial padding copies to 42 ms.)
+typedef struct { const float *A, *B; float *Apk, *Bpk; const float *Cs; float *C;
+                 int M, N, K, Mp, Np, Kp; volatile int next; int nA, nB; } any_job_t;
+static void any_pack_task(void *argp, int id) {
+  any_job_t *j = (any_job_t *)argp;
+  (void)id;
+  const int nkc = j->Kp / KC;
+  for (;;) {
+    int item = __sync_fetch_and_add(&j->next, 1);
+    if (item >= j->nA + j->nB) break;
+    if (item < j->nA) {                       // 8-row block rb of A: Apk[rb][kc][i][KC]
+      int rb = item;
+      for (int kc = 0; kc < nkc; kc++) {
+        int k0 = kc * KC, nk = j->K - k0; if (nk > KC) nk = KC;
+        for (int i = 0; i < 8; i++) {
+          float *dst = j->Apk + (((size_t)rb * nkc + kc) * 8 + i) * KC;
+          int r = rb * 8 + i;
+          if (r >= j->M || nk <= 0) { memset(dst, 0, KC * 4); continue; }
+          memcpy(dst, j->A + (size_t)r * j->K + k0, (size_t)nk * 4);
+          if (nk < KC) memset(dst + nk, 0, (size_t)(KC - nk) * 4);
+        }
+      }
+    } else {                                  // 32-column panel p of B: Bpk[p][kc][kk][32]
+      int p = item - j->nA, c0 = p * 32, nc = j->N - c0; if (nc > 32) nc = 32;
+      for (int k = 0; k < j->Kp; k++) {
+        float *dst = j->Bpk + ((size_t)p * j->Kp + k) * 32;
+        if (k >= j->K || nc <= 0) { memset(dst, 0, 128); continue; }
+        memcpy(dst, j->B + (size_t)k * j->N + c0, (size_t)nc * 4);
+        if (nc < 32) memset(dst + nc, 0, (size_t)(32 - nc) * 4);
+      }
+    }
+  }
+}
+static void any_copy_task(void *argp, int id) {   // C[M][N] = Cs[0..M)[0..N) (Cs is Mp x Np)
+  any_job_t *j = (any_job_t *)argp;
+  (void)id;
+  for (;;) {
+    int r0 = __sync_fetch_and_add(&j->next, 8);
+    if (r0 >= j->M) break;
+    for (int r = r0; r < r0 + 8 && r < j->M; r++)
+      memcpy(j->C + (size_t)r * j->N, j->Cs + (size_t)r * j->Np, (size_t)j->N * 4);
+  }
+}
+static float *any_scratch(float **buf, size_t *cap, size_t n) {
+  if (n > *cap) { free(*buf); *buf = aligned_alloc(BIGALIGN, (n * 4 + BIGALIGN - 1) / BIGALIGN * BIGALIGN); *cap = n; }
+  return *buf;
+}
+static float *Cs_buf = NULL; static size_t Cs_cap = 0;
+void sgemm_knc_any(const float *A, const float *B, float *C, int M, int N, int K, int nthreads) {
+  pool_init(nthreads);
+  int Mp = (int)pad_to(M, RC), Np = (int)pad_to(N, 32 * PG), Kp = (int)pad_to(K, KC);
+  any_job_t j = {A, B, any_scratch(&Apk_buf, &Apk_cap, (size_t)Mp * Kp), any_scratch(&Bpk_buf, &Bpk_cap, (size_t)Np * Kp),
+                 NULL, C, M, N, K, Mp, Np, Kp, 0, Mp / 8, Np / 32};
+  pool_run(any_pack_task, &j);                          // A and B in one pass
+  const int direct = (Mp == M && Np == N);
+  float *Cd = direct ? C : any_scratch(&Cs_buf, &Cs_cap, (size_t)Mp * Np);
+  job_t cj = {0};
+  cj.Bpk = j.Bpk; cj.C = Cd; cj.Apk = j.Apk; cj.M = Mp; cj.N = Np; cj.K = Kp; cj.nkc = Kp / KC;
+  cj.groups_n = Np / (32 * PG); cj.items = (Mp / RC) * cj.groups_n * KS;
+  if (KS > 1) cj.Cpart = any_scratch(&Cpart_buf, &Cpart_cap, (size_t)(KS - 1) * Mp * Np);
+  cj.next = 0; pool_run(compute_task, &cj);
+  if (KS > 1) { cj.next = 0; pool_run(reduce_task, &cj); }
+  if (!direct) { j.Cs = Cd; j.next = 0; pool_run(any_copy_task, &j); }
+}
+
 static double maxerr_sampled(const float *A, const float *B, const float *C, int M, int N, int K) {
   double maxerr = 0;
   for (int t = 0; t < 64; t++) {
     int i = (t * 37) % M, jx = (t * 91) % N; double r = 0;
     for (int k = 0; k < K; k++) r += (double)A[(size_t)i * K + k] * B[(size_t)k * N + jx];
-    double e = r - C[(size_t)i * N + jx]; if (e < 0) e = -e; if (e > maxerr) maxerr = e;
+    double e = r - C[(size_t)i * N + jx]; if (e != e) return 1e30; if (e < 0) e = -e; if (e > maxerr) maxerr = e;
   }
   return maxerr;
 }
@@ -676,22 +763,21 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (float)rand() / RAND_MAX - 0.5f;
   for (size_t i = 0; i < (size_t)K * N; i++) B[i] = (float)rand() / RAND_MAX - 0.5f;
   float *Bpk = BIGALLOC((size_t)K * N * 4), *Apk = BIGALLOC((size_t)M * K * 4);
-  const int fast = (M % RC == 0 && N % (32 * PG) == 0 && K % KC == 0);
-  if (fast) {
-    sgemm_knc_pack_B(B, Bpk, K, N, nth);
-    sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
-  } else { sgemm_knc_any(A, B, C, M, N, K, nth); }
-  double maxerr = maxerr_sampled(A, B, C, M, N, K);
+  // ANY=1 sends aligned shapes through sgemm_knc_any too (operands packed per call).
+  const int fast = !getenv("ANY") && (M % RC == 0 && N % (32 * PG) == 0 && K % KC == 0);
+  if (fast) sgemm_knc_pack_B(B, Bpk, K, N, nth);
   double best = 1e30;
-  for (int r = 0; r < reps; r++) {
+  for (int r = 0; r <= reps; r++) {                    // r == 0: warm-up, not timed
+    memset(C, 0xff, (size_t)M * N * 4);                // NaN: the error check below sees only this call's output
     double t0 = now_s();
     if (!fast) sgemm_knc_any(A, B, C, M, N, K, nth);
     else if (getenv("PHASED")) sgemm_knc_run(A, Bpk, C, Apk, M, N, K, nth);
-    else if (!getenv("NOSHARED") && M % 32 == 0 && nth == 4 * SH_CORES) sgemm_knc_run_shared(A, Bpk, C, Apk, M, N, K, nth);
+    else if (getenv("SHARED") && M % 32 == 0 && nth == 4 * SH_CORES) sgemm_knc_run_shared(A, Bpk, C, Apk, M, N, K, nth);   // opt-in: measured slower
     else if (getenv("STATIC") && M % (RC * 4) == 0 && nth == 4 * NCORES) sgemm_knc_run_static(A, Bpk, C, Apk, M, N, K, nth);   // opt-in: measured slower
     else sgemm_knc_run_overlap(A, Bpk, C, Apk, M, N, K, nth);
-    double dt = now_s() - t0; if (dt < best) best = dt;
+    double dt = now_s() - t0; if (r > 0 && dt < best) best = dt;
   }
+  double maxerr = maxerr_sampled(A, B, C, M, N, K);   // output of the last timed call (NaN counts as 1e30)
   double gflops = 2.0 * M * N * K / best * 1e-9;
   printf("M=%d N=%d K=%d threads=%d maxerr(sampled)=%g\n", M, N, K, nth, maxerr);
   printf("best (B prepacked, A packed per call) %.3f ms  %.1f GFLOPS  (%.1f%% of 2006 GFLOPS peak)\n", best * 1e3, gflops, 100.0 * gflops / 2006.4);
