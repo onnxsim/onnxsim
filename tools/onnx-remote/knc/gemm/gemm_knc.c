@@ -568,19 +568,27 @@ void sgemm_knc_run_static(const float *A, const float *Bpk, float *C, float *Apk
 }
 
 
-// ---- shared-panel schedule ----
-// A unit is one panel group (PG panels) x four 8-row blocks, one per hardware thread of a core (thread c + 57*jj
-// with pin_thread's mapping), so the four threads of a core stream the same B panel together through one L1.
-// Cores claim units from a global counter; the leader thread of a core (jj == 0) claims for the core, and two
-// per-core barriers keep the four threads in step. Requires 228 threads and M % 32 == 0.
+// ---- shared-panel schedule with overlapped A packing ----
+// A unit is one panel group (PG panels) x four 8-row blocks ("quad"), one block per hardware thread of a core (thread
+// c + 57*jj). A quad's blocks are packed into Apk ahead of use: the core that claims a unit also claims the pack
+// target quad+4 (leader CAS on sh_state), and its four threads pack one block each while computing. sh_state: 0 not
+// packed, 1 being packed, 2 ready. The first four quads are packed before the run.
 #define SH_CORES 57
 static volatile int sh_next;
 static volatile int sh_arr[SH_CORES];
 static volatile int sh_val[SH_CORES];
-typedef struct { const float *Apk, *Bpk; float *C; int M, N, nkc, npg, nunits; } shared_job_t;
+static volatile int sh_pk[SH_CORES];
+static volatile int sh_state[1024];
+typedef struct { const float *A, *Bpk; float *Apk; float *C; int M, N, K, nkc, npg, nunits, nquads; } shared_job_t;
 static inline void sh_barrier(int c, int m) {
   __sync_fetch_and_add(&sh_arr[c], 1);
   while (__sync_fetch_and_add(&sh_arr[c], 0) < 4 * m) { }
+}
+static inline void pack_block(const shared_job_t *j, int rb) {
+  const int K = j->K, nkc = j->nkc;
+  for (int kc = 0; kc < nkc; kc++)
+    for (int i = 0; i < 8; i++)
+      memcpy(j->Apk + (((size_t)rb * nkc + kc) * 8 + i) * KC, j->A + (size_t)(rb * 8 + i) * K + kc * KC, KC * 4);
 }
 static void shared_task(void *argp, int id) {
   shared_job_t *j = (shared_job_t *)argp;
@@ -589,27 +597,38 @@ static void shared_task(void *argp, int id) {
   for (;;) {
     if (jj == 0) {
       int u = __sync_fetch_and_add(&sh_next, 1);
-      sh_val[c] = u < j->nunits ? u : -1;
+      if (u >= j->nunits) { sh_val[c] = -1; sh_pk[c] = -1; }
+      else {
+        int t = (u / j->npg) + 4;
+        sh_val[c] = u;
+        sh_pk[c] = (t < j->nquads && __sync_bool_compare_and_swap(&sh_state[t], 0, 1)) ? t : -1;
+      }
     }
-    sh_barrier(c, ++m);                       // unit claimed and visible to the four threads
+    sh_barrier(c, ++m);
     int u = sh_val[c];
     if (u < 0) break;
+    int t = sh_pk[c];
+    if (t >= 0) pack_block(j, t * 4 + jj);
     int quad = u / j->npg, pg = u % j->npg;
     int rb = quad * 4 + jj, p0 = pg * PG;
+    while (sh_state[quad] != 2) { __sync_synchronize(); }
     for (int q = 0; q < PG; q++)
       kernel_full(j->Apk + (size_t)rb * nkc * 8 * KC, j->Bpk + ((size_t)(p0 + q) * nkc) * KC * 32,
                   j->C + (size_t)(rb * 8) * N + (p0 + q) * 32, N, nkc);
-    sh_barrier(c, ++m);                       // all four done before the leader claims again
+    sh_barrier(c, ++m);
+    if (jj == 0 && t >= 0) { __sync_synchronize(); sh_state[t] = 2; }
   }
 }
 void sgemm_knc_run_shared(const float *A, const float *Bpk, float *C, float *Apk, int M, int N, int K, int nthreads) {
   pool_init(nthreads);
+  const int nquads = M / 32;
   job_t pj = {0};
-  pj.A = A; pj.Apk = Apk; pj.M = M; pj.N = N; pj.K = K; pj.nkc = K / KC; pj.nA = M / 8; pj.nB = 0; pj.do_pack_B = 0;
-  pj.next = 0; pool_run(pack_task, &pj);
-  for (int c = 0; c < SH_CORES; c++) { sh_arr[c] = 0; sh_val[c] = 0; }
+  pj.A = A; pj.Apk = Apk; pj.M = M; pj.N = N; pj.K = K; pj.nkc = K / KC; pj.nA = 16; pj.nB = 0; pj.do_pack_B = 0;
+  pj.next = 0; pool_run(pack_task, &pj);                 // quads 0..3 (16 blocks) before the run
+  for (int c = 0; c < SH_CORES; c++) { sh_arr[c] = 0; sh_val[c] = 0; sh_pk[c] = -1; }
+  for (int q = 0; q < nquads && q < 1024; q++) sh_state[q] = (q < 4) ? 2 : 0;
   sh_next = 0;
-  shared_job_t j = {Apk, Bpk, C, M, N, K / KC, N / (32 * PG), (M / 32) * (N / (32 * PG))};
+  shared_job_t j = {A, Bpk, Apk, C, M, N, K, K / KC, N / (32 * PG), (M / 32) * (N / (32 * PG)), nquads};
   pool_run(shared_task, &j);
 }
 
