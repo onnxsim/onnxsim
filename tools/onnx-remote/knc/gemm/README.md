@@ -73,6 +73,16 @@ reaches about 75% of the microkernel's own rate.
 - **Streaming bandwidth** (vector loads, 1 GB): 36 GB/s at 57 threads, 19 GB/s at 171, 14.5 GB/s at 228 (reads). It falls with
   thread count, which points at contention; a true ceiling was not established.
 
+- **Leaving the OS core alone** (`-DNCU=56`, 224 threads), **2 MB alignment** (`-DBIGALIGN=2097152`), **explicit huge pages**
+  (`HUGETLB=1` with `/proc/sys/vm/nr_hugepages` reserved) and **prefetch distance** 2/8/16: none was better in interleaved
+  runs. Transparent huge pages are set to `always` on the card, but `AnonHugePages` stays at 0 during a run. The knobs stay
+  as options.
+
+## Measurement noise
+
+The same binary varies by about +-15% between runs and over time on this card (2048^3: 485-740 GFLOPS across sessions).
+Single comparisons at that level are not reliable: compare variants in interleaved rounds and use the median.
+
 ## Shapes
 
 `sgemm_knc_any` accepts any M, N, K: it pads M to 32, N to 128 and K to 128 with zeros, runs the fast path, and copies

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
 
 #ifndef KC
 #define KC 128   // K block (B panel 16 KB: stays in L1 next to the A stream)
@@ -25,10 +26,34 @@
 #define KS 1     // K groups: each group is its own work item and writes its own partial C (reduced at the end)
 #endif
 
+
+// Alignment of the large buffers.
+#ifndef BIGALIGN
+#define BIGALIGN 64   // 2 MB alignment and MAP_HUGETLB (HUGETLB=1) were not better in interleaved runs
+#endif
+// Large-buffer allocation: explicit 2 MB huge pages (MAP_HUGETLB) when HUGETLB=1 is set and pages are reserved
+// (/proc/sys/vm/nr_hugepages), else aligned_alloc. Buffers from here are never freed (benchmark-lifetime).
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+static void *big_alloc(size_t n) {
+  size_t sz = (n + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+  if (getenv("HUGETLB")) {
+    void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (p != MAP_FAILED) return p;
+    fprintf(stderr, "big_alloc: MAP_HUGETLB failed for %zu bytes, using aligned_alloc\n", sz);
+  }
+  return aligned_alloc(BIGALIGN, (n + BIGALIGN - 1) / BIGALIGN * BIGALIGN);
+}
+
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
+// Cores used: 57, or 56 to leave core 56 (which runs the card's OS on CPU 0) alone.
+#ifndef NCU
+#define NCU 57
+#endif
 #ifndef PF_DIST
-#define PF_DIST 4
+#define PF_DIST 4   // PF=2 and PF=8/16 were not better in interleaved runs (medians within the +-15% noise)
 #endif
 #if PF_DIST > 0
 #define PREFETCH_ASM \
@@ -176,7 +201,7 @@ static struct {
 // Pin pool thread t to one hardware thread: the card numbers CPUs in groups of four per core, so threads 0..56 go to
 // the first hardware thread of each core, and later threads take the other three (measured: 1.4x at 228 threads).
 static void pin_thread(int t) {
-  int cpu = (4 * (t % 57) + 1 + t / 57) % 228;
+  int cpu = (4 * (t % NCU) + 1 + t / NCU) % 228;
   cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
   sched_setaffinity(0, sizeof set, &set);
 }
@@ -391,8 +416,8 @@ void sgemm_knc_run(const float *A, const float *Bpk, float *C, float *Apk, int M
 
 // C = A*B, packing both operands (the general call).
 void sgemm_knc(const float *A, const float *B, float *C, int M, int N, int K, int nthreads) {
-  if ((size_t)M * K > Apk_cap) { free(Apk_buf); Apk_buf = aligned_alloc(64, (size_t)M * K * 4); Apk_cap = (size_t)M * K; }
-  if ((size_t)N * K > Bpk_cap) { free(Bpk_buf); Bpk_buf = aligned_alloc(64, (size_t)N * K * 4); Bpk_cap = (size_t)N * K; }
+  if ((size_t)M * K > Apk_cap) { free(Apk_buf); Apk_buf = aligned_alloc(BIGALIGN, ((size_t)M * K * 4 + BIGALIGN - 1) / BIGALIGN * BIGALIGN); Apk_cap = (size_t)M * K; }
+  if ((size_t)N * K > Bpk_cap) { free(Bpk_buf); Bpk_buf = aligned_alloc(BIGALIGN, ((size_t)N * K * 4 + BIGALIGN - 1) / BIGALIGN * BIGALIGN); Bpk_cap = (size_t)N * K; }
   sgemm_knc_pack_B(B, Bpk_buf, K, N, nthreads);
   sgemm_knc_run(A, Bpk_buf, C, Apk_buf, M, N, K, nthreads);
 }
@@ -539,7 +564,7 @@ static inline void kernel_full(const float *Ap, const float *Bp, float *C, long 
 // 128-column panel group at the same time, so they share one B panel in L1 (measured: 1112 vs 903 GFLOPS kernel-only
 // at 228 threads). A unit is one panel group x four row chunks (one per hardware thread of the core); core c takes
 // units c, c+57, c+114, ... The packing of A is a separate phase before this (requires M % 128 == 0).
-#define NCORES 57
+#define NCORES NCU
 typedef struct { const float *A, *Bpk, *Apk; float *C; int M, N, K, nkc, nsr, npg; } static_job_t;
 static void static_task(void *argp, int id) {
   static_job_t *j = (static_job_t *)argp;
@@ -573,7 +598,7 @@ void sgemm_knc_run_static(const float *A, const float *Bpk, float *C, float *Apk
 // c + 57*jj). A quad's blocks are packed into Apk ahead of use: the core that claims a unit also claims the pack
 // target quad+4 (leader CAS on sh_state), and its four threads pack one block each while computing. sh_state: 0 not
 // packed, 1 being packed, 2 ready. The first four quads are packed before the run.
-#define SH_CORES 57
+#define SH_CORES NCU
 static volatile int sh_next;
 static volatile int sh_arr[SH_CORES];
 static volatile int sh_val[SH_CORES];
@@ -644,12 +669,13 @@ static double maxerr_sampled(const float *A, const float *B, const float *C, int
 
 int main(int argc, char **argv) {
   int M = argc > 1 ? atoi(argv[1]) : 2048, N = argc > 2 ? atoi(argv[2]) : 2048, K = argc > 3 ? atoi(argv[3]) : 2048;
-  int nth = argc > 4 ? atoi(argv[4]) : 228, reps = argc > 5 ? atoi(argv[5]) : 3;
-  float *A = aligned_alloc(64, (size_t)M * K * 4), *B = aligned_alloc(64, (size_t)K * N * 4), *C = aligned_alloc(64, (size_t)M * N * 4);
+  int nth = argc > 4 ? atoi(argv[4]) : 4 * NCU, reps = argc > 5 ? atoi(argv[5]) : 3;
+#define BIGALLOC(n) big_alloc((size_t)(n))
+  float *A = BIGALLOC((size_t)M * K * 4), *B = BIGALLOC((size_t)K * N * 4), *C = BIGALLOC((size_t)M * N * 4);
   srand(1);
   for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (float)rand() / RAND_MAX - 0.5f;
   for (size_t i = 0; i < (size_t)K * N; i++) B[i] = (float)rand() / RAND_MAX - 0.5f;
-  float *Bpk = aligned_alloc(64, (size_t)K * N * 4), *Apk = aligned_alloc(64, (size_t)M * K * 4);
+  float *Bpk = BIGALLOC((size_t)K * N * 4), *Apk = BIGALLOC((size_t)M * K * 4);
   const int fast = (M % RC == 0 && N % (32 * PG) == 0 && K % KC == 0);
   if (fast) {
     sgemm_knc_pack_B(B, Bpk, K, N, nth);
