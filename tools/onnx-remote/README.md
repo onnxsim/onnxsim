@@ -818,6 +818,55 @@ and every lost-state case above was produced (eviction, changed file,
 `unload`, old-form run, another client's reset, `--no-cache`). It has **not**
 been built against the real runtime or run on a card.
 
+### `run_plan`: a chain of executions with device buffers that persist
+
+`run_plan` runs a whole plan in one request: model executions, device buffers,
+device-to-device copies and host transfers, the card-side counterpart of the
+axcl runner's `PLAN` (one decode step of a Pulsar-free model, where every
+tensor between programs stays on the card). The request's `artifact` bytes hold
+the control, one directive per line:
+
+```text
+session <id>                          continue this session (first line; without it a new one)
+model <mid> <path>                    load <path> as model <mid>, owned by the session
+buffer <bid> <bytes>                  allocate device buffer <bid>, zero-filled
+bind <mid> I|O <idx> <bid> <offset>   point model input/output <idx> at buffer+offset
+exec <mid>                            execute model <mid>
+copy <dbid> <doff> <sbid> <soff> <n>  device-to-device copy
+write <bid> <offset> <n> <k>          upload request input <k> (n bytes) into buffer+offset
+read <bid> <offset> <n>               append n bytes of buffer+offset to the outputs (UINT8)
+free                                  release the session
+```
+
+The response's `artifact_id` is the session id. A session keeps its models and
+buffers between requests, so a decode loop can rewrite one input and execute
+again without re-uploading the rest. Session models are not in the LRU cache,
+so nothing evicts them mid-plan. A failing directive stops the plan with its
+line number, and the session keeps what already ran. The Python client has
+`run_plan(control, inputs, session=..., profiling=...)`.
+
+What was checked: the worker compiles with `-Wall -Wextra` against the AXCL
+SDK's headers. It was built in the card VM and run on the card
+(`tools/onnx-remote/test/axcl_run_plan_check.py`): a plan with two chained
+executions of a 2560x2560 linear matched two host round trips bit for bit, a
+second plan on the same session matched too, and a bad directive was refused
+with its line number. The split-K down projection of the Pulsar-free PLaMo
+decode also ran as one plan
+(`tools/onnx-remote/test/axcl_run_plan_split_check.py`): a 4x2560 input is
+copied on the card into four slices, four linears run, and a two-input Add
+sums the partials, with a result equal to the one-program-at-a-time chain.
+The same split was also run with PLaMo layer 0's real `down_proj` (the four
+K-slices emitted into the template with their weight tables, and three Adds
+with grids calibrated on the real partial sums): the device chain equals the
+host chain exactly and is 0.86% from the float reference, the error of the
+linears themselves
+(`tools/onnx-remote/test/axcl_run_plan_split_check.py`, with `ONNX_REMOTE_PARTIAL`
+taking `{}` for the part and `ONNX_REMOTE_INPUT` / `ONNX_REMOTE_REF` set). A
+two-output model (`tools/onnx-remote/test/axcl_run_plan_multi_out_check.py`)
+binds and reads both outputs, equal to the host run and to numpy within 4e-5.
+Not yet covered: a full PLaMo decoder layer (attention, norms and RoPE
+templates are not built yet).
+
 ## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
 
 `remote_viplite_worker.cpp` is the runner for NBG (`.nb`) artifacts through the VIPLite runtime on an Allwinner SoC; build it with

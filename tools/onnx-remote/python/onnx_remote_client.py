@@ -659,6 +659,25 @@ class Client:
         )
         return int(json.loads(response.manifest)["state_id"])
 
+    def run_plan(
+        self,
+        control: str,
+        inputs: Sequence[TensorLike] = (),
+        *,
+        session: Optional[int] = None,
+        profiling: int = PROFILING_OFF,
+    ) -> Response:
+        """Run a plan on the AXCL worker (`run_plan`): model executions, device
+        buffers and device-to-device copies in one request, the card's PLAN. `control`
+        holds the directives (see the `run_plan` section of remote_axcl_worker.cpp);
+        with `session`, the plan continues that session, whose models and buffers
+        persist between requests. The response's artifact_id is the session id, and its
+        outputs are the `read` directives' bytes (uint8) in order."""
+        text = ("" if session is None else f"session {session}\n") + control
+        return self.request(
+            "run_plan", inputs, artifact=text.encode(), profiling=profiling
+        )
+
     def run_resident(
         self,
         path: Optional[str],
