@@ -850,8 +850,13 @@ SDK's headers. It was built in the card VM and run on the card
 (`tools/onnx-remote/test/axcl_run_plan_check.py`): a plan with two chained
 executions of a 2560x2560 linear matched two host round trips bit for bit, a
 second plan on the same session matched too, and a bad directive was refused
-with its line number. Not yet covered: a plan on a model with more than one
-input or output, and a plan driving a full layer.
+with its line number. The split-K down projection of the Pulsar-free PLaMo
+decode also ran as one plan
+(`tools/onnx-remote/test/axcl_run_plan_split_check.py`): a 4x2560 input is
+copied on the card into four slices, four linears run, and a two-input Add
+sums the partials, with a result equal to the one-program-at-a-time chain.
+Not yet covered: a model with several outputs (none of the templates has one),
+real PLaMo weights (the templates carry template weights), and a full layer.
 
 ## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
 
