@@ -8,6 +8,11 @@
 //   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (in their program.txt dtypes)
 //                                    a recurrent-state input (program.txt "state") sent empty takes the previous run's output,
 //                                    and that output comes back empty: after the first call the state stays on the phone
+//   run_compiled("a+b+...", tensors) a chain: runs a, then b, ... in one request. Each program gets the request's inputs, except
+//                                    that input 0 is the previous program's output 0 (so the programs must agree on that
+//                                    tensor's dtype and size). Returns the last program's outputs and every program's profile
+//                                    events. It saves a transport round trip per program, e.g. for a model split into layer
+//                                    groups (scripts/android/tinygrad_hexagon_bridge/plamo3/run_phone_spec.py --chain)
 // An artifact is TGHX<arch>\0 (TGHXV65\0, TGHXV69\0, ...: the DSP arch the skel is built for; the container and the tg_graph ABI
 // are the same), u32 file count, then per file u32 name length, name, u64 size, bytes: tg_graph.so (the skel), blob.bin (weights)
 // and program.txt (the I/O contract; see tinygrad's examples/openpilot/dsp_graph_v65.py and examples/dsp_graph_onnx.py).
@@ -200,6 +205,50 @@ void profile(Response& r, const Request& q, const char* name, uint64_t start, ui
   if (q.profiling != ProfilingLevel::Off) r.profile.push_back(ProfileEvent{name, "hexagon", start, dur, detail});
 }
 
+Response execute(const Request& request);
+
+// run_compiled over "a+b+...": each program as its own run_compiled, output 0 fed forward as the next program's input 0
+Response execute_chain(const Request& request) {
+  Response response;
+  response.request_id = request.request_id;
+  std::vector<std::string> ids;
+  for (size_t at = 0;;) {
+    const size_t plus = request.artifact_id.find('+', at);
+    ids.push_back(request.artifact_id.substr(at, plus == std::string::npos ? std::string::npos : plus - at));
+    if (plus == std::string::npos) break;
+    at = plus + 1;
+  }
+  if (!request.artifact.empty()) { response.error = "a chained run_compiled carries no artifact: load each program first"; return response; }
+  if (request.inputs.empty()) { response.error = "a chained run_compiled needs input 0"; return response; }
+  Request step = request;
+  std::vector<ProfileEvent> events;
+  // the transport carries at most kMaxProfileEvents: keep every per-program event, then the slowest calls of the whole chain
+  auto trimmed = [&events]() {
+    if (events.size() <= kMaxProfileEvents) return std::move(events);
+    std::stable_partition(events.begin(), events.end(), [](const ProfileEvent& e) { return e.category != "hexagon_call"; });
+    const auto calls = std::find_if(events.begin(), events.end(), [](const ProfileEvent& e) { return e.category == "hexagon_call"; });
+    std::stable_sort(calls, events.end(), [](const ProfileEvent& a, const ProfileEvent& b) { return a.duration_us > b.duration_us; });
+    events.resize(kMaxProfileEvents);
+    return std::move(events);
+  };
+  for (size_t k = 0; k < ids.size(); ++k) {
+    step.artifact_id = ids[k];
+    Response r = execute(step);
+    for (auto& e : r.profile) {
+      e.detail = ids[k] + (e.detail.empty() ? "" : " " + e.detail);
+      events.push_back(std::move(e));
+    }
+    if (!r.ok) { r.error = ids[k] + ": " + r.error; r.profile = trimmed(); return r; }
+    if (k + 1 == ids.size()) { r.profile = trimmed(); return r; }
+    if (r.outputs.empty() || (r.outputs[0].data.empty() && r.outputs[0].raw_data.empty())) {
+      response.error = ids[k] + ": output 0 came back empty (a state output) and cannot feed the next program";
+      return response;
+    }
+    step.inputs[0] = std::move(r.outputs[0]);
+  }
+  return response;
+}
+
 Response execute(const Request& request) {
   Response response;
   response.request_id = request.request_id;
@@ -224,6 +273,7 @@ Response execute(const Request& request) {
     profile(response, request, "hexagon_load", 0, now_us() - t0, request.artifact_id);
   }
   if (request.op == "load_compiled") { response.ok = true; response.artifact_id = request.artifact_id; return response; }
+  if (request.artifact_id.find('+') != std::string::npos) return execute_chain(request);
   auto it = g_programs.find(request.artifact_id);
   if (it == g_programs.end()) { response.error = "compiled artifact is not attached: " + request.artifact_id; return response; }
   Program& p = *it->second;
