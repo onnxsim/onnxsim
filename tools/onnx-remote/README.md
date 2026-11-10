@@ -850,6 +850,13 @@ ONNX output as float32 in graph order. `--threads N` overrides the DSP thread co
 profiling reports the DSP-side run time; `Detailed` adds one event per kernel call. `onnx-remote-client --compile-run` drives
 compile, `load_compiled` and `run_compiled` against separate compiler and runner endpoints and can compare or dump the outputs.
 
+A `run_compiled` whose artifact id is `a+b+...` is a chain. It runs the loaded programs `a`, `b`, ... in turn within one
+request. Each program gets the request's inputs, except that input 0 is the previous program's output 0, so the programs must
+agree on that tensor's dtype and size. The reply holds the last program's outputs and every program's profile events, each
+detail starting with its program's id. A model split into layer-group programs then costs one transport round trip per
+step instead of one per program. On the Xiaomi 12S over `adb forward`, PLaMo 3's six programs went from 0.14 s of transfer per
+step to 0.03 s (`scripts/android/tinygrad_hexagon_bridge/plamo3/README.md`).
+
 ### v68+ cDSPs (`tghx-v69`: qfloat HVX, HMX)
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
