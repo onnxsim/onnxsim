@@ -472,3 +472,95 @@ def test_split_layer_graph_matches_reference(model, tmp_path, layer):
         pk[:, pos, :] = res[2][:, 0, :]
         pv[:, pos, :] = res[3][:, 0, :]
     np.testing.assert_allclose(np.stack(outs), ref_out, rtol=1e-4, atol=1e-4)
+
+
+def test_split_head_matches_head(model, tmp_path):
+    """The split final norm and LM head (massive channel kept separate) equal ``build_head``."""
+    massive = 3
+    H = CFG["hidden_size"]
+    keep = np.arange(H) != massive
+    full = O.build_head(model, str(tmp_path / "head.onnx"))
+    split = O.build_head_split(
+        model, str(tmp_path / "head_split.onnx"), massive=massive
+    )
+    ref = ort.InferenceSession(full, providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(split, providers=["CPUExecutionProvider"])
+    hid = np.random.RandomState(7).randn(4, H).astype(np.float32) * 3.0
+    for row in hid:
+        (want,) = ref.run(None, {"hidden": row[None]})
+        (got,) = sess.run(
+            None,
+            {
+                "hidden_m": row[None, keep].copy(),
+                "hidden_c": row[None, massive : massive + 1].copy(),
+            },
+        )
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+
+def test_speculative_decode_matches_greedy(model, tmp_path):
+    """run_phone_spec.generate over the resident-state row-block graph (all layers, run with onnxruntime as the phone runs
+    the compiled programs): prompt-lookup speculative decoding gives exactly the plain greedy tokens, in fewer passes on
+    a repetitive prompt, and both match the reference's greedy continuation."""
+    sys.path.insert(
+        0,
+        os.path.join(
+            HERE, "..", "scripts", "android", "tinygrad_hexagon_bridge", "plamo3"
+        ),
+    )
+    import run_phone_spec as S
+
+    rows, cache, L = 8, 48, CFG["num_hidden_layers"]
+    nkv, hd = CFG["num_key_value_heads"], CFG["head_dim"]
+    path = O.build_block(
+        model,
+        range(L),
+        str(tmp_path / "spec.onnx"),
+        cache_len=cache,
+        rows=rows,
+        state=True,
+    )
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    names = [o.name for o in sess.get_outputs()]
+    emb = model.w("model.embed_tokens.weight")
+    gain = model.w("model.norm.weight")
+    lm_T = model.w("lm_head.weight").T
+
+    def decoder():
+        caches = {
+            f"past_{kv}_{i}": np.zeros((nkv, cache, hd), np.float32)
+            for i in range(L)
+            for kv in "kv"
+        }
+
+        def block(tokens, p0):
+            hid, pos, mask, wsel, wmask = S.block_inputs(
+                emb[np.asarray(tokens)].astype(np.float32), p0, rows, cache
+            )
+            feeds = dict(
+                hidden=hid,
+                position_ids=pos,
+                attn_mask=mask,
+                wsel=wsel,
+                wmask=wmask,
+                **caches,
+            )
+            res = dict(zip(names, sess.run(None, feeds)))
+            for k in caches:
+                caches[k] = res["next_" + k]
+            return R.Plamo3Reference.rms(res["hidden_out"][: len(tokens)], gain) @ lm_T
+
+        return block
+
+    ids = [3, 17, 5, 29, 8, 3, 17, 5, 29, 8, 3, 17]
+    n_new = 12
+    greedy = S.generate(decoder(), ids, rows, cache, n_new, spec=False)
+    spec = S.generate(decoder(), ids, rows, cache, n_new, spec=True)
+    assert spec[0] == greedy[0]
+    assert greedy[1] == n_new - 1  # the first token comes from the prefill
+    assert spec[2] > 0 and spec[1] < greedy[1]  # drafts were accepted: fewer passes
+
+    seq = list(ids)
+    for _ in range(n_new):
+        seq.append(int(np.argmax(model.logits(seq)[-1])))
+    assert greedy[0] == seq[len(ids) :]

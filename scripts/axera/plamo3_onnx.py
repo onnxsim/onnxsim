@@ -813,7 +813,17 @@ def build_layer_split(
         2,
         axis=-1,
     )
-    a = b.node("Mul", [b.node("Mul", [gate, b.node("Sigmoid", [gate])]), up])
+    sg = b.node("Mul", [gate, b.node("Sigmoid", [gate])])
+    # the post-MLP RMSNorm is scale invariant, so silu(gate) and up are each normalized per
+    # position before the product: the down-projection input then has the same magnitude at
+    # every position (a few large positions no longer set the range that zeroes the others)
+    tiny = b.const("sp_tiny", np.array(1e-12, np.float32))
+
+    def unit(x):
+        ms = b.node("ReduceMean", [b.node("Mul", [x, x])], axes=[-1], keepdims=1)
+        return b.node("Div", [x, b.node("Sqrt", [b.node("Add", [ms, tiny])])])
+
+    a = b.node("Mul", [unit(sg), unit(up)])
     mo = b.node(
         "MatMul", [a, b.const("sp_Wd", model.w(p + "mlp.down_proj.weight").T.copy())]
     )
@@ -842,6 +852,70 @@ def build_layer_split(
     graph = h.make_graph(
         b.nodes, f"plamo3_layer{layer_idx}_split", inputs, outputs, b.inits
     )
+    proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
+    proto.ir_version = 9
+    return _save(proto, out_path, external)
+
+
+def build_head_split(model, out_path, external=False, massive=MASSIVE_CHANNEL):
+    """The final RMSNorm and the LM head on the split residual of ``build_layer_split``:
+    hidden_m float32 [1, H-1], hidden_c float32 [1, 1] -> logits float32 [1, vocab]."""
+    b = _Builder()
+    c = _common(b, model)
+    H, V = model.H, model.c["vocab_size"]
+    keep = np.array([i for i in range(H) if i != massive])
+    g = 1.0 + model.w("model.norm.weight")
+    hm_c = b.const("hd_Hm", np.array(float(H - 1), np.float32))
+    hh_c = b.const("hd_H", np.array(float(H), np.float32))
+    msm = b.node(
+        "ReduceMean",
+        [b.node("Mul", ["hidden_m", "hidden_m"])],
+        axes=[-1],
+        keepdims=1,
+    )
+    ms = b.node(
+        "Div",
+        [
+            b.node(
+                "Add",
+                [
+                    b.node("Mul", [msm, hm_c]),
+                    b.node("Mul", ["hidden_c", "hidden_c"]),
+                ],
+            ),
+            hh_c,
+        ],
+    )
+    r = b.node("Sqrt", [b.node("Add", [ms, c["eps"]])])
+    xm = b.node(
+        "Mul",
+        [
+            b.node("Div", ["hidden_m", r]),
+            b.const("hd_gm", g[keep].copy()),
+        ],
+    )
+    xc = b.node(
+        "Mul",
+        [
+            b.node("Div", ["hidden_c", r]),
+            b.const("hd_gc", g[massive : massive + 1].copy()),
+        ],
+    )
+    Wl = model.w("lm_head.weight").T
+    logits = b.node(
+        "Add",
+        [
+            b.node("MatMul", [xm, b.const("hd_Wm", Wl[keep].copy())]),
+            b.node("Mul", [xc, b.const("hd_Wc", Wl[massive : massive + 1].copy())]),
+        ],
+    )
+    b.nodes.append(h.make_node("Identity", [logits], ["logits"]))
+    inputs = [
+        h.make_tensor_value_info("hidden_m", T.FLOAT, [1, H - 1]),
+        h.make_tensor_value_info("hidden_c", T.FLOAT, [1, 1]),
+    ]
+    outputs = [h.make_tensor_value_info("logits", T.FLOAT, [1, V])]
+    graph = h.make_graph(b.nodes, "plamo3_head_split", inputs, outputs, b.inits)
     proto = h.make_model(graph, opset_imports=[h.make_opsetid("", OPSET)])
     proto.ir_version = 9
     return _save(proto, out_path, external)
