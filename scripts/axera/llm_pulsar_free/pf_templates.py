@@ -113,6 +113,15 @@ CRMS = """
   r = Sqrt(e)
   y = Div(x, r)
 """
+# the coarse norm without the epsilon Add: the Add's shift is what Pulsar2 elides on a
+# template (the retarget of ``crms`` is refused); unit RMS of a row with no zero mean square
+CRMSN = """
+  sq = Mul(x, x)
+  m = ReduceMean<axes=[-1], keepdims=1>(sq)
+  r = Sqrt(m)
+  y = Div(x, r)
+"""
+
 RMS = """
   sq = Mul(x, x)
   m = ReduceMean<axes=[-1], keepdims=1>(sq)
@@ -559,7 +568,7 @@ def graph(name: str, d: Dims):
         base = KSPLIT_BASE[mk.group(1)] + mk.group(2)
         return ksplit_graph(graph(base, d), d)
     m = re.fullmatch(
-        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
+        r"(crmsn|crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
         r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk|alanorml?"
         r"|alyrqkrs|a?lyrqkr?|alyrf)"
         r"(\d+)(?:x(\d+))?(t?)",
@@ -625,6 +634,16 @@ def graph(name: str, d: Dims):
     if kind == "crms":
         gens = [_norm_gen(n, s, o) for s, o in NORM_X]
         return NORM_OPS, CRMS, {"x": [1, n]}, [1, n], eps, gens
+    if kind == "crmsn":
+        gens = [_norm_gen(n, s, o) for s, o in NORM_X]
+        return (
+            ["Mul", "ReduceMean", "Sqrt", "Div"],
+            CRMSN,
+            {"x": [1, n]},
+            [1, n],
+            {},
+            gens,
+        )
     if kind == "rms":
         gens = [_norm_gen(n, s, o, g) for (s, o), g in zip(NORM_X, NORM_G)]
         return NORM_OPS, RMS, {"x": [1, n], "g": [1, n]}, [1, n], eps, gens
