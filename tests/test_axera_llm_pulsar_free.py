@@ -319,6 +319,18 @@ def test_free_running_greedy_matches_float_model(name, fuse, tmp_path):
         pf_plan.greedy(None, cfg, prompt, cfg.S)
 
 
+def test_crmsn_is_the_unit_rms_without_an_epsilon_add():
+    """``crmsn<n>`` drops the epsilon Add (its shift is what Pulsar2 elides on a template,
+    so the retarget of ``crms`` is refused): its float graph is x / sqrt(mean(x^2))."""
+    ops, body, ins, _, inits, gens = tpl.graph("crmsn32", DIMS)
+    assert "Add" not in ops and "Add(" not in body and not inits
+    feeds = gens[0](np.random.default_rng(0))
+    got = ReferenceEvaluator(tpl.float_graph("crmsn32", DIMS)).run(None, feeds)[-1]
+    x = feeds["x"]
+    want = x / np.sqrt(np.mean(x * x, -1, keepdims=True))
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
 def test_template_names():
     cfg = _config("qwen3_like", ".")
     names = tpl.needed(cfg)
