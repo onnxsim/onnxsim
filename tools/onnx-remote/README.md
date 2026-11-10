@@ -855,8 +855,17 @@ decode also ran as one plan
 (`tools/onnx-remote/test/axcl_run_plan_split_check.py`): a 4x2560 input is
 copied on the card into four slices, four linears run, and a two-input Add
 sums the partials, with a result equal to the one-program-at-a-time chain.
-Not yet covered: a model with several outputs (none of the templates has one),
-real PLaMo weights (the templates carry template weights), and a full layer.
+The same split was also run with PLaMo layer 0's real `down_proj` (the four
+K-slices emitted into the template with their weight tables, and three Adds
+with grids calibrated on the real partial sums): the device chain equals the
+host chain exactly and is 0.86% from the float reference, the error of the
+linears themselves
+(`tools/onnx-remote/test/axcl_run_plan_split_check.py`, with `ONNX_REMOTE_PARTIAL`
+taking `{}` for the part and `ONNX_REMOTE_INPUT` / `ONNX_REMOTE_REF` set). A
+two-output model (`tools/onnx-remote/test/axcl_run_plan_multi_out_check.py`)
+binds and reads both outputs, equal to the host run and to numpy within 4e-5.
+Not yet covered: a full PLaMo decoder layer (attention, norms and RoPE
+templates are not built yet).
 
 ## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
 
