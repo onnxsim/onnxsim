@@ -21,7 +21,7 @@ static void bench_task(void *argp, int id) {
 }
 int main(int argc, char **argv) {
   int T = argc > 1 ? atoi(argv[1]) : 1, reps = argc > 2 ? atoi(argv[2]) : 20000;
-  pin = argc > 3 ? atoi(argv[3]) : 0;
+  pin = argc > 3 ? atoi(argv[3]) : 1;   // pinned by default (PIN=0 to disable)
   pool_init(T);
   double t0 = now_s();
   pool_run(bench_task, &reps);
