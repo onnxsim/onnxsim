@@ -26,12 +26,14 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <list>
+#include <map>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -683,6 +685,196 @@ static Response execute_resident(const Request& request, const std::string& path
                     });
 }
 
+// ---- plan sessions --------------------------------------------------------
+//
+// `run_plan`: a chain of model executions whose device buffers outlive one
+// request, the card-side counterpart of axcl_batch_runner's PLAN (one decode step
+// of a Pulsar-free model: every tensor between programs stays on the card). The
+// control is UTF-8 text in the request's `artifact` bytes, one directive per line:
+//
+//   session <id>                          continue this session; without it the
+//                                         request starts a new one (first line only)
+//   model <mid> <path>                    load <path> as model <mid>, owned by the session
+//   buffer <bid> <bytes>                  allocate device buffer <bid>, zero-filled
+//   bind <mid> I|O <idx> <bid> <offset>   point model input/output <idx> at buffer+offset
+//   exec <mid>                            execute model <mid>
+//   copy <dbid> <doff> <sbid> <soff> <n>  device-to-device copy
+//   write <bid> <offset> <n> <k>          upload the payload of request input <k> (n bytes)
+//                                         into buffer+offset
+//   read <bid> <offset> <n>               append n bytes of buffer+offset to the outputs
+//                                         (UINT8 tensors, in directive order)
+//   free                                  release the session (after this line's plan)
+//
+// The response's artifact_id is the session id in decimal. A failing directive
+// stops the plan with its line number; the session keeps what already ran.
+// Session models are not in the LRU, so nothing evicts them mid-plan.
+
+constexpr size_t kMaxPlanControlBytes = 1 << 16;
+
+struct PlanBuffer { void* p = nullptr; uint64_t bytes = 0; };
+struct PlanSession {
+  std::map<uint32_t, LoadedModel> models;
+  std::map<uint32_t, PlanBuffer> buffers;
+};
+static std::map<uint64_t, PlanSession> g_plans;
+
+static void free_plan(PlanSession& session) {
+  for (auto& kv : session.models) free_model(kv.second);
+  session.models.clear();
+  for (auto& kv : session.buffers) if (kv.second.p) axclrtFree(kv.second.p);
+  session.buffers.clear();
+}
+
+// The payload bytes of a transport tensor: float32 in `data`, every other dtype in `raw_data`.
+static const void* plan_payload(const Tensor& t, uint64_t& bytes) {
+  if (t.dtype == 1) { bytes = t.data.size() * sizeof(float); return t.data.data(); }
+  bytes = t.raw_data.size();
+  return t.raw_data.data();
+}
+
+static Response execute_plan(const Request& request) {
+  Response response;
+  response.request_id = request.request_id;
+  if (request.artifact.size() > kMaxPlanControlBytes) {
+    response.error = "AXCL plan control too large";
+    return response;
+  }
+  std::vector<std::string> lines;
+  {
+    std::istringstream text(std::string(request.artifact.begin(), request.artifact.end()));
+    for (std::string line; std::getline(text, line);) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty() && line[0] != '#') lines.push_back(line);
+    }
+  }
+  uint64_t sid = 0;
+  size_t first = 0;
+  if (!lines.empty() && lines[0].rfind("session ", 0) == 0) {
+    sid = std::strtoull(lines[0].c_str() + 8, nullptr, 10);
+    first = 1;
+    if (!g_plans.count(sid)) {
+      response.error = "AXCL plan session lost: " + std::to_string(sid);
+      return response;
+    }
+  } else {
+    sid = g_next_state_id++;
+    g_plans[sid];
+  }
+  response.artifact_id = std::to_string(sid);
+  PlanSession& session = g_plans[sid];
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<Tensor> reads;
+  bool freed = false;
+  auto fail = [&](size_t n, const std::string& message) {
+    response.ok = false;
+    response.error = "AXCL plan line " + std::to_string(n + 1) + ": " + message;
+    response.outputs.clear();
+    return response;
+  };
+  for (size_t n = first; n < lines.size(); ++n) {
+    std::istringstream d(lines[n]);
+    std::string op;
+    d >> op;
+    if (op == "model") {
+      uint64_t mid = 0; std::string path;
+      if (!(d >> mid >> path)) return fail(n, "bad model directive");
+      if (session.models.count(mid)) return fail(n, "model id already loaded");
+      LoadedModel m;
+      std::string error;
+      if (!load_model(path, m, error)) { free_model(m); return fail(n, error); }
+      m.key = path;
+      session.models.emplace(static_cast<uint32_t>(mid), std::move(m));
+    } else if (op == "buffer") {
+      uint64_t bid = 0, bytes = 0;
+      if (!(d >> bid >> bytes) || bytes == 0) return fail(n, "bad buffer directive");
+      if (session.buffers.count(bid)) return fail(n, "buffer id already allocated");
+      PlanBuffer b;
+      if (axclrtMalloc(&b.p, bytes, AXCL_MEM_MALLOC_NORMAL_ONLY)) return fail(n, "buffer alloc failed");
+      axclrtMemset(b.p, 0, bytes);
+      b.bytes = bytes;
+      session.buffers.emplace(static_cast<uint32_t>(bid), b);
+    } else if (op == "bind") {
+      uint64_t mid = 0, idx = 0, bid = 0, off = 0; std::string io;
+      if (!(d >> mid >> io >> idx >> bid >> off) || (io != "I" && io != "O"))
+        return fail(n, "bad bind directive");
+      auto mit = session.models.find(static_cast<uint32_t>(mid));
+      auto bit = session.buffers.find(static_cast<uint32_t>(bid));
+      if (mit == session.models.end()) return fail(n, "bind: no such model");
+      if (bit == session.buffers.end()) return fail(n, "bind: no such buffer");
+      LoadedModel& m = mit->second;
+      const bool in = io == "I";
+      const auto& specs = in ? m.in : m.out;
+      if (idx >= specs.size()) return fail(n, "bind: io index out of range");
+      const uint64_t bytes = specs[idx].bytes;
+      if (off + bytes > bit->second.bytes) return fail(n, "bind: past the buffer end");
+      char* p = static_cast<char*>(bit->second.p) + off;
+      const int32_t err = in ? axclrtEngineSetInputBufferByIndex(m.io, static_cast<uint32_t>(idx), p, bytes)
+                             : axclrtEngineSetOutputBufferByIndex(m.io, static_cast<uint32_t>(idx), p, bytes);
+      if (err) return fail(n, "bind: set buffer failed");
+    } else if (op == "exec") {
+      uint64_t mid = 0;
+      if (!(d >> mid)) return fail(n, "bad exec directive");
+      auto mit = session.models.find(static_cast<uint32_t>(mid));
+      if (mit == session.models.end()) return fail(n, "exec: no such model");
+      LoadedModel& m = mit->second;
+      if (axclrtEngineExecute(m.model, m.context, 0, m.io)) return fail(n, "execute failed");
+    } else if (op == "copy") {
+      uint64_t db = 0, doff = 0, sb = 0, soff = 0, bytes = 0;
+      if (!(d >> db >> doff >> sb >> soff >> bytes)) return fail(n, "bad copy directive");
+      auto dit = session.buffers.find(static_cast<uint32_t>(db));
+      auto sit = session.buffers.find(static_cast<uint32_t>(sb));
+      if (dit == session.buffers.end() || sit == session.buffers.end())
+        return fail(n, "copy: no such buffer");
+      if (doff + bytes > dit->second.bytes || soff + bytes > sit->second.bytes)
+        return fail(n, "copy: past a buffer end");
+      if (axclrtMemcpy(static_cast<char*>(dit->second.p) + doff,
+                       static_cast<char*>(sit->second.p) + soff, bytes,
+                       AXCL_MEMCPY_DEVICE_TO_DEVICE))
+        return fail(n, "copy failed");
+    } else if (op == "write") {
+      uint64_t bid = 0, off = 0, bytes = 0, k = 0;
+      if (!(d >> bid >> off >> bytes >> k)) return fail(n, "bad write directive");
+      auto bit = session.buffers.find(static_cast<uint32_t>(bid));
+      if (bit == session.buffers.end()) return fail(n, "write: no such buffer");
+      if (k >= request.inputs.size()) return fail(n, "write: no such request input");
+      uint64_t payload = 0;
+      const void* src = plan_payload(request.inputs[k], payload);
+      if (payload != bytes) return fail(n, "write: payload size differs from n");
+      if (off + bytes > bit->second.bytes) return fail(n, "write: past the buffer end");
+      if (axclrtMemcpy(static_cast<char*>(bit->second.p) + off, src, bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
+        return fail(n, "write failed");
+    } else if (op == "read") {
+      uint64_t bid = 0, off = 0, bytes = 0;
+      if (!(d >> bid >> off >> bytes)) return fail(n, "bad read directive");
+      auto bit = session.buffers.find(static_cast<uint32_t>(bid));
+      if (bit == session.buffers.end()) return fail(n, "read: no such buffer");
+      if (off + bytes > bit->second.bytes) return fail(n, "read: past the buffer end");
+      Tensor t;
+      t.dtype = 2;  // UINT8: the bytes as they are on the card
+      t.shape = {static_cast<int64_t>(bytes)};
+      t.raw_data.resize(static_cast<size_t>(bytes));
+      if (axclrtMemcpy(t.raw_data.data(), static_cast<char*>(bit->second.p) + off, bytes,
+                       AXCL_MEMCPY_DEVICE_TO_HOST))
+        return fail(n, "read failed");
+      reads.push_back(std::move(t));
+    } else if (op == "free") {
+      free_plan(session);
+      g_plans.erase(sid);
+      freed = true;
+      break;
+    } else {
+      return fail(n, "unknown directive: " + op);
+    }
+  }
+  if (!freed) { /* the session stays for the next plan */ }
+  response.ok = true;
+  response.outputs = std::move(reads);
+  response.manifest = "{\"schema_version\":1,\"session\":" + std::to_string(sid) +
+                      ",\"freed\":" + (freed ? "true" : "false") +
+                      ",\"elapsed_us\":" + std::to_string(elapsed_us(started)) + "}";
+  return response;
+}
+
 // ---- io_info --------------------------------------------------------------
 
 static const char* onnx_dtype_name(uint8_t dtype) {
@@ -779,7 +971,7 @@ static std::string capabilities_manifest() {
              "\"runner_id\":\"axcl-worker\",\"ready\":true,"
              "\"graph_execution\":false,"
              "\"supported_ops\":[\"load_compiled\",\"run_compiled\",\"run\",\"io_info\",\"unload\","
-             "\"run_resident\",\"reset_state\"],"
+             "\"run_resident\",\"reset_state\",\"run_plan\"],"
              "\"supported_dtypes\":[\"FLOAT\",\"FLOAT16\",\"BFLOAT16\",\"DOUBLE\","
              "\"INT8\",\"UINT8\",\"INT16\",\"UINT16\",\"INT32\",\"UINT32\",\"INT64\",\"UINT64\"],"
              "\"model_cache\":") +
@@ -801,6 +993,7 @@ static Response execute_request(const Request& request) {
     response.manifest = capabilities_manifest();
     return response;
   }
+  if (request.op == "run_plan") return execute_plan(request);
   if (request.op == "io_info" || request.op == "unload" || request.op == "run" ||
       request.op == "run_resident" || request.op == "reset_state") {
     Response response;
