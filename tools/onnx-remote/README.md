@@ -864,8 +864,16 @@ linears themselves
 taking `{}` for the part and `ONNX_REMOTE_INPUT` / `ONNX_REMOTE_REF` set). A
 two-output model (`tools/onnx-remote/test/axcl_run_plan_multi_out_check.py`)
 binds and reads both outputs, equal to the host run and to numpy within 4e-5.
-Not yet covered: a full PLaMo decoder layer (attention, norms and RoPE
-templates are not built yet).
+PLaMo layer 0's MLP block runs as two plans
+(`tools/onnx-remote/test/axcl_run_plan_mlp_block_check.py`): the pre-MLP RMS
+(retargeted to real activations), the gate and up linears with their real
+weights, silu, and the split down projection. The two unit RMS norms between
+them run on the host, because the Pulsar-free `crms10240` template clips its
+output grid and its retarget is refused. Against the float reference the gate
+and up linears are 1.2% and 1.5%, the silu 0.05%, the product 0.27%, and the
+block output 0.86%; the check asserts limits about twice those.
+Not yet covered: a full PLaMo decoder layer (attention, RoPE and the post-MLP
+norm templates are not built yet), and device-side unit norms.
 
 ## Allwinner VIPLite worker (Vivante VIP9000 NPU: A733, T527, ...)
 
