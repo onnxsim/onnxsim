@@ -472,3 +472,27 @@ def test_split_layer_graph_matches_reference(model, tmp_path, layer):
         pk[:, pos, :] = res[2][:, 0, :]
         pv[:, pos, :] = res[3][:, 0, :]
     np.testing.assert_allclose(np.stack(outs), ref_out, rtol=1e-4, atol=1e-4)
+
+
+def test_split_head_matches_head(model, tmp_path):
+    """The split final norm and LM head (massive channel kept separate) equal ``build_head``."""
+    massive = 3
+    H = CFG["hidden_size"]
+    keep = np.arange(H) != massive
+    full = O.build_head(model, str(tmp_path / "head.onnx"))
+    split = O.build_head_split(
+        model, str(tmp_path / "head_split.onnx"), massive=massive
+    )
+    ref = ort.InferenceSession(full, providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(split, providers=["CPUExecutionProvider"])
+    hid = np.random.RandomState(7).randn(4, H).astype(np.float32) * 3.0
+    for row in hid:
+        (want,) = ref.run(None, {"hidden": row[None]})
+        (got,) = sess.run(
+            None,
+            {
+                "hidden_m": row[None, keep].copy(),
+                "hidden_c": row[None, massive : massive + 1].copy(),
+            },
+        )
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
