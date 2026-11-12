@@ -1,5 +1,3 @@
-#include "quantize_entry.h"
-
 #include <onnx/onnx_pb.h>
 
 #include <memory>
@@ -29,6 +27,7 @@
 #include "passes/quarot.h"
 #include "passes/static_quantize_matmul.h"
 #include "passes/zeroquant.h"
+#include "quantize_entry.h"
 
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
@@ -49,7 +48,7 @@ onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
   return onnx::optimization::OptimizeFixed(
       model,
       std::vector<std::string>{"dynamic_quantize_matmul_integer_to_float",
-                                      "eliminate_unused_initializer"});
+                               "eliminate_unused_initializer"});
 }
 
 std::vector<std::string> ListQuantizableActivations(
@@ -114,9 +113,9 @@ onnx::ModelProto QuantizeStatic(
   onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
       activation_ranges;
   return onnx::optimization::OptimizeFixed(
-      model, std::vector<std::string>{"static_quantize_matmul",
-                                      "static_quantize_conv",
-                                      "eliminate_unused_initializer"});
+      model,
+      std::vector<std::string>{"static_quantize_matmul", "static_quantize_conv",
+                               "eliminate_unused_initializer"});
 }
 
 onnx::ModelProto QuantizeStaticInt16(
