@@ -108,6 +108,11 @@ inline bool MatchMatMulLike(Node* n, MatMulLikeInfo& info) {
 inline std::vector<float> ReadFloatMatrix(const Tensor& w_t) {
   const auto& sizes = w_t.sizes();
   const int64_t numel = sizes[0] * sizes[1];
+  RequireMaterializedValues(
+      w_t.name(),
+      w_t.is_raw_data() ? static_cast<int64_t>(w_t.raw().size() / sizeof(float))
+                        : static_cast<int64_t>(w_t.floats().size()),
+      numel);
   if (w_t.is_raw_data()) {
     return ReadRawDataHostOrder<float>(w_t.data<float>(), numel);
   }
@@ -123,6 +128,11 @@ inline std::vector<float> ReadFloatMatrix(const Tensor& w_t) {
 inline std::vector<int8_t> ReadInt8Matrix(const Tensor& q_t) {
   const auto& sizes = q_t.sizes();
   const int64_t numel = sizes[0] * sizes[1];
+  RequireMaterializedValues(q_t.name(),
+                            q_t.is_raw_data()
+                                ? static_cast<int64_t>(q_t.raw().size())
+                                : static_cast<int64_t>(q_t.int32s().size()),
+                            numel);
   if (q_t.is_raw_data()) {
     return ReadRawDataHostOrder<int8_t>(
         reinterpret_cast<const int8_t*>(q_t.raw().data()), numel);
