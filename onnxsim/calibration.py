@@ -1539,6 +1539,17 @@ def quantize_static(
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_calibration_samples, seed=seed
         )
+    # The QDQ rewrite needs QuantizeLinear/DequantizeLinear from opset 13. Below it the
+    # passes insert nothing and the caller gets back an unquantized model, so refuse.
+    onnx_opset = max(
+        (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")),
+        default=0,
+    )
+    if onnx_opset < 13:
+        raise ValueError(
+            f"quantize_static needs ONNX opset >= 13 for QDQ (model has opset "
+            f"{onnx_opset}); upgrade it first, e.g. onnx.version_converter.convert_version(model, 13)"
+        )
     plan = _StaticPlan(
         model,
         full_graph=full_graph,

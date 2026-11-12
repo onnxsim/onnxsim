@@ -312,9 +312,7 @@ onnx::ModelProto CrossLayerEqualize(const onnx::ModelProto& model);
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Same rewrite as ``QuantizeDynamic`` -- same matching rules, same weight
 // quantization, same runtime ``DynamicQuantizeLinear`` activation
@@ -1898,10 +1896,8 @@ EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
 // here, since calibrating a tensor that then turns out to be unusable
 // (opset < 13) is harmless -- the pass simply ignores its entry in
 // ``activation_ranges``.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every MatMul, every "vanilla"
 // Gemm (transA=0, alpha=1, beta=1), and every Conv, whose weight is a
@@ -1925,12 +1921,10 @@ std::vector<std::string> ListQuantizableActivations(
 // each, to a copy of ``model`` (which is left untouched) and returns the
 // result. Nodes that do not match, or whose activation has no entry in
 // ``activation_ranges``, are left as-is.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeStatic(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Same as ``QuantizeStatic``, but a "W8A16" scheme: the weight stays INT8
 // (identical per-output-channel symmetric scheme), while the activation is
@@ -1951,12 +1945,10 @@ onnx::ModelProto QuantizeStatic(
 // each, to a copy of ``model`` (which is left untouched) and returns the
 // result. Nodes that do not match, whose activation has no entry in
 // ``activation_ranges``, or whose opset is older than 21, are left as-is.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeStaticInt16(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the *output* tensor names that ``QuantizeQOperator`` could quantize
 // in ``model``, on top of the input tensor names ``ListQuantizableActivations``

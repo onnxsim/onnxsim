@@ -66,6 +66,11 @@ inline std::vector<float> ReadFloatTensorFlat(const Tensor& t) {
   for (const auto& s : t.sizes()) {
     numel *= s;
   }
+  RequireMaterializedValues(
+      t.name(),
+      t.is_raw_data() ? static_cast<int64_t>(t.raw().size() / sizeof(float))
+                      : static_cast<int64_t>(t.floats().size()),
+      numel);
   if (t.is_raw_data()) {
     return ReadRawDataHostOrder<float>(t.data<float>(), numel);
   }

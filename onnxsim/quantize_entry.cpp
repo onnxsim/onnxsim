@@ -30,26 +30,6 @@
 #include "passes/static_quantize_matmul.h"
 #include "passes/zeroquant.h"
 
-onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
-  PrepareSchemasForDebug(model);
-  // Registers dynamic_quantize_matmul (idempotent) into onnxoptimizer's
-  // registry so OptimizeFixed can find it by name below.
-  onnxsim::RegisterCustomOptimizerPasses();
-  return onnx::optimization::OptimizeFixed(
-      model, std::vector<std::string>{"dynamic_quantize_matmul"});
-}
-
-onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
-    const onnx::ModelProto& model) {
-  PrepareSchemasForDebug(model);
-  // Registers dynamic_quantize_matmul_integer_to_float (idempotent) into
-  // onnxoptimizer's registry so OptimizeFixed can find it by name below.
-  onnxsim::RegisterCustomOptimizerPasses();
-  return onnx::optimization::OptimizeFixed(
-      model,
-      std::vector<std::string>{"dynamic_quantize_matmul_integer_to_float"});
-}
-
 onnx::ModelProto QuantizeAttentionDynamic(const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
   // Registers dynamic_quantize_attention (idempotent) into onnxoptimizer's
@@ -436,92 +416,6 @@ onnx::ModelProto ApplyDsq(const onnx::ModelProto& model) {
   onnxsim::RegisterCustomOptimizerPasses();
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"d2quant_dsq"});
-}
-
-std::vector<std::string> ListQuantizableActivations(
-    const onnx::ModelProto& model) {
-  PrepareSchemasForDebug(model);
-  std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
-  if (g.get() == nullptr) {
-    return {};
-  }
-  std::vector<std::string> names;
-  std::unordered_set<std::string> seen;
-  for (auto* node : g->nodes()) {
-    onnx::optimization::onnxsim_passes::MatMulLikeInfo info;
-    if (!onnx::optimization::onnxsim_passes::MatchMatMulLike(node, info)) {
-      continue;
-    }
-    if (info.x->elemType() != onnx::TensorProto_DataType_FLOAT) {
-      continue;
-    }
-    const onnx::Tensor* w_t = onnx::optimization::FetchConstantTensor(info.w);
-    if (w_t == nullptr ||
-        w_t->elem_type() != onnx::TensorProto_DataType_FLOAT ||
-        w_t->sizes().size() != 2) {
-      continue;
-    }
-    if (seen.insert(info.x->uniqueName()).second) {
-      names.push_back(info.x->uniqueName());
-    }
-  }
-  for (auto* node : g->nodes()) {
-    onnx::optimization::onnxsim_passes::ConvInfo info;
-    if (!onnx::optimization::onnxsim_passes::MatchConv(node, info)) {
-      continue;
-    }
-    if (info.x->elemType() != onnx::TensorProto_DataType_FLOAT) {
-      continue;
-    }
-    const onnx::Tensor* w_t = onnx::optimization::FetchConstantTensor(info.w);
-    if (w_t == nullptr ||
-        w_t->elem_type() != onnx::TensorProto_DataType_FLOAT ||
-        w_t->sizes().size() < 3) {
-      continue;
-    }
-    if (seen.insert(info.x->uniqueName()).second) {
-      names.push_back(info.x->uniqueName());
-    }
-  }
-  return names;
-}
-
-onnx::ModelProto QuantizeStatic(
-    const onnx::ModelProto& model,
-    const std::unordered_map<std::string, std::pair<float, float>>&
-        activation_ranges) {
-  PrepareSchemasForDebug(model);
-  // Registers static_quantize_matmul (idempotent) into onnxoptimizer's
-  // registry so OptimizeFixed can find it by name below.
-  onnxsim::RegisterCustomOptimizerPasses();
-  // static_quantize_matmul reads this global, the same way onnxsim's other
-  // passes read `config` -- see StaticQuantizationCalibrationRanges's doc
-  // comment.
-  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
-      activation_ranges;
-  return onnx::optimization::OptimizeFixed(
-      model, std::vector<std::string>{"static_quantize_matmul",
-                                      "static_quantize_conv"});
-}
-
-onnx::ModelProto QuantizeStaticInt16(
-    const onnx::ModelProto& model,
-    const std::unordered_map<std::string, std::pair<float, float>>&
-        activation_ranges) {
-  PrepareSchemasForDebug(model);
-  // Registers static_quantize_int16_matmul/_conv (idempotent) into
-  // onnxoptimizer's registry so OptimizeFixed can find them by name below.
-  onnxsim::RegisterCustomOptimizerPasses();
-  // Reads/writes the same calibration-ranges global QuantizeStatic uses --
-  // safe as long as only one of QuantizeStatic/QuantizeStaticInt16/
-  // QuantizeQOperator runs per call, which OptimizeFixed's single
-  // pass-name list here ensures (see QuantizeQOperator's own comment on
-  // this).
-  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
-      activation_ranges;
-  return onnx::optimization::OptimizeFixed(
-      model, std::vector<std::string>{"static_quantize_int16_matmul",
-                                      "static_quantize_int16_conv"});
 }
 
 std::vector<std::string> ListQOperatorQuantizableOutputs(

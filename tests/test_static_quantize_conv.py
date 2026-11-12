@@ -160,7 +160,7 @@ def test_quantize_skips_non_constant_conv_weight():
     assert _op_counts(quant)["QuantizeLinear"] == 0
 
 
-def test_quantize_skips_old_opset_conv():
+def test_quantize_rejects_old_opset_conv():
     # DequantizeLinear's per-channel `axis` attribute needs opset >= 13.
     weight = _f32(np.random.randn(4, 3, 3, 3).astype(np.float32), "W")
     model = _model(
@@ -173,9 +173,10 @@ def test_quantize_skips_old_opset_conv():
         [weight],
         opset=12,
     )
-    quant = onnxsim.quantize_static(model)
-    assert _op_counts(quant)["Conv"] == 1
-    assert _op_counts(quant)["QuantizeLinear"] == 0
+    # Below opset 13 the QDQ rewrite cannot run, so this is an error, not a
+    # silently unquantized model.
+    with pytest.raises(ValueError, match="opset >= 13"):
+        onnxsim.quantize_static(model)
 
 
 def test_calibrate_includes_conv_activation():

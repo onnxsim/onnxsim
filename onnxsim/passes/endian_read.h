@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,19 @@
 namespace ONNX_NAMESPACE {
 namespace optimization {
 namespace onnxsim_passes {
+
+// Throws unless a constant tensor actually carries its `numel` values. An
+// external-data initializer that was never loaded keeps its shape but has no
+// bytes, and reading it would run past an empty buffer (a SEGV, not an error).
+inline void RequireMaterializedValues(const std::string& name, int64_t have,
+                                      int64_t numel) {
+  if (have < numel) {
+    throw std::runtime_error(
+        "onnxsim: constant tensor '" + name + "' has " + std::to_string(have) +
+        " of " + std::to_string(numel) +
+        " values loaded; load its external data before optimizing");
+  }
+}
 
 // Copies `numel` elements starting at `raw` (a Tensor::data<T>() pointer into
 // raw_data storage) into a host-order vector<T>, swapping each element's

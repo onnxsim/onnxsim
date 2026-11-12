@@ -460,7 +460,6 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // symmetric) and activations to uint8 at runtime via DynamicQuantizeLinear
   // -- see QuantizeDynamic in onnxsim.h. Pure graph rewrite: no ModelExecutor
   // or calibration data needed.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_dynamic",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -474,7 +473,6 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Same rewrite as quantize_dynamic, but the dequantize step is a single
   // ONNX Runtime "com.microsoft" contrib op (MatMulIntegerToFloat) instead
@@ -3741,7 +3739,6 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_quantizable_activations",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3752,7 +3749,6 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQuantizableActivations(model);
       },
       "model_bytes"_a);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes MatMul/Gemm/Conv: weights to
   // INT8
@@ -3761,7 +3757,6 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // derived from `activation_ranges` (tensor name -> (min, max), typically
   // from list_quantizable_activations plus running the float model over
   // calibration data) -- see QuantizeStatic in onnxsim.h.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_static",
       [](const py::bytes& model_proto_bytes,
@@ -3777,12 +3772,10 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Same as quantize_static, but a "W8A16" scheme: the weight stays INT8,
   // while the activation is quantized to uint16 instead of uint8 (an 8x
   // finer calibrated affine step) -- see QuantizeStaticInt16 in onnxsim.h.
-#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_static_int16",
       [](const py::bytes& model_proto_bytes,
@@ -3798,7 +3791,6 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
-#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the *output* tensor names quantize_qoperator could additionally
   // quantize, on top of list_quantizable_activations' input names -- see
