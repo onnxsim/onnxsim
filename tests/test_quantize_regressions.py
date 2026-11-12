@@ -72,12 +72,12 @@ def test_quantize_dynamic_drops_replaced_float_weights_and_stays_close():
     assert all(name in used for name in float_inits), "no dead float initializers left"
 
     x = rng.standard_normal((1, 32)).astype(np.float32)
-    ref = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"]).run(
-        None, {"x": x}
-    )[0]
-    out = ort.InferenceSession(q.SerializeToString(), providers=["CPUExecutionProvider"]).run(
-        None, {"x": x}
-    )[0]
+    ref = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"x": x})[0]
+    out = ort.InferenceSession(
+        q.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {"x": x})[0]
     assert np.max(np.abs(ref - out)) < 0.05 * np.max(np.abs(ref))
 
 
