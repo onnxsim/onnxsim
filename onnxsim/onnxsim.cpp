@@ -341,7 +341,7 @@ static onnx::ModelProto SimplifyImpl(
   // checker below does not reject the model (GitHub issues #107, #220).
   RegisterCustomDefaultDomainOpSchemas(model);
 
-  Check(model);
+  CheckInput(model);
 
   config.tensor_size_threshold = tensor_size_threshold;
   config.initializers_as_constants = initializers_as_constants;
@@ -773,6 +773,10 @@ static onnx::ModelProto SimplifyImpl(
   } else {
     sim_model = model;
   }
+  // An input exported with an ir_version older than its tensor types need
+  // (e.g. IR 8 with uint4 weights) is raised here so the later Check() and
+  // every folding sub-model accept it.
+  RaiseIrVersionForDataTypes(sim_model);
   // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
   // initializers that also appear as graph inputs like any other constant.
   if (!mutable_initializer) {

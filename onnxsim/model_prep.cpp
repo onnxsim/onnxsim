@@ -315,7 +315,91 @@ void DropIncompleteValueInfo(onnx::ModelProto& model) {
   DropIncompleteValueInfo(*model.mutable_graph());
 }
 
+namespace {
+
+// Mirrors onnx's checker.cc min_ir_version_for_data_type: the IR version that
+// introduced a tensor element type (0 when it predates the checks).
+int MinIrVersionForDataType(int32_t t) {
+  switch (t) {
+    case onnx::TensorProto::UINT4:
+    case onnx::TensorProto::INT4:
+      return 10;
+    case onnx::TensorProto::FLOAT4E2M1:
+      return 11;
+    case onnx::TensorProto::FLOAT8E8M0:
+      return 12;
+    case onnx::TensorProto::UINT2:
+    case onnx::TensorProto::INT2:
+      return 13;
+    case onnx::TensorProto::FLOAT6E2M3:
+    case onnx::TensorProto::FLOAT6E3M2:
+      return 14;
+    default:
+      return 0;
+  }
+}
+
+int MinIrVersionForType(const onnx::TypeProto& type) {
+  switch (type.value_case()) {
+    case onnx::TypeProto::kTensorType:
+      return MinIrVersionForDataType(type.tensor_type().elem_type());
+    case onnx::TypeProto::kSequenceType:
+      return MinIrVersionForType(type.sequence_type().elem_type());
+    case onnx::TypeProto::kOptionalType:
+      return MinIrVersionForType(type.optional_type().elem_type());
+    default:
+      return 0;
+  }
+}
+
+int MinIrVersionForGraph(const onnx::GraphProto& graph) {
+  int required = 0;
+  auto bump = [&required](int v) { required = std::max(required, v); };
+  for (const auto& init : graph.initializer()) {
+    bump(MinIrVersionForDataType(init.data_type()));
+  }
+  for (const auto& vi : graph.input()) bump(MinIrVersionForType(vi.type()));
+  for (const auto& vi : graph.output()) bump(MinIrVersionForType(vi.type()));
+  for (const auto& vi : graph.value_info()) {
+    bump(MinIrVersionForType(vi.type()));
+  }
+  for (const auto& node : graph.node()) {
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_t()) bump(MinIrVersionForDataType(attr.t().data_type()));
+      for (const auto& t : attr.tensors()) {
+        bump(MinIrVersionForDataType(t.data_type()));
+      }
+      if (attr.has_g()) bump(MinIrVersionForGraph(attr.g()));
+      for (const auto& g : attr.graphs()) bump(MinIrVersionForGraph(g));
+    }
+  }
+  return required;
+}
+
+}  // namespace
+
+void RaiseIrVersionForDataTypes(onnx::ModelProto& model) {
+  const int required = MinIrVersionForGraph(model.graph());
+  if (required > model.ir_version()) {
+    model.set_ir_version(required);
+  }
+}
+
 void Check(const onnx::ModelProto& model) { onnx::checker::check_model(model); }
+
+void CheckInput(const onnx::ModelProto& model) {
+  const int required = MinIrVersionForGraph(model.graph());
+  if (required <= model.ir_version()) {
+    Check(model);
+    return;
+  }
+  // Off-spec input (see RaiseIrVersionForDataTypes): validate it as it will be
+  // simplified, without touching the caller's model. Copying is acceptable
+  // since only already-malformed inputs take this path.
+  onnx::ModelProto raised = model;
+  raised.set_ir_version(required);
+  Check(raised);
+}
 
 // Return the opset version the model imports for the default ONNX domain
 // (represented as either the empty string or "ai.onnx"), or std::nullopt when
