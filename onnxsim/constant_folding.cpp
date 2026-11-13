@@ -317,14 +317,21 @@ void InitEnv() {
 // unless its ir_version is >= 10. The folding sub-model inherits the original
 // model's ir_version, which can be older (e.g. an IR 8 export carrying uint4
 // MatMulNBits weights), so raise it just for that case.
-static void EnsureIrVersionForSubByteTypes(onnx::ModelProto& m) {
+static void EnsureIrVersionForSubByteTypes(
+    onnx::ModelProto& m, const std::vector<int32_t>& feed_elem_types = {}) {
   constexpr int64_t kMinIrForInt4 = 10;
   if (m.ir_version() >= kMinIrForInt4) return;
   auto is_int4 = [](int32_t t) {
     return t == onnx::TensorProto_DataType_INT4 ||
            t == onnx::TensorProto_DataType_UINT4;
   };
+  // The tensors actually fed to the session: the graph inputs' value_info may
+  // carry no element type at all (it is copied from the original model, where
+  // an initializer usually has none), so check the real data types too.
   bool needs = false;
+  for (int32_t t : feed_elem_types) {
+    if (is_int4(t)) needs = true;
+  }
   for (const auto& vi : m.graph().input()) {
     if (vi.type().has_tensor_type() &&
         is_int4(vi.type().tensor_type().elem_type())) {
@@ -490,7 +497,12 @@ std::vector<onnx::TensorProto> RunOps(
       output_names.push_back(x);
     }
   }
-  EnsureIrVersionForSubByteTypes(op_model);
+  {
+    std::vector<int32_t> feed_types;
+    feed_types.reserve(input_tps.size());
+    for (const auto* tp : input_tps) feed_types.push_back(tp->data_type());
+    EnsureIrVersionForSubByteTypes(op_model, feed_types);
+  }
   onnxsim::Profiler::Instance().End();  // BuildSubModel
 
   using namespace ONNX_NAMESPACE::optimization;
@@ -1463,7 +1475,12 @@ RunOpsOnGraphResult RunOpsOnGraph(
       tensor_type->mutable_shape()->add_dim()->set_dim_value(d);
     }
   }
-  EnsureIrVersionForSubByteTypes(op_model);
+  {
+    std::vector<int32_t> feed_types;
+    feed_types.reserve(input_tensors.size());
+    for (const auto* t : input_tensors) feed_types.push_back(t->elem_type());
+    EnsureIrVersionForSubByteTypes(op_model, feed_types);
+  }
   std::vector<std::string> output_names;
   std::vector<onnx::Value*> output_values;
   for (onnx::Node* op : ops) {
