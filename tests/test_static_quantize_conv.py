@@ -195,3 +195,35 @@ def test_calibrate_includes_conv_activation():
     assert set(ranges.keys()) == {"X"}
     lo, hi = ranges["X"]
     assert lo < hi
+
+
+def test_quantize_infers_missing_value_info():
+    # Y1 is an intermediate with no value_info, as in a raw export. Its element
+    # type is unknown, so the second Conv's activation used to be skipped with
+    # no error. Implicit shape inference (default) quantizes both Convs;
+    # infer_shapes=False keeps the old behavior.
+    rng = np.random.default_rng(5)
+    w1 = _f32(rng.standard_normal((4, 3, 3, 3)) * 0.5, "W1")
+    w2 = _f32(rng.standard_normal((4, 4, 3, 3)) * 0.5, "W2")
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,4,6,6] Y)
+        {
+          Y1 = Conv<kernel_shape = [3, 3]>(X, W1)
+          Y = Conv<kernel_shape = [3, 3]>(Y1, W2)
+        }
+        """,
+        [w1, w2],
+    )
+    assert len(model.graph.value_info) == 0
+
+    quant = onnxsim.quantize_static(model)
+    assert _op_counts(quant)["QuantizeLinear"] == 2
+    # The returned model carries the inferred types too.
+    assert len(quant.graph.value_info) > 0
+
+    skipped = onnxsim.quantize_static(model, infer_shapes=False)
+    assert _op_counts(skipped)["QuantizeLinear"] == 1
+
+    x = rng.standard_normal((1, 3, 8, 8)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
