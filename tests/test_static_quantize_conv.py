@@ -54,7 +54,7 @@ def _op_counts(model):
     return collections.Counter(n.op_type for n in model.graph.node)
 
 
-def _assert_close(float_outputs, quant_outputs):
+def _assert_close(float_outputs, quant_outputs, max_rel_l2=0.1):
     # INT8/uint8 quantization is lossy by design; see
     # test_dynamic_quantize_matmul.py's identically-named helper for why this
     # checks aggregate relative L2 error rather than a tight per-element bound.
@@ -63,7 +63,7 @@ def _assert_close(float_outputs, quant_outputs):
         q = np.asarray(q, dtype=np.float64).ravel()
         assert np.all(np.isfinite(q))
         rel_l2 = np.linalg.norm(f - q) / max(np.linalg.norm(f), 1e-6)
-        assert rel_l2 < 0.1, f"relative L2 error too large: {rel_l2:.4f}"
+        assert rel_l2 < max_rel_l2, f"relative L2 error too large: {rel_l2:.4f}"
 
 
 def _assert_explicit_weight_zp(quant, out_channels):
@@ -207,7 +207,7 @@ def test_quantize_infers_missing_value_info():
     w2 = _f32(rng.standard_normal((4, 4, 3, 3)) * 0.5, "W2")
     model = _model(
         """
-        g (float[1,3,8,8] X) => (float[1,4,6,6] Y)
+        g (float[1,3,8,8] X) => (float[1,4,4,4] Y)
         {
           Y1 = Conv<kernel_shape = [3, 3]>(X, W1)
           Y = Conv<kernel_shape = [3, 3]>(Y1, W2)
@@ -226,4 +226,8 @@ def test_quantize_infers_missing_value_info():
     assert _op_counts(skipped)["QuantizeLinear"] == 1
 
     x = rng.standard_normal((1, 3, 8, 8)).astype(np.float32)
-    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+    # Two chained quantized Convs: the error compounds. It is ~0.012 on a CPU
+    # with VNNI, but 0.13 was measured on GitHub's runners (probably ORT's
+    # u8 x s8 kernels saturating without VNNI), so use a looser bound than the
+    # single-layer tests. A wrong graph is off by ~1.0, far above this.
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}), max_rel_l2=0.25)

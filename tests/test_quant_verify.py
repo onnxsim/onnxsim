@@ -14,6 +14,7 @@ from onnx import numpy_helper, parser
 
 pytest.importorskip("onnxruntime")
 
+import onnxsim  # noqa: E402
 from onnxsim import accuracy, quant_verify  # noqa: E402
 from onnxsim import ranges as R  # noqa: E402
 
@@ -183,7 +184,12 @@ def test_certified_bound_dominates_observed_error(name, scheme, dtype, box):
 
 
 def test_bound_grows_when_the_box_exceeds_the_calibrated_range():
-    model, q = _mlp3(), _quantize(_mlp3(), "static", "int8")
+    model = _mlp3()
+    # infer_shapes=False: the default shape inference would quantize every
+    # activation of this value_info-free model; the extra sites make the loose
+    # interval bound exceed the calibrated range even for the narrow box, which
+    # is not what this test is about.
+    q = onnxsim.quantize_static(model, num_calibration_samples=16, infer_shapes=False)
     narrow = quant_verify.verify(model, q, {"x": (-0.25, 0.25)}, breakdown=False)
     wide = quant_verify.verify(model, q, {"x": (-4.0, 4.0)}, breakdown=False)
     assert not any(s.clipped for s in narrow.sites) and any(

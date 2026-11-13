@@ -55,7 +55,8 @@ Relu(x-b)` plus `scale/2` noise. It is sound but **looser** (measured below), so
 import numpy as np
 from onnx import numpy_helper, parser
 
-from onnxsim import accuracy, precision_estimator, quant_verify
+import onnxsim
+from onnxsim import precision_estimator, quant_verify
 
 rng = np.random.default_rng(1)
 
@@ -72,8 +73,9 @@ model = parser.parse_model(
 for name, shape in dict(W1=(32, 64), B1=(64,), W2=(64, 64), W3=(64, 8)).items():
     model.graph.initializer.append(numpy_helper.from_array(weights(*shape), name))
 
-cfg = accuracy.QuantizationConfig(scheme="static", dtype="int8", num_calibration_samples=16)
-quantized = accuracy.quantize(model, cfg)
+# infer_shapes=False keeps this model's single quantized site (the default would
+# first infer value_info and quantize every activation).
+quantized = onnxsim.quantize_static(model, num_calibration_samples=16, infer_shapes=False)
 
 print("--- inside the calibrated range (box +-0.25)")
 box = {"x": (-0.25, 0.25)}
