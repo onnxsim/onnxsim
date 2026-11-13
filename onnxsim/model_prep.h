@@ -179,7 +179,19 @@ std::vector<std::string> AssignMissingNodeNames(onnx::ModelProto& model);
 // function's own doc comment in model_prep.cpp for why).
 void DropIncompleteValueInfo(onnx::ModelProto& model);
 
+// Raise model.ir_version to the minimum the model's tensor element types need
+// (e.g. INT4/UINT4 need IR >= 10). onnx's checker rejects a model whose
+// ir_version predates a data type it uses, but such exports exist in the wild
+// (an IR 8 file carrying uint4 MatMulNBits weights); the data is unchanged and
+// the type is valid in the newer IR, so bump rather than fail.
+void RaiseIrVersionForDataTypes(onnx::ModelProto& model);
+
 void Check(const onnx::ModelProto& model);
+
+// Check() for the model handed to Simplify(): tolerates an ir_version older
+// than its tensor types need (see RaiseIrVersionForDataTypes) without
+// modifying ``model``.
+void CheckInput(const onnx::ModelProto& model);
 
 // Return the opset version the model imports for the default ONNX domain
 // (represented as either the empty string or "ai.onnx"), or std::nullopt when
