@@ -111,19 +111,28 @@ def test_onnx_test_case_round_trips_through_json(tmp_path):
     assert case_from_dict(data, str(tmp_path)) == case
 
 
+# Named explicitly rather than taken as the first N cases in the submodule: the
+# selection depends on which test-data groups upstream ships, and a case whose
+# operator has no reference implementation (for example test_gradient_of_add,
+# which uses the training-domain Gradient op) cannot produce official outputs.
+_REAL_CASE_NAMES = (
+    "test_expand_shape_model1",
+    "test_expand_shape_model2",
+    "test_expand_shape_model3",
+    "test_expand_shape_model4",
+    "test_single_relu_model",
+)
+
+
 def _real_cases():
-    """Up to five backend cases from the ONNX submodule, across its test-data groups."""
-    found = []
-    for group in ("pytorch-operator", "pytorch-converted", "simple", "real"):
-        root = ONNX_DATA / group
-        if not root.is_dir():
-            continue
-        found += sorted(
-            d
-            for d in root.iterdir()
-            if (d / "model.onnx").is_file() and (d / "test_data_set_0").is_dir()
-        )
-    return found[:5]
+    """Backend cases from the ONNX submodule whose reference outputs the evaluator can produce."""
+    root = ONNX_DATA / "simple"
+    return [
+        root / name
+        for name in _REAL_CASE_NAMES
+        if (root / name / "model.onnx").is_file()
+        and (root / name / "test_data_set_0").is_dir()
+    ]
 
 
 @pytest.mark.skipif(
