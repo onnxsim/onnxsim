@@ -142,6 +142,20 @@ jobs:
         run: |
           cargo test --release --workspace
           cargo test --release -- --ignored list_optimizers_is_non_empty
+      # Temporary diagnostics: where did the onnxsim-sys build script put
+      # libonnxsim_c, and what did its build script print?
+      - name: Diagnose native library output
+        if: always()
+        run: |
+          echo "== libonnxsim_c artifacts under target"
+          find target \( -name 'libonnxsim_c*' -o -name 'onnxsim_c*.dll' \) -print 2>/dev/null || true
+          echo "== onnxsim-sys build-script output (tail)"
+          for f in target/release/build/onnxsim-sys-*/output; do
+            echo "-- $f"
+            tail -c 20000 "$f" || true
+          done
+          echo "== onnxsim-sys build directory"
+          ls target/release/build/onnxsim-sys-*/out/build 2>/dev/null | head -60 || true
       # Same standalone package test as the `package` job, but linking the
       # native library this job just built (--lib-dir auto finds it under
       # rust/target), so the packaged crates are linked and executed outside
