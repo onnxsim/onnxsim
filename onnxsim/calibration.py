@@ -25,6 +25,7 @@ ONNX Runtime to produce the ``{tensor_name: (min, max)}`` ranges
 """
 
 import itertools
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
@@ -1457,6 +1458,29 @@ def _calibrate_quark(
     return out
 
 
+def _implicit_shape_inference(model: onnx.ModelProto, enabled: bool) -> onnx.ModelProto:
+    """Fill in missing ``value_info`` before static quantization.
+
+    The static QDQ passes only quantize an activation whose element type is
+    known, and raw exports (e.g. a PyTorch ViT) carry no ``value_info`` for
+    intermediate tensors, so most candidates were skipped with no error. Shape
+    inference adds the types; tensors that already have value_info keep it.
+    If inference fails (e.g. a model over the 2 GB protobuf limit) this warns
+    and continues with the model as given.
+    """
+    if not enabled:
+        return model
+    try:
+        return onnx.shape_inference.infer_shapes(model, data_prop=True)
+    except Exception as e:
+        warnings.warn(
+            f"quantize_static: shape inference failed ({e}); activations without "
+            "value_info will be skipped. Pass infer_shapes=False to disable this.",
+            stacklevel=3,
+        )
+        return model
+
+
 def quantize_static(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -1472,8 +1496,14 @@ def quantize_static(
     percentile: float = 99.999,
     minmax_tensor_names: Optional[Sequence[str]] = None,
     auto_options: Optional[Dict] = None,
+    infer_shapes: bool = True,
 ) -> onnx.ModelProto:
     """
+    Unless ``infer_shapes=False``, shape inference first fills in missing
+    ``value_info``. An activation with no known element type is silently left
+    unquantized, and raw exports usually lack it for every intermediate tensor.
+    The returned model then carries the inferred value_info.
+
     Statically (calibration-based) quantize every MatMul, every "vanilla"
     Gemm (transA=0, alpha=1, beta=1), and every Conv, whose weight is a
     constant float32 tensor (2-D for MatMul/Gemm, rank >= 3 -- [Cout,
@@ -1535,6 +1565,7 @@ def quantize_static(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
+    model = _implicit_shape_inference(model, infer_shapes)
     if calibration_data is None:
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_calibration_samples, seed=seed
@@ -1647,6 +1678,7 @@ def quantize_static_int16(
     seed: int = 0,
     providers: Optional[Sequence[str]] = None,
     method: str = "minmax",
+    infer_shapes: bool = True,
 ) -> onnx.ModelProto:
     """
     Same as :func:`quantize_static`, but a "W8A16" scheme: the weight stays
@@ -1682,6 +1714,7 @@ def quantize_static_int16(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
+    model = _implicit_shape_inference(model, infer_shapes)
     if calibration_data is None:
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_calibration_samples, seed=seed
