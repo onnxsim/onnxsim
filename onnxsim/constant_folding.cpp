@@ -313,6 +313,30 @@ void InitEnv() {
 }
 #endif
 
+// ORT (>= 1.32) rejects a model that uses the sub-byte INT4/UINT4 element types
+// unless its ir_version is >= 10. The folding sub-model inherits the original
+// model's ir_version, which can be older (e.g. an IR 8 export carrying uint4
+// MatMulNBits weights), so raise it just for that case.
+static void EnsureIrVersionForSubByteTypes(onnx::ModelProto& m) {
+  constexpr int64_t kMinIrForInt4 = 10;
+  if (m.ir_version() >= kMinIrForInt4) return;
+  auto is_int4 = [](int32_t t) {
+    return t == onnx::TensorProto_DataType_INT4 ||
+           t == onnx::TensorProto_DataType_UINT4;
+  };
+  bool needs = false;
+  for (const auto& vi : m.graph().input()) {
+    if (vi.type().has_tensor_type() &&
+        is_int4(vi.type().tensor_type().elem_type())) {
+      needs = true;
+    }
+  }
+  for (const auto& init : m.graph().initializer()) {
+    if (is_int4(init.data_type())) needs = true;
+  }
+  if (needs) m.set_ir_version(kMinIrForInt4);
+}
+
 // Fold a group of const nodes together by building one sub-model that produces
 // all of their outputs, running it through `executor` in a single Session, and
 // returning the resulting tensors (named, in group order). Folding many nodes
@@ -466,6 +490,7 @@ std::vector<onnx::TensorProto> RunOps(
       output_names.push_back(x);
     }
   }
+  EnsureIrVersionForSubByteTypes(op_model);
   onnxsim::Profiler::Instance().End();  // BuildSubModel
 
   using namespace ONNX_NAMESPACE::optimization;
@@ -1438,6 +1463,7 @@ RunOpsOnGraphResult RunOpsOnGraph(
       tensor_type->mutable_shape()->add_dim()->set_dim_value(d);
     }
   }
+  EnsureIrVersionForSubByteTypes(op_model);
   std::vector<std::string> output_names;
   std::vector<onnx::Value*> output_values;
   for (onnx::Node* op : ops) {
