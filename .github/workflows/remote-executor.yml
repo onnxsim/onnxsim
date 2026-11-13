@@ -156,15 +156,15 @@ jobs:
       - name: Download public ORT SDK
         run: |
           curl --fail --location --retry 3 \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-x64-1.31.1.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.32.0/onnxruntime-linux-x64-1.32.0.tgz \
             --output "$RUNNER_TEMP/onnxruntime.tgz"
           tar -xzf "$RUNNER_TEMP/onnxruntime.tgz" -C "$RUNNER_TEMP"
       - name: Configure public plugin
         run: |
           cmake -S tools/onnx-remote -B build/onnx-remote-public-ep \
             -DONNXSIM_REMOTE_ORT_PUBLIC_PLUGIN=ON \
-            -DONNXSIM_ORT_PUBLIC_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.31.1/include" \
-            -DONNXSIM_ORT_PUBLIC_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.31.1/lib/libonnxruntime.so" \
+            -DONNXSIM_ORT_PUBLIC_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.32.0/include" \
+            -DONNXSIM_ORT_PUBLIC_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.32.0/lib/libonnxruntime.so" \
             -DBUILD_TESTING=ON
       - name: Build public plugin and tests
         run: |
@@ -173,11 +173,11 @@ jobs:
             onnxsim_remote_ep_run_test onnx-remote-worker -j2
       - name: Test plugin discovery
         env:
-          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.31.1/lib
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.32.0/lib
         run: ctest --test-dir build/onnx-remote-public-ep -R public-ep --output-on-failure
       - name: Test remote execution through public EP
         env:
-          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.31.1/lib
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.32.0/lib
           ONNXSIM_REMOTE_EP_HOST: 127.0.0.1
           ONNXSIM_REMOTE_EP_PORT: 39501
           ONNXSIM_REMOTE_EP_PROFILING: detailed
@@ -220,15 +220,15 @@ jobs:
       - name: Download public ORT SDK
         run: |
           curl --fail --location --retry 3 \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-x64-1.31.1.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.32.0/onnxruntime-linux-x64-1.32.0.tgz \
             --output "$RUNNER_TEMP/onnxruntime.tgz"
           tar -xzf "$RUNNER_TEMP/onnxruntime.tgz" -C "$RUNNER_TEMP"
       - name: Configure ORT graph worker
         run: |
           cmake -S tools/onnx-remote -B build/onnx-remote-ort-worker \
             -DONNXSIM_REMOTE_ORT_WORKER=ON \
-            -DONNXSIM_ORT_WORKER_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.31.1/include" \
-            -DONNXSIM_ORT_WORKER_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.31.1/lib/libonnxruntime.so" \
+            -DONNXSIM_ORT_WORKER_INCLUDE_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-1.32.0/include" \
+            -DONNXSIM_ORT_WORKER_LIBRARY="$RUNNER_TEMP/onnxruntime-linux-x64-1.32.0/lib/libonnxruntime.so" \
             -DBUILD_TESTING=ON
       - name: Build ORT graph worker
         run: |
@@ -237,7 +237,7 @@ jobs:
             onnx-remote-client -j2
       - name: Test graph execution round trip
         env:
-          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.31.1/lib
+          LD_LIBRARY_PATH: ${{ runner.temp }}/onnxruntime-linux-x64-1.32.0/lib
         run: |
           build/onnx-remote-ort-worker/onnx-remote-ort-worker --port 39503 \
             >"$RUNNER_TEMP/ort-worker.log" 2>&1 &

@@ -67,10 +67,10 @@ jobs:
       - name: Run the simplify example
         working-directory: examples/ruby_cumo_integration
         env:
-          ONNXSIM_LIB_DIR: ${{ github.workspace }}/build:${{ github.workspace }}/build/prebuilt-ort/onnxruntime-linux-x64-1.31.1/lib
+          ONNXSIM_LIB_DIR: ${{ github.workspace }}/build:${{ github.workspace }}/build/prebuilt-ort/onnxruntime-linux-x64-1.32.0/lib
         run: bundle exec ruby simplify_and_run.rb
       - name: Run the training example
         working-directory: examples/ruby_cumo_integration
         env:
-          ONNXSIM_LIB_DIR: ${{ github.workspace }}/build:${{ github.workspace }}/build/prebuilt-ort/onnxruntime-linux-x64-1.31.1/lib
+          ONNXSIM_LIB_DIR: ${{ github.workspace }}/build:${{ github.workspace }}/build/prebuilt-ort/onnxruntime-linux-x64-1.32.0/lib
         run: bundle exec ruby train_and_export.rb "${{ runner.temp }}/trained_linear.onnx"

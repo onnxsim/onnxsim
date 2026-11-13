@@ -21,7 +21,7 @@
 # are precompiled, so their internal onnx never appears here either).
 include(ExternalProject)
 
-set(_ort_ext_source_dir "${CMAKE_SOURCE_DIR}/third_party/onnxruntime-1.31.1")
+set(_ort_ext_source_dir "${CMAKE_SOURCE_DIR}/third_party/onnxruntime-1.32.0")
 set(_ort_ext_prefix "${CMAKE_BINARY_DIR}/onnxruntime-ext")
 set(_ort_ext_install_dir "${_ort_ext_prefix}/install")
 
