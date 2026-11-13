@@ -643,10 +643,20 @@ jobs:
       # unpinned still resolved jax==0.11.1). jax/jaxlib must be pinned
       # directly. Drop both pins once jax2onnx ships a fix for the newer jax
       # Var() signature.
+      # sentencepiece is pinned below 0.2.3 for a separate reason: 0.2.3's
+      # generated sentencepiece_model_pb2 was built with protobuf 7.36.1's
+      # protoc, but something in this install (jax/gemma/onnx) keeps
+      # protobuf at 6.x (6.33.6 observed), and protobuf refuses to load
+      # gencode newer than its runtime ("VersionError: Detected incompatible
+      # Protobuf Gencode/Runtime versions when loading
+      # sentencepiece_model.proto: gencode 7.36.1 runtime 6.33.6") -- which
+      # broke gemma's tokenizer import in test_jax_export_gemma_dummy_model.
+      # 0.2.2 loads fine against protobuf 6.33.6. Drop this pin once
+      # protobuf 7 is what the rest of the install resolves to.
       - name: Install onnxsim wheel + jax2onnx + transformers (Flax models) + gemma
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest jax2onnx "transformers<5" "gemma==3.3.0" "jax<0.11" "jaxlib<0.11"
+          python -m pip install pytest jax2onnx "transformers<5" "gemma==3.3.0" "jax<0.11" "jaxlib<0.11" "sentencepiece<0.2.3"
           python -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
