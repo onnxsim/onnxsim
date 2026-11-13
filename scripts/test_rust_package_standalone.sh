@@ -85,7 +85,9 @@ if [ "$LIB_DIR" = "auto" ]; then
       build_root="$candidate"
       break
     fi
-  done < <(find "$RUST_DIR/target" -type d -path '*/onnxsim-sys-*/out/build' 2>/dev/null)
+  # Match both cargo layouts: older releases use build/onnxsim-sys-<hash>/out,
+  # newer ones build/onnxsim-sys/<hash>/out.
+  done < <(find "$RUST_DIR/target" -type d -path '*/onnxsim-sys*/out/build' 2>/dev/null)
 
   if [ -z "$build_root" ]; then
     echo "error: --lib-dir auto found no built onnxsim_c under $RUST_DIR/target;" >&2
