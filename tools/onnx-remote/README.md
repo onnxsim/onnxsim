@@ -164,6 +164,60 @@ The positional values are the first input; repeat `--input VALUES[@D0,D1]`
 for additional model inputs. Output shapes, values, and profile events are
 printed.
 
+### OpenVINO worker (compile and profiling)
+
+`onnx-remote-openvino-worker` runs serialized ONNX graphs through the
+OpenVINO runtime on a chosen device (`CPU`, `GPU` or `NPU`). It uses the same
+v5 transport and the same `subgraph`/`onnx` operations as the ORT worker, and
+adds an explicit compile step and profiling:
+
+* `compile` or `compile:DEVICE` compiles the graph in `Request::model` and
+  returns a self-describing artifact (`Response::artifact`), an `artifact_id`,
+  and a JSON manifest with the compile time, blob size, and the input/output
+  names, types and shapes. The bare form uses the worker's `--device`.
+* `load_compiled` imports an artifact into the worker's cache.
+* `run_compiled` runs an artifact by `artifact_id`. The artifact bytes are only
+  needed on first use or after the worker restarts.
+* `subgraph` / `onnx` compile (with a cache) and run in one request.
+* `capabilities` reports `runner_id` (`openvino-<device>`), the available
+  devices, and `graph_execution:true`.
+
+Profiling follows the request's level: `summary` reports `ov_infer`
+(plus `ov_cache_hit` when the compiled model was reused); `detailed` also emits
+one `openvino_node` event per OpenVINO node from `get_profiling_info()`. Node
+events carry real time and execution type, but OpenVINO exposes no per-node
+start times, so their `start_us` values are cumulative sums (a layout, not a
+measured timeline). Artifacts are always compiled with profiling enabled
+because the NPU plugin can only report per-node profiles from such a blob.
+
+Build it against an OpenVINO runtime (for example the C++ headers and
+`libopenvino.so` shipped in the `openvino` pip wheel):
+
+```sh
+cmake -S tools/onnx-remote -B build/openvino-worker \
+  -DONNXSIM_REMOTE_OPENVINO_WORKER=ON \
+  -DONNXSIM_OPENVINO_INCLUDE_DIR=/path/to/openvino/include \
+  -DONNXSIM_OPENVINO_LIBRARY=/path/to/openvino/libs/libopenvino.so
+cmake --build build/openvino-worker --target onnx-remote-openvino-worker \
+  onnx-remote-openvino-worker-test
+```
+
+Run one worker per device and check it with the self-test, which takes a
+float32 model and an input shape (default `1,512`):
+
+```sh
+onnx-remote-openvino-worker --port 39504 --device GPU &
+onnx-remote-openvino-worker-test MODEL.onnx 39504 1,512
+```
+
+The self-test checks that `capabilities` advertises the three compile
+operations, that `run_compiled` matches `subgraph` output on the same device,
+that a second run without artifact bytes reports `ov_cache_hit`, and that
+detailed profiling returns `ov_infer` and `openvino_node` events. It has been
+run on Intel Core 3 304 (Wildcat Lake) with OpenVINO 2026.4.1 for CPU, GPU and
+NPU (`Intel(R) AI Boost`). The NPU needs the Intel NPU driver packages
+installed on the host.
+
 ## TensorRT worker (Jetson / NVIDIA GPU)
 
 `onnx-remote-tensorrt-worker` runs graphs on TensorRT. It speaks the same wire format as
