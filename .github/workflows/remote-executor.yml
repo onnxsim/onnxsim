@@ -65,16 +65,29 @@ jobs:
       - name: Compiled artifact attach smoke test
         run: |
           cache_dir="${RUNNER_TEMP}/mock-runner-cache"
-          build/onnx-remote/onnx-remote-mock-runner --port 39510 --cache-dir "$cache_dir" >"${RUNNER_TEMP}/mock-runner.log" 2>&1 &
+          mock_log="${RUNNER_TEMP}/mock-runner.log"
+          # Wait for the listener instead of sleeping a fixed time, so a slow
+          # runner cannot make the attach test race the mock runner's bind.
+          wait_for_mock() {
+            for attempt in $(seq 1 50); do
+              if ! kill -0 "$mock_pid" 2>/dev/null; then
+                echo "mock runner exited early:"; cat "$mock_log"; exit 1
+              fi
+              (exec 3<>"/dev/tcp/127.0.0.1/39510") 2>/dev/null && { exec 3>&-; return 0; }
+              sleep 0.1
+            done
+            echo "mock runner never became ready:"; cat "$mock_log"; exit 1
+          }
+          build/onnx-remote/onnx-remote-mock-runner --port 39510 --cache-dir "$cache_dir" >"$mock_log" 2>&1 &
           mock_pid=$!
           trap 'kill "$mock_pid" 2>/dev/null || true' EXIT
-          sleep 0.2
+          wait_for_mock
           build/onnx-remote/onnx-remote-attach-test 127.0.0.1 39510
           kill "$mock_pid"
           wait "$mock_pid" 2>/dev/null || true
-          build/onnx-remote/onnx-remote-mock-runner --port 39510 --cache-dir "$cache_dir" >>"${RUNNER_TEMP}/mock-runner.log" 2>&1 &
+          build/onnx-remote/onnx-remote-mock-runner --port 39510 --cache-dir "$cache_dir" >>"$mock_log" 2>&1 &
           mock_pid=$!
-          sleep 0.2
+          wait_for_mock
           build/onnx-remote/onnx-remote-attach-test 127.0.0.1 39510 --run-only
       - name: Compiler service cache smoke test
         run: |
