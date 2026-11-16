@@ -26,6 +26,16 @@ set(ONNXSIM_ORT_WORKER_INCLUDE_DIR "" CACHE PATH
     "ONNX Runtime public include directory for the ORT worker")
 set(ONNXSIM_ORT_WORKER_LIBRARY "" CACHE FILEPATH
     "ONNX Runtime library for the ORT worker")
+option(ONNXSIM_REMOTE_OPENVINO_WORKER
+       "Build the optional OpenVINO worker (subgraph, compile, profiling)" OFF)
+set(ONNXSIM_OPENVINO_INCLUDE_DIR "" CACHE PATH
+    "OpenVINO C++ include directory (contains openvino/openvino.hpp)")
+set(ONNXSIM_OPENVINO_LIBRARY "" CACHE FILEPATH
+    "OpenVINO runtime library (libopenvino.so) for the OpenVINO worker")
+set(ONNXSIM_ORT_WORKER_INCLUDE_DIR "" CACHE PATH
+    "ONNX Runtime public include directory for the ORT worker")
+set(ONNXSIM_ORT_WORKER_LIBRARY "" CACHE FILEPATH
+    "ONNX Runtime library for the ORT worker")
 set(ONNXSIM_ORT_PUBLIC_INCLUDE_DIR "" CACHE PATH
     "ONNX Runtime public include directory for the OrtEp plugin")
 set(ONNXSIM_ORT_PUBLIC_LIBRARY "" CACHE FILEPATH
@@ -148,6 +158,25 @@ if (ONNXSIM_REMOTE_TENSORRT_WORKER)
                           CUDA::cudart)
     install(TARGETS ${target} RUNTIME DESTINATION bin)
   endforeach()
+endif()
+
+if (ONNXSIM_REMOTE_OPENVINO_WORKER)
+  if (NOT ONNXSIM_OPENVINO_INCLUDE_DIR OR
+      NOT EXISTS "${ONNXSIM_OPENVINO_INCLUDE_DIR}/openvino/openvino.hpp" OR
+      NOT ONNXSIM_OPENVINO_LIBRARY)
+    message(FATAL_ERROR
+      "ONNXSIM_REMOTE_OPENVINO_WORKER requires ONNXSIM_OPENVINO_INCLUDE_DIR "
+      "(containing openvino/openvino.hpp) and ONNXSIM_OPENVINO_LIBRARY")
+  endif()
+  add_executable(onnx-remote-openvino-worker remote_openvino_worker.cpp)
+  target_include_directories(onnx-remote-openvino-worker PRIVATE
+                             ${ONNXSIM_OPENVINO_INCLUDE_DIR})
+  target_link_libraries(onnx-remote-openvino-worker PRIVATE
+                        onnx_remote_transport ${ONNXSIM_OPENVINO_LIBRARY})
+  add_executable(onnx-remote-openvino-worker-test remote_openvino_worker_test.cpp)
+  target_link_libraries(onnx-remote-openvino-worker-test PRIVATE onnx_remote_transport)
+  install(TARGETS onnx-remote-openvino-worker onnx-remote-openvino-worker-test
+          RUNTIME DESTINATION bin)
 endif()
 
 add_executable(onnx-remote-client remote_client.cpp)
