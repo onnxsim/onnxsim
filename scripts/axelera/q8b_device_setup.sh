@@ -136,7 +136,9 @@ if [[ "$SKIP_ONNXSIM" != 1 ]]; then
     WHEEL="$(ls -t "$WHEEL_DIR"/onnxsim-*.whl | head -1)"
     say "Installing $WHEEL into the SDK venv"
     "$SDK_PY" -m pip install --force-reinstall --no-deps "$WHEEL"
-    "$SDK_PY" -c "import axelera.compiler, onnxsim; print('axelera.compiler and onnxsim import OK')"
+    # Run from $HOME: from the repo root, `import onnxsim` picks up the source
+    # tree, which has no compiled extension.
+    (cd "$HOME" && "$SDK_PY" -c "import axelera.compiler, onnxsim; print('axelera.compiler and onnxsim import OK')")
     ccache -s | sed -n '1,4p'
 fi
 
