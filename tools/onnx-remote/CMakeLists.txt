@@ -322,6 +322,33 @@ if (ONNX_REMOTE_VIPLITE)
   install(TARGETS onnx-remote-viplite-worker RUNTIME DESTINATION bin)
 endif()
 
+# Axelera Metis worker: runs Voyager SDK artifacts through the SDK's axruntime C API.
+option(ONNXSIM_REMOTE_AXELERA_WORKER
+       "Build the Axelera Metis worker (Voyager SDK axruntime)" OFF)
+set(AXELERA_RUNTIME_INCLUDE_DIR "" CACHE PATH
+    "Directory containing axruntime/axruntime.h (SDK venv: axelera/include)")
+set(AXELERA_RUNTIME_LIBRARY "" CACHE FILEPATH
+    "libaxruntime.so from the Voyager SDK (SDK venv: axelera/lib)")
+if (ONNXSIM_REMOTE_AXELERA_WORKER)
+  if (NOT AXELERA_RUNTIME_INCLUDE_DIR OR
+      NOT EXISTS "${AXELERA_RUNTIME_INCLUDE_DIR}/axruntime/axruntime.h" OR
+      NOT AXELERA_RUNTIME_LIBRARY)
+    message(FATAL_ERROR
+      "ONNXSIM_REMOTE_AXELERA_WORKER requires AXELERA_RUNTIME_INCLUDE_DIR (containing "
+      "axruntime/axruntime.h) and AXELERA_RUNTIME_LIBRARY (libaxruntime.so)")
+  endif()
+  get_filename_component(AXELERA_RUNTIME_LIB_DIR "${AXELERA_RUNTIME_LIBRARY}" DIRECTORY)
+  add_executable(onnx-remote-axelera-worker remote_axelera_worker.cpp)
+  target_include_directories(onnx-remote-axelera-worker PRIVATE ${AXELERA_RUNTIME_INCLUDE_DIR})
+  target_link_libraries(onnx-remote-axelera-worker PRIVATE
+                        onnx_remote_transport ${AXELERA_RUNTIME_LIBRARY} Threads::Threads)
+  # Find libaxruntime.so at run time from the SDK tree, without LD_LIBRARY_PATH.
+  set_target_properties(onnx-remote-axelera-worker PROPERTIES
+                        BUILD_RPATH "${AXELERA_RUNTIME_LIB_DIR}"
+                        INSTALL_RPATH "${AXELERA_RUNTIME_LIB_DIR}")
+  install(TARGETS onnx-remote-axelera-worker RUNTIME DESTINATION bin)
+endif()
+
 if (ONNXSIM_REMOTE_DORA)
   if (NOT DORA_NODE_API_INCLUDE_DIR OR NOT DORA_NODE_API_LIBRARY)
     message(FATAL_ERROR
