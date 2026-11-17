@@ -221,3 +221,12 @@ warning to stderr if a future Voyager SDK release makes them diverge (as of
 this writing, support levels and constraints are identical across all four,
 so only opset 17 -- the compiler's own recommended default -- is captured
 in detail).
+
+## Real-device testing
+
+To run `tests/test_axelera_voyager_real_compiler.py` against a real Metis
+AIPU (tested on a Radxa Dragon Q8B), see
+[`docs/axelera-q8b-device-testing.md`](../../docs/axelera-q8b-device-testing.md).
+`q8b_device_setup.sh` in this directory automates the driver, SDK, and onnxsim
+wheel setup. It does not patch Voyager SDK source; the runbook lists the SDK
+workarounds needed on Ubuntu 26.04.
