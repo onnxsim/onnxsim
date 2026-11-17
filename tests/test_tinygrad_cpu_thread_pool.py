@@ -1,4 +1,5 @@
 """Check partition concurrency, argument isolation and runtime restoration."""
+
 import importlib.util
 from pathlib import Path
 import shutil
@@ -9,7 +10,9 @@ from unittest.mock import patch
 
 
 _spec = importlib.util.spec_from_file_location(
-    "cpu_thread_pool", Path(__file__).resolve().parents[1] / "scripts/tinygrad/cpu_thread_pool.py")
+    "cpu_thread_pool",
+    Path(__file__).resolve().parents[1] / "scripts/tinygrad/cpu_thread_pool.py",
+)
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 cpu_thread_pool = _module.cpu_thread_pool
@@ -19,6 +22,7 @@ cpu_thread_pool = _module.cpu_thread_pool
 class TestCPUThreadPool(unittest.TestCase):
     def setUp(self):
         from tinygrad.runtime.ops_cpu import CPUProgram
+
         self.program_type = CPUProgram
         self.env = patch.dict("os.environ", {"HCQ2": "0"})
         self.env.start()
@@ -36,7 +40,12 @@ class TestCPUThreadPool(unittest.TestCase):
         original = self.program_type.__call__
         with cpu_thread_pool(2):
             elapsed = self.program_type.__call__(
-                program, SimpleNamespace(va_addr=123), vals=(0,), global_size=(2, 1, 1), wait=True)
+                program,
+                SimpleNamespace(va_addr=123),
+                vals=(0,),
+                global_size=(2, 1, 1),
+                wait=True,
+            )
             self.assertEqual(sorted(completed), [(123, 0), (123, 1)])
             self.assertGreater(elapsed, 0)
         self.assertIs(self.program_type.__call__, original)
@@ -53,13 +62,23 @@ class TestCPUThreadPool(unittest.TestCase):
         self.assertIs(self.program_type.__call__, original)
 
     def test_lvp_and_single_partition_keep_original_runtime(self):
-        for lvp, runtimevars, size in [(True, {"core_id": 0}, 2),
-                                       (False, {}, 2), (False, {"core_id": 0}, 1)]:
+        for lvp, runtimevars, size in [
+            (True, {"core_id": 0}, 2),
+            (False, {}, 2),
+            (False, {"core_id": 0}, 1),
+        ]:
             with self.subTest(lvp=lvp, runtimevars=runtimevars, size=size):
-                with patch.object(self.program_type, "__call__", return_value="original") as original:
+                with patch.object(
+                    self.program_type, "__call__", return_value="original"
+                ) as original:
                     with cpu_thread_pool(2):
                         program = SimpleNamespace(lvp=lvp, runtimevars=runtimevars)
-                        self.assertEqual(self.program_type.__call__(program, global_size=(size, 1, 1)), "original")
+                        self.assertEqual(
+                            self.program_type.__call__(
+                                program, global_size=(size, 1, 1)
+                            ),
+                            "original",
+                        )
                         original.assert_called_once()
 
     def test_rejects_hcq2(self):
@@ -75,9 +94,12 @@ class TestCPUThreadPool(unittest.TestCase):
         from tinygrad.helpers import Context
 
         with Context(DEV="CPU", NUM_CPU_THREADS=4, BEAM=0):
-            weight = Tensor((np.arange(512 * 2048).reshape(512, 2048) % 17).astype(np.float32) * .002).realize()
-            base = np.arange(2048, dtype=np.float32).reshape(1, 2048) * .001
-            inputs = [Tensor(value).realize() for value in (base, base * .5, -base)]
+            weight = Tensor(
+                (np.arange(512 * 2048).reshape(512, 2048) % 17).astype(np.float32)
+                * 0.002
+            ).realize()
+            base = np.arange(2048, dtype=np.float32).reshape(1, 2048) * 0.001
+            inputs = [Tensor(value).realize() for value in (base, base * 0.5, -base)]
             x = inputs[0]
 
             @TinyJit
