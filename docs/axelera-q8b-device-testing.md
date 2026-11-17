@@ -82,8 +82,9 @@ export CCACHE_DIR=$HOME/.cache/ccache
 ~/voyager-sdk/venv_1.9.0/bin/python3 -m pip install --force-reinstall --no-deps ~/wheels/onnxsim-*.whl
 ```
 
-Cold build: 7m08s on 8 cores, ccache hit rate 4% (26 / 622). Expect much higher
-hit rates on rebuilds.
+Cold build: 7m08s on 8 cores, ccache hit rate 4% (26 / 622). A later build from
+a fresh clone took 57s, but its ccache log showed 11 cacheable calls and 0 hits,
+so the speedup is not explained by ccache. Not investigated further.
 
 Two build failures on this host and their causes:
 
@@ -101,8 +102,10 @@ Two build failures on this host and their causes:
 ```bash
 source ~/voyager-sdk/venv_1.9.0/bin/activate
 cd <onnxsim checkout>
-python -m pytest tests/test_axelera_voyager_real_compiler.py -v
-python -m pytest tests/test_axelera_legalize.py tests/test_axelera_voyager_op_support.py tests/test_voyager_sdk_patterns.py -q
+# Use `pytest`, not `python -m pytest`: -m puts the repo root on sys.path,
+# so `import onnxsim` loads the source tree (no compiled extension) and fails.
+pytest tests/test_axelera_voyager_real_compiler.py -v
+pytest tests/test_axelera_legalize.py tests/test_axelera_voyager_op_support.py tests/test_voyager_sdk_patterns.py -q
 ```
 
 Results on this board, with the wheel from step 3:

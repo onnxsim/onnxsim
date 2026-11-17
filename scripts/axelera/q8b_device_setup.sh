@@ -144,4 +144,6 @@ fi
 
 say "Done. Run the device tests with the SDK venv active:"
 echo "  source $VOYAGER_DIR/venv_\$(cat $VOYAGER_DIR/VERSION.TXT)/bin/activate"
-echo "  cd $REPO_DIR && python -m pytest tests/test_axelera_voyager_real_compiler.py -v"
+# Use the pytest entry point, not `python -m pytest`: -m puts the cwd (the repo
+# root) on sys.path, so `import onnxsim` loads the source tree.
+echo "  cd $REPO_DIR && pytest tests/test_axelera_voyager_real_compiler.py -v"
