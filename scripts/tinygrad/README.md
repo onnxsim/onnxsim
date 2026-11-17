@@ -3,6 +3,8 @@
 For GGUF language models, `bench_llm.py` compares lazy and unpack-once
 weights with synchronized greedy decoding. See the
 [Q8B Qwen3-1.7B results and reproduction steps](results/q8b/llm/README.md).
+The [parallel CPU follow-up](results/q8b/llm/tune2/README.md) adds an opt-in
+native partition dispatcher and generation-only BEAM tuning.
 
 For a direct tuning pass over an existing static float32 ONNX model, without an
 RPC server or an onnxsim build:
