@@ -1,0 +1,8 @@
+{
+  "target": "CPU:LLVM",
+  "tinygrad_commit": "6f87158d77f66a36d5f8bbe915170b24e2acabe8",
+  "realize": true,
+  "threads": 8,
+  "status": "failed before generation",
+  "error": "RuntimeError: UOp verification failed at 20 on Ops.AFTER dtypes.float 2 [(Ops.CAST, dtypes.float, dtypes.float), (Ops.RANGE, dtypes.int, (1, AxisType.WEAK))] None"
+}

@@ -1,0 +1,12 @@
+{
+  "capital_prompt": {
+    "generated_tokens_match": true,
+    "tokens_checked": 15,
+    "speedup": 4.2675697700490485
+  },
+  "arithmetic_prompt": {
+    "generated_tokens_match": true,
+    "tokens_checked": 9,
+    "speedup": 4.272477754375243
+  }
+}

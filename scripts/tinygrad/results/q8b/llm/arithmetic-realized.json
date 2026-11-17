@@ -1,0 +1,59 @@
+{
+  "model": "/home/radxa/tinygrad-opt/llm/Qwen3-1.7B-Q4_K_M.gguf",
+  "model_name": "Qwen3-1.7B",
+  "model_bytes": 1107409472,
+  "tinygrad": "0.14.0",
+  "device": "CPU",
+  "target": "CPU::arm64,native",
+  "threads": 8,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "realize": true,
+  "beam": "0",
+  "half": "1",
+  "context": 256,
+  "prompt": "1 + 1 =",
+  "prompt_tokens": [
+    16,
+    488,
+    220,
+    16,
+    284
+  ],
+  "generated_tokens": [
+    220,
+    17,
+    11,
+    220,
+    17,
+    488,
+    220,
+    16,
+    284
+  ],
+  "text": " 2, 2 + 1 =",
+  "load_s": 8.52469145699797,
+  "first_token_s": 6.214697576000617,
+  "warmup": 3,
+  "decode_samples_s": [
+    0.5123533869991661,
+    0.5120408050024707,
+    0.5124648459968739,
+    0.5119823250024638,
+    0.5148292459998629,
+    0.5135354180019931
+  ],
+  "median_decode_s": 0.51240911649802,
+  "tokens_per_second": 1.949820696875452,
+  "peak_rss_kib": 4695080,
+  "tinygrad_allocated_bytes": 3472381992,
+  "timing": "greedy generation with synchronization, excluding first warmup tokens"
+}

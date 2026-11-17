@@ -1,0 +1,9 @@
+{
+  "repo": "unsloth/Qwen3-1.7B-GGUF",
+  "revision": "d7f544eead698dbd1f15126ef60b45a1e1933222",
+  "file": "Qwen3-1.7B-Q4_K_M.gguf",
+  "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+  "bytes": 1107409472,
+  "tinygrad_tag": "v0.14.0",
+  "tinygrad_commit": "6f87158d77f66a36d5f8bbe915170b24e2acabe8"
+}
