@@ -236,8 +236,17 @@ the same `load_compiled` / `run_compiled` handshake as the viplite worker, so a
   `(q - zero_point) * scale`. This is the contract in the SDK's runtime docs.
   When the model's `input_tensor_layout` is `NHWC`, rank-4 NCHW tensors are
   transposed in and out.
-* Profiling (`--profile`) reports `axelera_load`, `axelera_quantize`,
-  `axelera_device_run`, and `axelera_dequantize` events.
+* Profiling: every level reports `axelera_load`, `axelera_quantize`,
+  `axelera_device_run`, and `axelera_dequantize`. The detailed level
+  (`--profile`) also reports `axelera_host_prep`, `axelera_host_input`,
+  `axelera_host_kernel`, and `axelera_host_output`, taken from the SDK runtime's
+  host trace (one line per frame, in nanoseconds). The worker turns on host
+  tracing when it loads a model, and writes the trace to
+  `--cache-dir/host_trace.log`, truncated at 64 MiB. Device runs are serialized,
+  so each trace line belongs to one request.
+* Device-side per-kernel profiling isn't exposed: the SDK's `device_profiling`
+  flag had no visible effect on the tested Metis M.2 board with SDK 1.9.0, so
+  `axelera_device_run` is the wall time of the device call.
 
 Models with host-side preamble or postamble graphs are rejected, because this
 worker does not run ONNX graphs on the host. A worker call with the wrong input

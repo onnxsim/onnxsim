@@ -59,6 +59,13 @@ std::string g_cache_dir;
 std::string g_manifest;          // capabilities document, built once at startup
 axrContext* g_ctx = nullptr;
 
+// Host trace written by the SDK runtime (AXE_LZ_PERF_LOG_PATH, set in main): one line per frame, appended before
+// axr_run_model_instance returns. Runs are serialized under g_run_mu so each new line belongs to exactly one request.
+std::string g_trace_path;
+uint64_t g_trace_offset = 0;
+std::mutex g_run_mu;
+constexpr uintmax_t kTraceMaxBytes = 64ull << 20;  // truncate the trace past this size; the runtime appends from 0 again
+
 uint64_t now_us() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -161,13 +168,91 @@ std::vector<T> permute(const std::vector<T>& src, const std::vector<size_t>& sha
   return out;
 }
 
+// One frame's host-side timing, as the runtime reports it: all fields are nanoseconds, beg on the monotonic clock.
+// Stages run back to back in this order, so prep + inp + krn + out is tot (within a few microseconds).
+struct HostTrace {
+  uint64_t beg_ns = 0, prep_ns = 0, inp_ns = 0, krn_ns = 0, out_ns = 0, tot_ns = 0;
+};
+
+// Parses "[T] idx:0:00000001 beg:<hex> prep:<hex> inp:<hex> krn:<hex> out:<hex> tot:<hex>".
+bool parse_host_trace(const std::string& line, HostTrace& t) {
+  std::istringstream in(line);
+  std::string tok;
+  int found = 0;
+  while (in >> tok) {
+    const size_t colon = tok.find(':');
+    if (colon == std::string::npos) continue;
+    const std::string key = tok.substr(0, colon);
+    uint64_t* dst = nullptr;
+    if (key == "beg") dst = &t.beg_ns;
+    else if (key == "prep") dst = &t.prep_ns;
+    else if (key == "inp") dst = &t.inp_ns;
+    else if (key == "krn") dst = &t.krn_ns;
+    else if (key == "out") dst = &t.out_ns;
+    else if (key == "tot") dst = &t.tot_ns;
+    if (!dst) continue;
+    try {
+      *dst = std::stoull(tok.substr(colon + 1), nullptr, 16);
+    } catch (const std::exception&) {
+      return false;
+    }
+    ++found;
+  }
+  return found == 6;
+}
+
+// Returns the complete trace lines appended since the last call and advances the offset past them. Caller holds g_run_mu.
+std::vector<HostTrace> read_new_host_trace() {
+  std::vector<HostTrace> rows;
+  std::error_code ec;
+  const auto size = fs::file_size(g_trace_path, ec);
+  if (ec) return rows;  // no trace yet (runtime writes it on the first run)
+  if (size < g_trace_offset) g_trace_offset = 0;  // the file was truncated outside this process
+  if (size <= g_trace_offset) return rows;
+  std::ifstream f(g_trace_path, std::ios::binary);
+  f.seekg(static_cast<std::streamoff>(g_trace_offset));
+  std::string chunk(static_cast<size_t>(size - g_trace_offset), '\0');
+  f.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+  chunk.resize(static_cast<size_t>(f.gcount()));
+  const size_t last_nl = chunk.rfind('\n');
+  if (last_nl == std::string::npos) return rows;  // a partial line; read it once it is complete
+  std::istringstream lines(chunk.substr(0, last_nl));
+  for (std::string line; std::getline(lines, line);) {
+    HostTrace t;
+    if (parse_host_trace(line, t)) rows.push_back(t);
+  }
+  g_trace_offset += last_nl + 1;
+  if (size > static_cast<uintmax_t>(kTraceMaxBytes)) {  // bound the file; the runtime keeps appending from offset 0
+    fs::resize_file(g_trace_path, 0, ec);
+    g_trace_offset = 0;
+  }
+  return rows;
+}
+
+// Emits the host stages of one frame as profile events, positioned on the request's timeline (t0 is the request start).
+void add_host_stages(Response& r, const Request& req, uint64_t t0, const HostTrace& t) {
+  if (req.profiling != ProfilingLevel::Detailed) return;
+  auto rel_us = [t0](uint64_t ns) { const uint64_t us = ns / 1000; return us > t0 ? us - t0 : 0; };
+  const uint64_t b = t.beg_ns;
+  const struct {
+    const char* name;
+    uint64_t start_ns, dur_ns;
+  } stages[] = {
+      {"axelera_host_prep", b, t.prep_ns},
+      {"axelera_host_input", b + t.prep_ns, t.inp_ns},
+      {"axelera_host_kernel", b + t.prep_ns + t.inp_ns, t.krn_ns},
+      {"axelera_host_output", b + t.prep_ns + t.inp_ns + t.krn_ns, t.out_ns},
+  };
+  for (const auto& s : stages)
+    r.profile.push_back(ProfileEvent{s.name, "axelera", rel_us(s.start_ns), s.dur_ns / 1000, "host trace"});
+}
+
 struct Net {
   axrModel* model = nullptr;
   axrConnection* connection = nullptr;
   axrModelInstance* instance = nullptr;
   std::vector<axrTensorInfo> inputs, outputs;
   bool nhwc = false;
-  std::mutex mu;  // one frame at a time per model instance
 
   ~Net() {
     if (instance) axr_destroy(as_object(instance));
@@ -227,7 +312,8 @@ bool load(const std::string& id, const std::vector<uint8_t>& artifact, Response&
 
   net->connection = axr_device_connect(g_ctx, nullptr, 1, nullptr);
   if (!net->connection) { response.error = "axr_device_connect: " + last_error(as_object(g_ctx)); return false; }
-  axrProperties* ip = axr_create_properties(g_ctx, "aipu_cores=1\nnum_sub_devices=1\n");
+  // host_profiling makes the runtime append one trace line per frame (see read_new_host_trace).
+  axrProperties* ip = axr_create_properties(g_ctx, "aipu_cores=1\nnum_sub_devices=1\nhost_profiling=1\n");
   net->instance = axr_load_model_instance(net->connection, net->model, ip);
   axr_destroy(as_object(ip));
   if (!net->instance) { response.error = "axr_load_model_instance: " + last_error(as_object(net->connection)); return false; }
@@ -338,8 +424,6 @@ Response run(const Request& request, const std::shared_ptr<Net>& net_ptr, Respon
                      std::to_string(net.inputs.size());
     return response;
   }
-  std::lock_guard<std::mutex> lk(net.mu);
-
   const uint64_t q_begin = now_us() - t0;
   std::vector<std::vector<uint8_t>> in_bufs(net.inputs.size());
   std::vector<axrArgument> in_args(net.inputs.size());
@@ -360,14 +444,21 @@ Response run(const Request& request, const std::shared_ptr<Net>& net_ptr, Respon
     out_args[i].size = out_bufs[i].size();
   }
 
-  const uint64_t run_begin = now_us() - t0;
-  const axrResult r = axr_run_model_instance(net.instance, in_args.data(), in_args.size(), out_args.data(), out_args.size());
-  if (r != AXR_SUCCESS) {
-    response.error = std::string("axr_run_model_instance: ") + axr_error_string(r) + ": " +
-                     last_error(as_object(net.instance));
-    return response;
+  std::vector<HostTrace> trace;
+  {
+    std::lock_guard<std::mutex> run_lk(g_run_mu);
+    const uint64_t run_begin = now_us() - t0;
+    const axrResult r = axr_run_model_instance(net.instance, in_args.data(), in_args.size(), out_args.data(), out_args.size());
+    if (r != AXR_SUCCESS) {
+      response.error = std::string("axr_run_model_instance: ") + axr_error_string(r) + ": " +
+                       last_error(as_object(net.instance));
+      return response;
+    }
+    add_profile(response, request, "axelera_device_run", run_begin, now_us() - t0 - run_begin, "");
+    trace = read_new_host_trace();
   }
-  add_profile(response, request, "axelera_device_run", run_begin, now_us() - t0 - run_begin, "");
+  // One line per frame; this request ran one frame, so take the newest line if the trace has any.
+  if (!trace.empty()) add_host_stages(response, request, t0, trace.back());
 
   const uint64_t d_begin = now_us() - t0;
   response.outputs.resize(net.outputs.size());
@@ -475,6 +566,15 @@ int main(int argc, char** argv) {
     }
   }
   std::signal(SIGPIPE, SIG_IGN);
+
+  // Host trace: the runtime reads these when it starts. The file is per worker process, so start it empty.
+  std::error_code ec;
+  fs::create_directories(g_cache_dir, ec);
+  g_trace_path = g_cache_dir + "/host_trace.log";
+  fs::remove(g_trace_path, ec);
+  g_trace_offset = 0;
+  setenv("AXE_LZ_PERF_LOG_PATH", g_trace_path.c_str(), 1);
+  setenv("AXE_PROFILING_CONFIG", "HOST_TEMPLATE", 1);
 
   g_ctx = axr_create_context();
   if (!g_ctx) { std::cerr << "axr_create_context failed\n"; return 1; }
