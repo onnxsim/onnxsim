@@ -1,13 +1,12 @@
 """Check partition concurrency, argument isolation and runtime restoration."""
 
 import importlib.util
-from pathlib import Path
 import shutil
 import threading
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
-
 
 _spec = importlib.util.spec_from_file_location(
     "cpu_thread_pool",
