@@ -63,7 +63,8 @@ if [[ "$SKIP_DRIVER" != 1 ]]; then
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y metis-dkms
     sudo modprobe metis
 
-    if ! lsmod | grep -q '^metis '; then
+    # Not `grep -q`: with pipefail, grep exiting early SIGPIPEs lsmod (rc 141).
+    if ! lsmod | grep '^metis ' >/dev/null; then
         die "metis module did not load; check 'sudo dmesg | grep -i metis'"
     fi
     say "Metis driver $(cat /sys/class/metis/version 2>/dev/null || echo '?') loaded"
@@ -72,7 +73,7 @@ if [[ "$SKIP_DRIVER" != 1 ]]; then
     # Re-trigger so existing nodes get the axelera group, then add this user.
     sudo udevadm trigger --subsystem-match=metis --action=add || true
     sudo usermod -aG axelera "${USER:-$(id -un)}" || true
-    if ! ls -l /dev/metis-* 2>/dev/null | grep -q axelera; then
+    if ! ls -l /dev/metis-* 2>/dev/null | grep axelera >/dev/null; then
         echo "WARNING: /dev/metis-* is not group 'axelera' yet. Reboot, or run:" >&2
         echo "  sudo chgrp axelera /dev/metis-*-*-* && sudo chmod 660 /dev/metis-*-*-*" >&2
     fi
