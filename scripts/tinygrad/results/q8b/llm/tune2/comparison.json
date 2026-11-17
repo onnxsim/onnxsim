@@ -1,0 +1,17 @@
+{
+  "capital_prompt": {
+    "baseline_tokens_per_second": 1.9522210493367653,
+    "threaded_tokens_per_second": 3.2365392128935953,
+    "speedup": 1.6578753794265029,
+    "generated_tokens_match": true,
+    "tokens_checked": 33
+  },
+  "arithmetic_prompt": {
+    "baseline_tokens_per_second": 1.957059401632779,
+    "threaded_tokens_per_second": 3.1799053410204388,
+    "speedup": 1.624838437896896,
+    "generated_tokens_match": true,
+    "tokens_checked": 33
+  },
+  "allocated_bytes_both_modes": 3472381992
+}

@@ -5,6 +5,7 @@ Example: DEV=CPU NUM_CPU_THREADS=8 python bench_llm.py model.gguf --json run.jso
 Use --realize to unpack weights once, trading resident memory for decode work.
 """
 import argparse
+from contextlib import nullcontext
 import importlib.metadata
 import json
 import os
@@ -22,18 +23,34 @@ def main():
     parser.add_argument("--tokens", type=int, default=12)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--realize", action="store_true")
+    parser.add_argument("--decode-beam", type=int, default=None,
+                        help="override BEAM after loading weights, for generation only")
+    parser.add_argument("--cpu-workers", type=int, default=0,
+                        help="opt in to parallel native CPU partition dispatch")
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
     if args.tokens < 1 or args.warmup < 0:
         parser.error("--tokens must be positive and --warmup must be nonnegative")
     if args.context < 1:
         parser.error("--context must be positive")
+    if args.decode_beam is not None and args.decode_beam < 0:
+        parser.error("--decode-beam must be nonnegative")
+    if args.cpu_workers < 0:
+        parser.error("--cpu-workers must be nonnegative")
+    if args.cpu_workers and os.environ.get("HCQ2", "0") not in ("", "0"):
+        parser.error("--cpu-workers requires the synchronous runtime (HCQ2=0)")
 
     from tinygrad import Device, Tensor
-    from tinygrad.helpers import NUM_CPU_THREADS, GlobalCounters
+    from tinygrad.helpers import BEAM, NUM_CPU_THREADS, Context, GlobalCounters
     from tinygrad.llm.cli import SimpleTokenizer
     from tinygrad.llm.model import Transformer
 
+    runtime = nullcontext()
+    if args.cpu_workers:
+        if Device.DEFAULT != "CPU":
+            parser.error("--cpu-workers requires DEV=CPU")
+        from cpu_thread_pool import cpu_thread_pool
+        runtime = cpu_thread_pool(args.cpu_workers)
     Tensor.manual_seed(42)
     start = time.perf_counter()
     model, metadata = Transformer.from_gguf(args.model, args.context, realize=args.realize)
@@ -47,22 +64,25 @@ def main():
         parser.error("prompt and generated tokens must fit the model's effective context")
     generator = model.generate(prompt.copy(), temperature=0.0)
     generated, times = [], []
-    for index in range(args.warmup + args.tokens):
-        start = time.perf_counter()
-        token = next(generator)
-        Device[Device.DEFAULT].synchronize()
-        elapsed = time.perf_counter() - start
-        generated.append(token)
-        times.append(elapsed)
-        print(json.dumps(dict(step=index, token=token, seconds=elapsed,
-                              text=tokenizer.decode([token]))), flush=True)
+    decode_beam = BEAM.value if args.decode_beam is None else args.decode_beam
+    with runtime, Context(BEAM=decode_beam):
+        for index in range(args.warmup + args.tokens):
+            start = time.perf_counter()
+            token = next(generator)
+            Device[Device.DEFAULT].synchronize()
+            elapsed = time.perf_counter() - start
+            generated.append(token)
+            times.append(elapsed)
+            print(json.dumps(dict(step=index, token=token, seconds=elapsed,
+                                  text=tokenizer.decode([token]))), flush=True)
     measured = times[args.warmup:]
     result = dict(model=str(args.model.resolve()), model_name=metadata.get("general.name"),
                   model_bytes=args.model.stat().st_size, tinygrad=importlib.metadata.version("tinygrad"),
                   device=Device.DEFAULT, target=str(Device[Device.DEFAULT].renderer.target),
-                  threads=NUM_CPU_THREADS.value,
+                  threads=NUM_CPU_THREADS.value, cpu_workers=args.cpu_workers,
                   affinity=sorted(os.sched_getaffinity(0)), realize=args.realize,
-                  beam=os.environ.get("BEAM", "0"), half=os.environ.get("HALF", "1"),
+                  beam=str(decode_beam), load_beam=BEAM.value, half=os.environ.get("HALF", "1"),
+                  cache_db=os.environ.get("CACHEDB"),
                   context=model.max_context, prompt=args.prompt, prompt_tokens=prompt,
                   generated_tokens=generated, text=tokenizer.decode(generated),
                   load_s=load_s, first_token_s=times[0], warmup=args.warmup,
