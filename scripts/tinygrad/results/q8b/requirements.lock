@@ -1,0 +1,9 @@
+flatbuffers==25.12.19
+ml-dtypes==0.7.0
+numpy==2.5.5
+onnx==1.23.2
+onnxruntime==1.32.0
+packaging==26.3
+protobuf==7.36.2
+tinygrad==0.14.0
+typing-extensions==4.16.0

@@ -1,5 +1,22 @@
 # Benchmarking tinygrad's code generation through an onnxsim RPC server
 
+For a direct tuning pass over an existing static float32 ONNX model, without an
+RPC server or an onnxsim build:
+
+```sh
+python -m pip install tinygrad onnxruntime numpy
+python scripts/tinygrad/tune_onnx.py model.onnx --device CPU --beam 0,2 --json results.json
+```
+
+The CPU backend needs Clang/LLVM. Each BEAM setting runs in a fresh process;
+three distinct random inputs check both initial execution and TinyJit replay
+against ONNX Runtime (`rtol=atol=1e-4`). The script records 30 synchronized
+replay samples with inputs already on the device. Compilation/search and
+host input/output copies are excluded. The single-thread ORT comparison uses
+host arrays, so the two columns measure different execution boundaries.
+Unsupported models, correctness failures, and timeouts are recorded as errors
+and cause a nonzero exit status. Search has a 600-second timeout per setting.
+
 `bench_codegen_rpc.py` is an RPC *client*. The server (see `docs/rpc.md`) runs on the machine whose
 hardware you want to measure, with tinygrad installed, and runs each ONNX workload with onnxruntime
 and with tinygrad on a chosen device and codegen setting. The client reports correctness against
