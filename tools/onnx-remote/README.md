@@ -249,7 +249,10 @@ the same `load_compiled` / `run_compiled` handshake as the viplite worker, so a
   does issue its usual command-list calls. This was measured by interposing the
   exported `zeCommandList*`, `zeCommandQueue*`, and `zeEvent*` entry points on the
   tested Metis M.2 board with SDK 1.9.0, so `axelera_device_run` is the wall time
-  of the device call.
+  of the device call. The Level Zero tools API (metric groups, tracer, kernel
+  profile info, command-list metric queries) is also unavailable: the SDK's
+  `zet*ProcAddrTable` calls succeed, but every function pointer in those tables
+  is null on this driver.
 
 Models with host-side preamble or postamble graphs are rejected, because this
 worker does not run ONNX graphs on the host. A worker call with the wrong input
