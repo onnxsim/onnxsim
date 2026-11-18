@@ -244,9 +244,12 @@ the same `load_compiled` / `run_compiled` handshake as the viplite worker, so a
   tracing when it loads a model, and writes the trace to
   `--cache-dir/host_trace.log`, truncated at 64 MiB. Device runs are serialized,
   so each trace line belongs to one request.
-* Device-side per-kernel profiling isn't exposed: the SDK's `device_profiling`
-  flag had no visible effect on the tested Metis M.2 board with SDK 1.9.0, so
-  `axelera_device_run` is the wall time of the device call.
+* Device-side per-kernel profiling isn't exposed: with `device_profiling=1` the
+  SDK runtime issues no Level Zero timestamp or kernel-profile calls, while it
+  does issue its usual command-list calls. This was measured by interposing the
+  exported `zeCommandList*`, `zeCommandQueue*`, and `zeEvent*` entry points on the
+  tested Metis M.2 board with SDK 1.9.0, so `axelera_device_run` is the wall time
+  of the device call.
 
 Models with host-side preamble or postamble graphs are rejected, because this
 worker does not run ONNX graphs on the host. A worker call with the wrong input
