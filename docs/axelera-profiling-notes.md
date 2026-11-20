@@ -121,6 +121,35 @@ compiled by the SDK at all (its graph cleaner treats it as preprocessing).
    lines instead. The SDK ships `aikernel_test_trace_kernel_simple`, which has the
    datapath and megakernel tracepoints, but no host-side runner executes it.
 
+## GEMM kernels
+
+Int8 GEMM, 1024x512x512 (537 M ops per call) unless noted. Kernel time is the
+median from the host trace; TOPS counts two operations per multiply-accumulate.
+
+| Implementation | Setting | Kernel us | TOPS |
+| --- | --- | --- | --- |
+| `axol` matmul (`mm_bench.py`) | 1 core | 2261 | 0.24 |
+| `axol` matmul | 2 cores (one kernel) | 1902 | 0.28 |
+| `axol` matmul | 4 cores (one kernel) | 1931 | 0.28 |
+| `axol` matmul, streamed | 1 instance, double buffer | 1118 per call | 0.48 |
+| `axol` matmul, streamed | 2 instances, double buffer | 631 per call | 0.85 |
+| `axol` matmul, streamed | 3 instances, double buffer | 538 per call | 1.00 |
+| GEMM as 1x1 conv (`gemm_as_conv.py`) | 1 core | 1450 | 0.37 |
+| GEMM as 1x1 conv, streamed (`conv_stream.py`) | 1 instance, double buffer | 784 per call | 0.68 |
+| GEMM as 1x1 conv, streamed | 3 instances, double buffer | 431 per call | 1.25 |
+| GEMM as 1x1 conv, M=2048 | 1 core | 2443 | 0.44 |
+| GEMM as 1x1 conv, M=2048, streamed | 3 instances, double buffer | 862 per call | 1.25 |
+
+- The `axol` matmul fails above M=1024: its L2 workspace needs 8 MiB against
+  about 7.7 MiB per context.
+- Four instances fail with `AXR_ERROR_CONNECTION_ERROR`. Multi-core connections
+  with one sub-device per instance work only up to three instances.
+- The best result is the 1x1 convolution form on three instances, about 1.25
+  TOPS. That's still under 1 percent of the 214 TOPS peak, and each core runs its
+  kernel at about 0.4 TOPS, so the remaining gap is in the compiled kernel
+  itself, not in the host. Reaching the peak would need kernels scheduled much
+  more densely than the SDK's generic path produces.
+
 ## Firmware trace (fwtrace) details
 
 - The driver exposes `/sys/kernel/debug/metis/<device>/fwtrace/{stats,enable}`.
