@@ -140,6 +140,12 @@ median from the host trace; TOPS counts two operations per multiply-accumulate.
 | GEMM as 1x1 conv, M=2048 | 1 core | 2443 | 0.44 |
 | GEMM as 1x1 conv, M=2048, streamed | 3 instances, double buffer | 862 per call | 1.25 |
 
+- Compiler pipelining knobs (`CompilerConfig`, GEMM as 1x1 conv, 1024x512x512):
+  `inter_operator_async=False` (default is True) gives about 1265 us on one core
+  (two builds: 1246 and 1285), against 1360 us with it on. Grouping IFD tasks
+  (`group_ifdw_tasks=True`) gives 1318 us, with no clear gain. Streamed with
+  double buffering, async off reaches 0.84 TOPS on one instance (0.68 before) and
+  1.24 TOPS on three, so the three-instance plateau is unchanged.
 - The `axol` matmul fails above M=1024: its L2 workspace needs 8 MiB against
   about 7.7 MiB per context.
 - Four instances fail with `AXR_ERROR_CONNECTION_ERROR`. Multi-core connections
