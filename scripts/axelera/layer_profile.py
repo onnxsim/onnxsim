@@ -17,6 +17,7 @@ Run with the Voyager SDK environment active:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import statistics
@@ -115,7 +116,6 @@ def main() -> int:
     ap.add_argument("--calib", type=int, default=16)
     args = ap.parse_args()
 
-    ctx = Context()
     results = []
     for name, op, sub in split_nodes(args.model):
         out = WORK / name
@@ -127,7 +127,12 @@ def main() -> int:
             results.append({"layer": name, "op": op, "error": first})
             print(json.dumps(results[-1]), flush=True)
             continue
+        # A fresh context per layer: each measurement holds a device connection, and the card
+        # has only 4 sub-devices, so connections must be released before the next layer.
+        ctx = Context()
         stats = measure(ctx, model_json, args.frames)
+        del ctx
+        gc.collect()
         results.append({"layer": name, "op": op, **stats})
         print(json.dumps(results[-1]), flush=True)
 
