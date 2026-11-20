@@ -80,10 +80,24 @@ Measured on one 3x3 convolution from ResNet-18 (`03_Conv_3`, 1x64x56x56):
 ## Fusion
 
 The DPU fusion pass absorbs a convolution's elementwise tail into one datapath.
-A Conv+ReLU model compiles to one kernel (641 us kernel time), and a standalone
-Conv measures about 505 us. The compiler config does not expose a switch to turn
-fusion off (`CompilerConfig(dpu_fuse=False)` is rejected), so the fused and
-unfused costs could not be separated directly.
+The public compiler config has no switch for it (`CompilerConfig(dpu_fuse=False)`
+is rejected), so the comparison below disables the pass in-process by replacing
+`DpuFuse.enabled` before compiling. The model is compiled with the same
+calibration and measured the same way in both variants.
+
+| Model | Variant | Kernel ELF files | Kernel us (median) |
+| --- | --- | --- | --- |
+| Conv + ReLU (1x64x1x1) | fused | 1 | 511 |
+| Conv + ReLU (1x64x1x1) | unfused | 1 | 672 |
+| ResNet-18 | fused | 1 | 1722 |
+| ResNet-18 | unfused | 1 | 1886 |
+
+- Fusion saves about 160 us on the small model and about 164 us on ResNet-18,
+  roughly 10 to 25 percent depending on size.
+- A standalone Conv measures about 505 us, so a fused ReLU costs almost nothing.
+- Both variants still produce one kernel ELF, so the saving is in the datapath
+  structure, not in the number of kernels.
+- The in-process replacement is a diagnostic, not a supported setting.
 
 Consequence for profiling: per-layer splits don't see fusion. A ReLU that is
 fused into a convolution has no separate timing, and a lone ReLU can't be
