@@ -60,9 +60,19 @@ Measured on one 3x3 convolution from ResNet-18 (`03_Conv_3`, 1x64x56x56):
 
 - Batching is not available for this layer: a batch-8 compile fails with
   `Only batch sizes of 1 supported`.
-- A linear fit of kernel time against MACs over the ResNet-18 convolutions gave
-  an intercept of about 1155 us and an R^2 of 0.07, so isolated runs are
-  dominated by a fixed per-dispatch cost.
+- Direct floor: 1x1 convolutions of increasing size, each run alone (300 frames):
+
+  | Input | MACs | Kernel us | Wall us |
+  | --- | --- | --- | --- |
+  | 1x1x1x1 | 1 | 773 | 781 |
+  | 1x64x1x1 | 4096 | 684 | 693 |
+  | 1x64x56x56 | 12.8 M | 1096 | 1129 |
+
+  A dispatch costs about 0.7 ms regardless of arithmetic. Run-to-run noise is
+  about 0.1 ms.
+- An earlier linear fit over the ResNet-18 convolutions gave an intercept of
+  about 1155 us, but its R^2 was 0.07, and the intercept also absorbed the
+  activation I/O of the larger layers. Use the direct floor instead.
 - The whole ResNet-18 compiles to one kernel ELF and runs in 1722 us (kernel),
   against 27.2 ms for the sum of its isolated convolutions. Per-layer sums
   overstate a fused model by about 16x.
