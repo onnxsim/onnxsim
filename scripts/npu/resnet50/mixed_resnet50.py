@@ -11,8 +11,9 @@ import time
 
 import numpy as np
 import onnx
-sys.path.insert(0, os.environ.get("CONV_NPU_DIR", os.path.expanduser("~/conv-npu-dir")))  # folder with conv_npu.py
+sys.path.insert(0, os.path.expanduser("~"))
 import conv_npu  # noqa: E402
+import conv_vec_run  # noqa: E402
 from onnx import numpy_helper
 import onnxruntime as ort
 
@@ -179,7 +180,7 @@ def npu_conv(ins, attrs):
     s = attrs.get("strides", [1, 1])[0]
     p = attrs.get("pads", [0, 0, 0, 0])[0]
     assert attrs.get("pads", [0, 0, 0, 0]) == [p] * 4 and attrs.get("strides", [1, 1]) == [s, s]
-    return Tensor(conv_npu.run_conv(x, W, B, s, p)[None].astype(np.float32))
+    return Tensor(conv_vec_run.run_conv(x, W, B, s, p)[None].astype(np.float32))
 
 
 def npu_flatten(x, attrs):
