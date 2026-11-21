@@ -26,7 +26,8 @@ import onnx
 from onnx import helper, numpy_helper, TensorProto
 
 WLIM = 147456   # weights per launch: 128 x 128 x 3 x 3 worked, larger did not
-IMAX = 200704   # input or output elements per launch: 256 x 28 x 28 worked
+IMAX = 200704   # input or output elements per launch for 3x3: 256 x 28 x 28 worked; 128 x 56 x 56 did not
+IMAX_1X1 = 401408   # input or output elements per launch for 1x1: 128 x 56 x 56 and 512 x 28 x 28 worked
 
 _CACHE = os.path.join(tempfile.gettempdir(), "onnxsim_dpu_templates")
 _CORE = None
@@ -51,7 +52,8 @@ def pick(cout, cin, k, hin, pad, stride):
     for ci in (256, 128, 64):
         for co in (256, 128, 64):
             ci_, co_ = min(ci, cin), min(co, cout)
-            if co_ * ci_ * k * k <= WLIM and ci_ * hin * hin <= IMAX and co_ * hout * hout <= IMAX:
+            imax = IMAX_1X1 if k == 1 else IMAX
+            if co_ * ci_ * k * k <= WLIM and ci_ * hin * hin <= imax and co_ * hout * hout <= imax:
                 if ci_ * co_ > best[0] * best[1]:
                     best = (ci_, co_)
     return best
