@@ -1,7 +1,7 @@
 """Conv and Gemm on the Intel NPU DPU, through OpenVINO-compiled template blobs.
 
 Each conv is split into sub-convs that fit one DPU launch (chunks of up to 256 x 256 channels, limited by weight count and
-input/output size; 3x3 convs at 14x14 or smaller use 64 x 64). Every sub-conv is a template compiled by OpenVINO's
+input/output size; 3x3 convs at 14x14 or smaller use cin * cout <= 8192). Every sub-conv is a template compiled by OpenVINO's
 compile_tool (zero-bias, same shape); its constant buffer is overwritten with the real weights using the forward layout:
 
     groups of 16 output channels; per group a 128-slot table is reserved up front (160 + 128 * G);
@@ -41,10 +41,12 @@ def _core():
 
 
 def pick(cout, cin, k, hin, pad, stride):
-    """Largest (ci, co) chunk that passes the launch limits, falling back to 64 x 64."""
+    """Largest (ci, co) chunk that passes the launch limits (3x3 at 14x14 or smaller: the cin * cout limit above)."""
     hout = (hin + 2 * pad - k) // stride + 1
     if k > 1 and hin <= 14:
-        return 64, 64
+        # 3x3 at 14x14 or 7x7: chunks with cin * cout <= 8192 passed ((128, 64) and (64, 128)); 128 x 128 and larger did not.
+        cands = [(min(ci, cin), min(co, cout)) for ci, co in ((128, 64), (64, 128), (64, 64))]
+        return max(cands, key=lambda c: c[0] * c[1])
     best = (64, 64)
     for ci in (256, 128, 64):
         for co in (256, 128, 64):

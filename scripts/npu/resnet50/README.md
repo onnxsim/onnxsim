@@ -37,8 +37,8 @@ python mixed_resnet50_dpu.py
 ```
 
 The layout of the constant buffer was measured on the test machine (Intel NPU 5020, OpenVINO 2026.4); it is not a
-documented format. Its limits are empirical: about 147k weights and 200k input or output elements per launch, and 64 x 64
-chunks for 3x3 convs at 14 x 14 or smaller. Other devices or OpenVINO versions may differ.
+documented format. Its limits are empirical: about 147k weights and 200k input or output elements per launch, and cin * cout <= 8192
+for 3x3 convs at 14 x 14 or smaller. Other devices or OpenVINO versions may differ.
 
 ## Dependencies on that machine
 
