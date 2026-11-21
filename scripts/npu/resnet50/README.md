@@ -26,9 +26,9 @@ a minute per image.
 ## Conv and Gemm on the DPU (`mixed_resnet50_dpu.py`)
 
 `mixed_resnet50_dpu.py` runs the same walk with Conv and Gemm on the NPU's DPU (the fixed-function convolution engine)
-instead of SHAVE. `dpu_chunked.py` splits each conv into sub-convs that fit one DPU launch, compiles zero-weight
-templates with OpenVINO's `compile_tool`, overwrites the constant buffer with the real weights, and launches in-process.
-Bias and the input-channel partial sums are on the host.
+instead of SHAVE. `dpu_layers.py` compiles each layer with its real weights through OpenVINO's `compile_tool` (one blob
+per layer, about 0.1 s to compile), imports the blob in-process, and runs one launch per layer. Bias is added on the host.
+Compiled models are cached in memory by weight hash, so each layer compiles once per process.
 
 ```sh
 OPENVINO_COMPILE_TOOL=/path/to/openvino/bin/intel64/Release/compile_tool \
@@ -36,9 +36,12 @@ LD_LIBRARY_PATH=$HOME/ze-loader/lib \
 python mixed_resnet50_dpu.py
 ```
 
-The layout of the constant buffer was measured on the test machine (Intel NPU 5020, OpenVINO 2026.4); it is not a
-documented format. Its limits are empirical: about 147k weights and 200k input or output elements per launch, and cin * cout <= 8192
-for 3x3 convs at 14 x 14 or smaller. Other devices or OpenVINO versions may differ.
+On the test machine (Intel NPU 5020, OpenVINO 2026.4) all 23 ResNet50 conv shapes and the classifier Gemm match a float32
+numpy reference with a relative error of at most 5e-4, and the full network runs in 54 launches (one per conv or Gemm).
+
+An earlier version split convs into chunks and patched a compiler-made template's constant buffer with the real weights.
+That worked only for some shapes, and the buffer layout turned out to depend on the template's shape and contents, so it
+was dropped in favour of compiling each layer.
 
 ## Dependencies on that machine
 
@@ -50,9 +53,9 @@ for 3x3 convs at 14 x 14 or smaller. Other devices or OpenVINO versions may diff
 
 ## Known limits
 
-- Speed: about 115 s per image without the in-process change, about 57 s with it. Nearly all of the remaining time is
-  inside our scalar SHAVE conv loops. Vectorizing them is the next step.
+- Speed: about 115 s per image without the in-process change, about 57 s with it (SHAVE path). Nearly all of the
+  remaining time is inside our scalar SHAVE conv loops. Vectorizing them is the next step.
+- DPU path: 8.3 s for one image, including compiling the 54 layers (not measured separately for later images).
+  Top-1 904 matches onnxruntime. The precompiled OpenVINO blob runs the same network in about 4 ms.
 - Numerics: fp16 activations; f32 accumulation inside the conv kernel. Subnormal inputs flush to zero on the device.
 - Coverage is 122 of 122 nodes on the NPU for ResNet50; other graphs will need more op kernels.
-- DPU path: about 20 to 23 s per image, with top-1 904 matching onnxruntime. Per-launch overhead dominates; the
-  precompiled OpenVINO blob runs the same network in about 4 ms.
