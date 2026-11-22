@@ -13,7 +13,7 @@ import onnxruntime as ort
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import dpu_chunked as dpu  # noqa: E402
+import dpu_layers as dpu  # noqa: E402
 import mixed_resnet50 as base  # noqa: E402
 
 MODEL = base.MODEL
