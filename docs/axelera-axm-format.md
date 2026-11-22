@@ -157,3 +157,21 @@ Reading: the bits that move with the N width look like tile-width or address fie
 commands. The bits that move with K look like input-stream lengths. These are groupings from the data, not
 confirmed meanings. Next: confirm one field per module by changing a value on a shape that does not crash the
 card, which needs a reset plan first.
+
+## Stage 1 result: the D_IFD_1 index selects a scale vector (measured)
+
+- Setup: the scale array's vector 1 (lanes 64 to 127) set to 1/2048, all others 1/4096. Tile 0's D_IFD_1
+  index changed from 3 to 1. Before the run, the indices were [3, 5, 0, 1, 4, 2, 7, 6].
+- Prediction: tiles 0 and 3 use vector 1 (1/2048); tiles 1, 2, 4 to 7 keep 1/4096.
+- Result: all eight tiles matched their prediction.
+
+  | Tile | Exact vs 1/2048 | Exact vs 1/4096 | Best |
+  |---|---|---|---|
+  | 0 | 98.49% | 1.34% | 1/2048 |
+  | 1 | 1.30% | 99.18% | 1/4096 |
+  | 2 | 1.31% | 99.17% | 1/4096 |
+  | 3 | 98.52% | 1.26% | 1/2048 |
+  | 4 to 7 | about 1.3% | about 99.1% | 1/4096 |
+
+- Conclusion: the per-tile index in D_IFD_1 selects which 64-lane scale vector the tile uses. Changing it is
+  safe on this shape and produces the predicted per-tile change, with no crash.
