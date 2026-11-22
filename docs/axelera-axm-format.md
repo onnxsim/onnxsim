@@ -67,3 +67,25 @@ Everything here was checked on the card unless marked "inferred".
 - Which payload fields of COMMAND, INSTRUCTION, and TOKEN are semantic (addresses, lane counts, sync modes)?
 - How the per-tile index in D_IFD_1 is chosen, and whether it can be redirected to a new constant table.
 - Whether the runtime accepts a stream we author (not a compiler output) without a matching constant layout.
+
+## Field map (differential, measured)
+
+Method: compile the unrolled GEMM at shapes that differ in one dimension (base 1024x512x512, N doubled,
+K doubled), align the two packed streams with a sequence matcher (task count changes from 217 to 221), and
+record which bytes change inside matched tasks.
+
+Confirmed:
+- **START_DMA transfers** (task type 4): each transfer is three u64 words at task byte 16 + 24k:
+  - `src`: pool index in bits 48-55 (0 = ddr input here), offset in bits 0-39, enable flag in bits 56-63 (1 for a source).
+  - `dst`: pool index and offset in the same layout. Offsets are L1 addresses (for example 0x18380000) and move with the shape.
+  - `size`: bytes moved. Doubling N doubles the size (32768 to 65536 for the weight tile; 131072 to 262144 for the wider case).
+  - The bytes that change across shapes are the offset and size fields (task bytes 17-18, 25-26, 33-34).
+
+Partly mapped:
+- **COMMAND** payload words (task type 0) change with every shape, in bytes 25-31 of most tasks. That is where
+  the matrix commands store their tile dimensions and addresses. I haven't assigned individual fields yet.
+- **INSTRUCTION** (type 1) and **TOKEN** (type 2) payloads change in a few tasks, which matches the extra
+  tasks that appear with the wider shapes.
+
+Not yet mapped: which COMMAND bits select the matrix unit's tile size, the token mode bits, and the IMC load
+parameters.
