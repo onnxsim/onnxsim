@@ -33,9 +33,17 @@ M, K, N, NT = args.M, args.K, args.N, args.tiles
 assert M % NT == 0 and K % 64 == 0 and N % 64 == 0
 TILE = M // NT
 KB, NB = K // 64, N // 64
-SCALE = 1.0 / 4096.0
+SCALE = 1.0 / float(os.environ.get('SCALE_DEN', '4096'))
 NOWAIT = os.environ.get('NOWAIT', '0') == '1'
 NOID = os.environ.get('NOID', '0') == '1'
+NSLOTS = int(os.environ.get('NSLOTS', '2'))
+CHAN = os.environ.get('CHAN', 'default')  # default | alt (even tiles ch0, odd tiles ch1)
+
+
+def chan_arg(i):
+    if CHAN == 'alt':
+        return ', channel=' + str(i % 2)
+    return ''
 
 WORK = Path(args.out or tempfile.mkdtemp(prefix="pipe-"))
 WORK.mkdir(parents=True, exist_ok=True)
@@ -53,23 +61,31 @@ from axelera.runtime import Context  # noqa: E402
 
 
 def build_source():
+    """Unrolled pipeline with NSLOTS L1 slots. Tile i uses slot i % NSLOTS; the copy for tile
+    i + (NSLOTS - 1) is issued before the matmul of tile i, so NSLOTS - 1 copies are in flight."""
     params = ", ".join(f'x{i}: A.Buffer(({TILE}, {KB}), "int8x64", scope=A.DDR)' for i in range(NT))
     body = [
         f'        w_l1 = A.alloc_buffer(({K}, {NB}), "int8x64", scope=A.L1)',
         "        axol.atomic.copy(w, output=w_l1)",
         "        w_imc = axol.atomic.load_imc(w_l1)",
-        f'        s0 = A.alloc_buffer(({TILE}, {KB}), "int8x64", scope=A.L1)',
-        f'        s1 = A.alloc_buffer(({TILE}, {KB}), "int8x64", scope=A.L1)',
-        f"        axol.atomic.copy(x0, output=s0{'' if NOID else ', id=' + repr('c0')})",
     ]
+    for k in range(NSLOTS):
+        body.append(f'        s{k} = A.alloc_buffer(({TILE}, {KB}), "int8x64", scope=A.L1)')
+    depth = NSLOTS - 1
+
+    def copy_line(j):
+        cid = "" if NOID else ", id=" + repr("c" + str(j))
+        return f"        axol.atomic.copy(x{j}, output=s{j % NSLOTS}{cid}{chan_arg(j)})"
+
+    for j in range(min(depth, NT)):
+        body.append(copy_line(j))
     outs = []
     for i in range(NT):
-        slot = f"s{i % 2}"
-        if i + 1 < NT:
-                body.append(f"        axol.atomic.copy(x{i + 1}, output=s{(i + 1) % 2}{'' if NOID else ', id=' + repr('c' + str(i + 1))})")
+        if i + depth < NT:
+            body.append(copy_line(i + depth))
         body += [
             *([] if NOWAIT else [f"        A.waits('c{i}')"]),
-            f"        acc{i} = axol.atomic.matmul(matrix_ifd={slot}, matrix_imc=w_imc, id='mm{i}')",
+            f"        acc{i} = axol.atomic.matmul(matrix_ifd=s{i % NSLOTS}, matrix_imc=w_imc, id='mm{i}')",
             f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})",
             f'        o{i} = A.alloc_buffer(({TILE}, {NB}), "int8x64", scope=A.DDR)',
             f"        axol.atomic.dpu_cast(sc{i}, o{i})",
