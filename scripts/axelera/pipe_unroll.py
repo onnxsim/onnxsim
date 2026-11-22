@@ -125,6 +125,9 @@ for _ in range(args.frames):
     t0 = time.perf_counter()
     inst.run(ins, outs)
     walls.append((time.perf_counter() - t0) * 1e6)
+inst.run(ins, outs)
+if os.environ.get("SAVE"):
+    np.savez(str(WORK / "outputs.npz"), *[o.copy() for o in outs], x=np.stack(xs), w=w)
 krn, _ = read_trace(offset)
 kernel_us = statistics.median(k / 1000 for k in krn)
 ops = 2 * M * K * N
