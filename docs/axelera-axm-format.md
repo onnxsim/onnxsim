@@ -118,3 +118,11 @@ parameters.
   an invalid command, which fits the crash.
 - Not yet tested: setting the count to 2 or 4 on the 512-wide kernel, and whether the output then matches a
   reference for that shape.
+
+## Count test on the 512-wide kernel (measured)
+
+- Setting bits 16-18 of M_MVMEXE word 1 to 0 crashed the card.
+- Setting them to 2 also crashed the card (`ZE_RESULT_ERROR_DEVICE_LOST`), with the card healthy before the run.
+- Setting them to the compiled value 1 runs and matches the reference (99.16%).
+- So the count must match the shape, and a mismatch is fatal. The count is a shape-derived parameter the device
+  checks, not a free knob. The value 4 is untested on the card and expected to fail the same way.
