@@ -218,6 +218,81 @@ run on Intel Core 3 304 (Wildcat Lake) with OpenVINO 2026.4.1 for CPU, GPU and
 NPU (`Intel(R) AI Boost`). The NPU needs the Intel NPU driver packages
 installed on the host.
 
+## Axelera Metis worker (Voyager SDK)
+
+`onnx-remote-axelera-worker` runs Voyager SDK artifacts on an Axelera Metis
+card through the SDK's `axruntime` C API. It speaks the same v5 transport and
+the same `load_compiled` / `run_compiled` handshake as the viplite worker, so a
+`compile` through `onnx-remote-compiler` and a run on this worker work together:
+
+* `capabilities` reports `runner_id` `axelera-metis`, the devices visible to
+  the SDK (name, board, firmware, sub-devices), and `supported_dtypes:["FLOAT"]`.
+* `load_compiled(id, artifact)` unpacks the artifact under `--cache-dir` and
+  loads `model.json` once onto a device connection, keeping it resident.
+* `run_compiled(id, tensors)` takes float32 inputs in graph order and returns
+  float32 outputs in graph order. Inputs are quantized as
+  `q = round(x / scale) + zero_point` (clipped to the integer type) and padded
+  with the zero point; outputs are depadded and dequantized as
+  `(q - zero_point) * scale`. This is the contract in the SDK's runtime docs.
+  When the model's `input_tensor_layout` is `NHWC`, rank-4 NCHW tensors are
+  transposed in and out.
+* Profiling: every level reports `axelera_load`, `axelera_quantize`,
+  `axelera_device_run`, and `axelera_dequantize`. The detailed level
+  (`--profile`) also reports `axelera_host_prep`, `axelera_host_input`,
+  `axelera_host_kernel`, and `axelera_host_output`, taken from the SDK runtime's
+  host trace (one line per frame, in nanoseconds). The worker turns on host
+  tracing when it loads a model, and writes the trace to
+  `--cache-dir/host_trace.log`, truncated at 64 MiB. Device runs are serialized,
+  so each trace line belongs to one request.
+* Device-side per-kernel profiling isn't exposed: with `device_profiling=1` the
+  SDK runtime issues no Level Zero timestamp or kernel-profile calls, while it
+  does issue its usual command-list calls. This was measured by interposing the
+  exported `zeCommandList*`, `zeCommandQueue*`, and `zeEvent*` entry points on the
+  tested Metis M.2 board with SDK 1.9.0, so `axelera_device_run` is the wall time
+  of the device call. The Level Zero tools API (metric groups, tracer, kernel
+  profile info, command-list metric queries) is also unavailable: the SDK's
+  `zet*ProcAddrTable` calls succeed, but every function pointer in those tables
+  is null on this driver.
+
+Models with host-side preamble or postamble graphs are rejected, because this
+worker does not run ONNX graphs on the host. A worker call with the wrong input
+shape or an unknown `artifact_id` returns an error response.
+
+The artifact is an `ONXAXL1` bundle: an 8-byte magic, a u32 entry count, then
+name and bytes for each file of the Voyager output directory. The compile step
+that produces it is `scripts/axelera/onnx_remote_compile.py`, which runs under the
+SDK's Python environment:
+
+```sh
+cmake -S tools/onnx-remote -B build/onnx-remote -DONNXSIM_REMOTE_AXELERA_WORKER=ON \
+  -DAXELERA_RUNTIME_INCLUDE_DIR=$VOYAGER/venv_1.9.0/lib/python3.12/site-packages/axelera/include \
+  -DAXELERA_RUNTIME_LIBRARY=$VOYAGER/venv_1.9.0/lib/python3.12/site-packages/axelera/lib/libaxruntime.so
+cmake --build build/onnx-remote --target onnx-remote-axelera-worker
+
+build/onnx-remote/onnx-remote-compiler --port 39502 --target metis-m2 --compiler-id voyager-1.9.0 \
+  --cache-dir ~/.cache/onnxsim-axelera \
+  --command "$VOYAGER/venv_1.9.0/bin/python3 scripts/axelera/onnx_remote_compile.py --input {input} \
+             --output {output} --manifest {manifest} --target {target} \
+             --compiler-id {compiler_id} --shapes {shapes}"
+
+build/onnx-remote/onnx-remote-axelera-worker --port 39505 --cache-dir ~/.cache/onnx-remote-axelera
+
+build/onnx-remote/onnx-remote-client --compile-run COMPILER_HOST 39502 RUNNER_HOST 39505 \
+  model.onnx --input-raw 1:1,64,1,1:x.raw --profile
+```
+
+Calibration: the compile step quantizes with random samples unless
+`--calib-dir` is given (a directory of `.npy` samples in the model's input
+layout). Random calibration is enough for transport and handshake tests but not
+for accuracy. Models must be static-shape, single-input, and Voyager-quantizable
+(for example, 4-D NCHW inputs).
+
+Tested on a Radxa Dragon Q8B with a Metis M.2 card (Voyager SDK 1.9.0): a 1×1
+convolution followed by ReLU (64 channels) compiled in about 10 s, loaded in
+about 230 ms, and ran in 344 µs on the device. The device output matched a numpy
+reference within int8 quantization error (max absolute error 0.007 on outputs up
+to 1.24).
+
 ## TensorRT worker (Jetson / NVIDIA GPU)
 
 `onnx-remote-tensorrt-worker` runs graphs on TensorRT. It speaks the same wire format as
