@@ -137,3 +137,23 @@ parameters.
      `Failed to enable MSI`, then the driver released its DMA memory.
 - The card stayed enumerated on the bus with no driver. A host reboot restored it.
 - So a PCIe bus reset does not recover the card in this state. Recovery needs a reboot.
+
+## COMMAND bits that change with shape (read-only decode, measured)
+
+Base 1024x512x512 compared with 1024x512x2048 (N) and 1024x2048x512 (K), matched tasks only.
+
+| Module | Words / bits that change | Changes with |
+|---|---|---|
+| M_MVMEXE (12) | word 1, bits 16 and 18 | N and K (chunk count, see above) |
+| M_DPU (11) | word 1 and word 2, bits 42 and 44 | N (not K) |
+| M_IFD_0 (6) | word 0 bit 48; word 1 bits 58, 60, 62 | N and K |
+| M_ODR (9) | word 1, bits 17, 19, 20 (K) and 19, 21, 60, 62 (N) | N and K |
+| M_IAU (10) | word 0 bit 48 (K only) | K |
+| D_IFD_0 (0), D_ODR (2) | word 1, several bits in 17 to 21 and 58 to 62 | N and K |
+| D_IFD_1 (1) | word 1, bits 8 to 10 | N and K (the per-tile slot index, see above) |
+| D_DPU (3), D_IAU (4), D_DWPU (5) | D_DPU word 1 and 2, bits 42 and 44 (N only); D_IAU and D_DWPU no change | N |
+
+Reading: the bits that move with the N width look like tile-width or address fields in the output and DPU
+commands. The bits that move with K look like input-stream lengths. These are groupings from the data, not
+confirmed meanings. Next: confirm one field per module by changing a value on a shape that does not crash the
+card, which needs a reset plan first.
