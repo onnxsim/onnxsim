@@ -126,3 +126,14 @@ parameters.
 - Setting them to the compiled value 1 runs and matches the reference (99.16%).
 - So the count must match the shape, and a mismatch is fatal. The count is a shape-derived parameter the device
   checks, not a free knob. The value 4 is untested on the card and expected to fail the same way.
+
+## Device recovery (measured)
+
+- After a device-lost crash, a metis module reload did not recover the card, and a host reboot did.
+- A PCIe recovery was tried on takecheeze-H8 (card at 03:00.0, driver `axl`):
+  1. unbind the driver: ok
+  2. bus reset through the `reset` sysfs file: I/O error
+  3. rebind: I/O error. The kernel log shows `Link down` after the link came up at Gen1, then
+     `Failed to enable MSI`, then the driver released its DMA memory.
+- The card stayed enumerated on the bus with no driver. A host reboot restored it.
+- So a PCIe bus reset does not recover the card in this state. Recovery needs a reboot.
