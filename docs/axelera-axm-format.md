@@ -89,3 +89,21 @@ Partly mapped:
 
 Not yet mapped: which COMMAND bits select the matrix unit's tile size, the token mode bits, and the IMC load
 parameters.
+
+## Matrix-execute field (M_MVMEXE, measured)
+
+- Word 1 of each M_MVMEXE command (8 per GEMM, one per tile) has a 2-bit field at bits 16-17.
+- Measured values, unrolled GEMM, 8 tiles:
+
+  | Shape (M x K x N) | bits 16-17 | Numerics vs reference |
+  |---|---|---|
+  | 1024 x 512 x 512 | 1 | 99.16% exact |
+  | 1024 x 512 x 1024 | 2 | 99.13% exact |
+  | 1024 x 1024 x 512 | 2 | 98.53% exact |
+  | 1024 x 512 x 2048 | 0 | 99.15% exact |
+  | 1024 x 2048 x 512 | 0 | 98.53% exact |
+
+- The field is linear in the 512-wide chunk count along N or K (1, 2, then 4), truncated to two bits.
+- Results stay correct at the wrapped value, so the hardware either ignores the high bits or reads the field
+  modulo 4. I haven't confirmed which. Treat the meaning as a hypothesis until a shape where the wrap matters
+  is checked.
