@@ -107,3 +107,14 @@ parameters.
 - Results stay correct at the wrapped value, so the hardware either ignores the high bits or reads the field
   modulo 4. I haven't confirmed which. Treat the meaning as a hypothesis until a shape where the wrap matters
   is checked.
+
+## Correction: the matrix-execute field is three bits (measured)
+
+- The chunk field is bits 16-18 of word 1 of M_MVMEXE, not bits 16-17. Word 1 of the 2048-wide kernel is
+  `0x40000` against `0x10000` for 512 wide: bit 18 is set and bits 16-17 are zero.
+- Values by shape: 512 gives 1, 1024 gives 2, 2048 gives 4. That is a count of 512-wide chunks.
+- The earlier "wrap to 0" reading came from looking at two bits only, so it is withdrawn.
+- Setting the count to 0 on the 512-wide kernel (bits 16-17 cleared, count 0) crashed the card. A zero count is
+  an invalid command, which fits the crash.
+- Not yet tested: setting the count to 2 or 4 on the 512-wide kernel, and whether the output then matches a
+  reference for that shape.
