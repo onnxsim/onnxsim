@@ -214,3 +214,14 @@ card, which needs a reset plan first.
 - Bits 17, 19, and 20 all corrupt tile 0. Bits 19 and 20 give identical output even though the two modified
   words differ. So the effect is probably from a shared field or an address that both bits select. Next: test
   bits 19 and 20 together, and bit 21.
+
+## Stage 3, M_ODR bit 21 (measured)
+
+- Setup: bit 21 of word 1 of the first M_ODR command flipped, 0x1000000018360000 to 0x1000000018160000.
+  Health check passed before the run.
+- Result: no crash. Tile 0 corrupted with the same per-block counts as bits 19 and 20 (65,081 mismatched).
+  Tiles 1 to 7 unchanged at the rounding level.
+- Bits 19, 20, and 21 give identical tile-0 output. Bit 17 gives a slightly different count (64,982).
+- Hypothesis: any change in bits 19 to 21 of this command makes tile 0's output a fixed wrong result, for
+  example written from another address or zeroed. To test: compare tile 0's device output with the other tiles'
+  outputs and with zero.
