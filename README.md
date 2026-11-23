@@ -610,8 +610,15 @@ which is by construction the einsum's own output order, so no output-side
 reshape or transpose is ever needed and an operand already in matmul order
 contributes no `Transpose`.
 
+Three-or-more-operand chains (e.g. `ij,jk,kl->il`) go through the same rewrite
+one pairwise step at a time: when the optional `opt-einsum` dependency (the
+`einsum` extra: `pip install onnxsim[einsum]`) is installed, its contraction
+path splits the chain into binary steps and each step is lowered as above.
+Without it, with unknown input shapes, or when any step is not a batched
+matmul (an outer product, a double contraction), the node is left as `Einsum`.
+
 Deliberately *not* rewritten: a diagonal, a trace, an outer product, a
-reduction to a scalar, or a batch axis only one operand carries. Those are left
+reduction to a scalar, or a double contraction. Those are left
 exactly as they were, so the exporter still raises its usual "unsupported op"
 error naming the op -- never a silently wrong model. `backend="onnx2tf"` and
 the MLIR path, which delegate, cover those without this caveat.
