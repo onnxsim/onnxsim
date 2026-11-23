@@ -209,25 +209,25 @@ def _assemble(
 ) -> Optional[List[onnx.NodeProto]]:
     """Outer node list with ``regions`` collapsed to calls, or ``None`` on a cycle."""
     in_region: Dict[int, _Region] = {}
-    for region in regions:
-        for i in region.partition.node_indices:
-            in_region[i] = region
+    for r in regions:
+        for i in r.partition.node_indices:
+            in_region[i] = r
 
     entries: List[Tuple[int, List[str], List[str], object]] = []
     for i, node in enumerate(nodes):
-        region = in_region.get(i)
-        if region is None:
+        owner = in_region.get(i)
+        if owner is None:
             entries.append((i, list(node.input), list(node.output), node))
-        elif i == region.partition.node_indices[0]:
+        elif i == owner.partition.node_indices[0]:
             call = helper.make_node(
-                region.name,
-                region.inputs,
-                region.outputs,
-                name=f"{region.name}_call",
+                owner.name,
+                owner.inputs,
+                owner.outputs,
+                name=f"{owner.name}_call",
                 domain=EXPORT_DOMAIN,
-                doc_string=f"device={region.partition.device}",
+                doc_string=f"device={owner.partition.device}",
             )
-            entries.append((i, list(region.inputs), list(region.outputs), call))
+            entries.append((i, list(owner.inputs), list(owner.outputs), call))
     return _order(entries)  # type: ignore[return-value]
 
 
