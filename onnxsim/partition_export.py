@@ -152,13 +152,17 @@ def _order(
     deps: List[Set[int]] = []
     dependents: Dict[int, List[int]] = {idx: [] for idx in range(len(entries))}
     for idx, (_, ins, _, _) in enumerate(entries):
-        src = {producer[name] for name in ins if name in producer and producer[name] != idx}
+        src = {
+            producer[name] for name in ins if name in producer and producer[name] != idx
+        }
         deps.append(src)
         for s in src:
             dependents[s].append(idx)
 
     remaining = [len(d) for d in deps]
-    heap = [(entries[idx][0], idx) for idx in range(len(entries)) if remaining[idx] == 0]
+    heap = [
+        (entries[idx][0], idx) for idx in range(len(entries)) if remaining[idx] == 0
+    ]
     heapq.heapify(heap)
     out: List[object] = []
     while heap:
@@ -283,7 +287,11 @@ def export_partitioned_model(
             break
         dropped = candidates.pop()
         skipped.append(
-            (dropped.partition.device, tuple(dropped.partition.node_indices), "would create a cycle")
+            (
+                dropped.partition.device,
+                tuple(dropped.partition.node_indices),
+                "would create a cycle",
+            )
         )
 
     out = copy.deepcopy(model)
@@ -295,12 +303,9 @@ def export_partitioned_model(
     functions = [_build_function(model, r, nodes) for r in candidates]
 
     in_region = {i for r in candidates for i in r.partition.node_indices}
-    internal = {
-        name
-        for i in in_region
-        for name in nodes[i].output
-        if name
-    } - {name for r in candidates for name in r.outputs}
+    internal = {name for i in in_region for name in nodes[i].output if name} - {
+        name for r in candidates for name in r.outputs
+    }
 
     del out.graph.node[:]
     out.graph.node.extend(new_nodes)
