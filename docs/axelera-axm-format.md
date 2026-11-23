@@ -225,3 +225,12 @@ card, which needs a reset plan first.
 - Hypothesis: any change in bits 19 to 21 of this command makes tile 0's output a fixed wrong result, for
   example written from another address or zeroed. To test: compare tile 0's device output with the other tiles'
   outputs and with zero.
+
+## Tile 0 after the M_ODR bit 21 flip (measured)
+
+- Tile 0's output has 247 distinct values, not zero. It matches its own reference in 0.7% of values and tile 1's
+  reference in 0.8%.
+- So the corruption is not a zero fill and not a copy of another tile.
+- Remaining hypotheses: a different scale or rounding on this tile's write, or a permutation of lanes or column
+  blocks. Next test: compare the histogram of tile 0's values with its reference, and check for a column
+  permutation.
