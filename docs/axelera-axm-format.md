@@ -195,3 +195,12 @@ card, which needs a reset plan first.
   write-side field (output layout or format), not a crash field, at least on this shape.
 - Prediction check: the output-change branch of the prediction held; no crash. Confirming which bit does what
   needs the next bits in the list.
+
+## Stage 3, M_ODR bit 19 (measured)
+
+- Setup: bit 19 of word 1 of the first M_ODR command flipped, 0x1000000018360000 to 0x10000000183e0000.
+  Health check passed before the run.
+- Result: no crash. Tile 0 almost entirely wrong (65,081 of 65,536 mismatched, in every column block). Tiles 1
+  to 7 unchanged at the rounding level.
+- Same pattern as bit 17. Bits 17 and 19 may belong to one multi-bit field in the M_ODR write. Test by
+  flipping them together or by checking whether bit 18 is part of the same field.
