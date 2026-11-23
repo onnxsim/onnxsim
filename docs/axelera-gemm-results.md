@@ -98,3 +98,25 @@ So kernel execution is about 88% of each call.
   `reset` sysfs file fails with an I/O error, the link retrains to Gen1 and drops, and the driver probe fails.
   Only a host reboot restored the card, in every case so far.
 - Scripts: `scripts/axelera/axm/axm_scale.py` (scale show, set, check with reset), `pstream.py` (stream codec).
+
+
+## CNN throughput and instance scaling (measured on one Metis M.2 113m)
+
+Batch 1, streaming with one Python thread per instance, double buffering on. Effective TOPS = 2 × MACs × images/s.
+MACs are standard published values at 224×224.
+
+| Model | MACs | Config | Images/s | Effective TOPS |
+|---|---|---|---|---|
+| ResNet-18 | 1.82 G | 1 instance, 1 core | 685 | 2.5 |
+| ResNet-50 | 4.11 G | 1 instance, 1 core | 380 | 3.1 |
+| ResNet-50 | 4.11 G | 1 instance, 4 cores | 451 | 3.7 |
+| ResNet-50 | 4.11 G | 2 instances, 1 core each | 685 | 5.6 |
+| ResNet-50 | 4.11 G | 3 instances, 1 core each | 964 | 7.9 |
+| ResNet-50 | 4.11 G | 4 instances, 1 core each | 1085 | 8.9 |
+| MobileNetV2 | 0.30 G | 1 instance, 1 core | 766 | 0.46 |
+| EfficientNet-B0 | 0.39 G | 1 instance, 1 core | 356 | 0.28 |
+
+- Published vendor ResNet-50 (M.2): 1756 FPS, about 14.4 effective TOPS. Our four-instance result is about 62% of it.
+- Scaling levels off: three to four instances adds about 12%.
+- Multi-core within one instance gives about 19% at four cores. The gain from instances is larger.
+- DINOv2-S/14 is about 6.1 GMACs by our estimate. The vendor's 131 FPS is about 1.6 effective TOPS. Not measured on our card: the zoo has no prebuilt ViT package.
