@@ -242,3 +242,12 @@ card, which needs a reset plan first.
 - So the corruption is not a lane or column reordering. The bit change alters the arithmetic for that tile.
 - Next: sweep a scale for tile 0 (powers of two) and check whether it matches one of them. That would show
   whether the flip changes the requantization for that tile.
+
+## Tile 0 scale sweep after the M_ODR bit 21 flip (measured)
+
+- Power-of-two scales 2^-4 to 2^-16 do not match tile 0's output. The best match is 21% at 2^-4, which is what
+  clipping alone gives.
+- So the flip does not change the requantization scale for tile 0 either.
+- Remaining hypothesis: tile 0's matrix computation uses different operands (input or weight source) because
+  bits 19 to 21 of its M_ODR write select them. Next test would compare tile 0 against products of other tiles'
+  inputs and of permuted weights.
