@@ -175,3 +175,12 @@ card, which needs a reset plan first.
 
 - Conclusion: the per-tile index in D_IFD_1 selects which 64-lane scale vector the tile uses. Changing it is
   safe on this shape and produces the predicted per-tile change, with no crash.
+
+## Stage 2 result: bit 42 of M_DPU crashes the card (measured)
+
+- Setup: bit 42 of word 1 of the first M_DPU command (target 11) flipped, 0x40000010000 to 0x10000.
+  Health check passed before the run.
+- Result: the device was lost on the first run (`ZE_RESULT_ERROR_DEVICE_LOST`). No per-tile output was obtained.
+- The prediction (output change or rejection) was wrong on the second count: the device was lost.
+- Conclusion: bit 42 is not a free field. Changing it on one command crashes the card. Stage 3 fields should be
+  treated as crash-prone and tested only with explicit approval and a reboot plan.
