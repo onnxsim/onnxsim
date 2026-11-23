@@ -120,3 +120,27 @@ MACs are standard published values at 224×224.
 - Scaling levels off: three to four instances adds about 12%.
 - Multi-core within one instance gives about 19% at four cores. The gain from instances is larger.
 - DINOv2-S/14 is about 6.1 GMACs by our estimate. The vendor's 131 FPS is about 1.6 effective TOPS. Not measured on our card: the zoo has no prebuilt ViT package.
+
+
+## Single-core ceiling analysis
+
+- The SDK documents 214 INT8 TOPS as the theoretical peak across all four cores at 800 MHz. The per-core
+  peak is therefore about 53 TOPS.
+- Measured, as share of per-core peak:
+
+  | Result | Effective TOPS | Share of per-core peak |
+  |---|---|---|
+  | Best GEMM (3 instances) | 1.7 | about 3% |
+  | ResNet-50, 1 instance, 1 core | 3.1 | about 6% |
+  | ResNet-50, 4 instances | 8.9 total | about 4% per core |
+
+- 50 TOPS on one core would be about 93% of the per-core theoretical peak. We don't consider that reachable.
+- What would be needed:
+  - Matrix unit busy nearly all the time: DMA fully overlapped with compute. Blocked by the `lanes > 1` compiler
+    error for the loop form; the unrolled form compiles but does not overlap.
+  - Little synchronization inside a kernel. Each extra tile costs about 156 µs; each call has about 1 ms fixed
+    overhead.
+  - Large shapes with weights resident. The reload variant crashes the runtime.
+- Realistic next targets: a few more TOPS per core through better compiler output and the instance and width
+  settings already found. Roughly 10 to 20 TOPS per core needs working overlap, which depends on the `lanes`
+  fix or Axelera support.
