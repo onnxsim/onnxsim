@@ -204,3 +204,13 @@ card, which needs a reset plan first.
   to 7 unchanged at the rounding level.
 - Same pattern as bit 17. Bits 17 and 19 may belong to one multi-bit field in the M_ODR write. Test by
   flipping them together or by checking whether bit 18 is part of the same field.
+
+## Stage 3, M_ODR bit 20 (measured)
+
+- Setup: bit 20 of word 1 of the first M_ODR command flipped, 0x1000000018360000 to 0x1000000018260000.
+  Health check passed before the run.
+- Result: no crash. Tile 0 corrupted with the same per-block counts as bit 19 (65,081 mismatched). Tiles 1 to 7
+  unchanged at the rounding level.
+- Bits 17, 19, and 20 all corrupt tile 0. Bits 19 and 20 give identical output even though the two modified
+  words differ. So the effect is probably from a shared field or an address that both bits select. Next: test
+  bits 19 and 20 together, and bit 21.
