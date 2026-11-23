@@ -184,3 +184,14 @@ card, which needs a reset plan first.
 - The prediction (output change or rejection) was wrong on the second count: the device was lost.
 - Conclusion: bit 42 is not a free field. Changing it on one command crashes the card. Stage 3 fields should be
   treated as crash-prone and tested only with explicit approval and a reboot plan.
+
+## Stage 3, M_ODR bit 17 (measured)
+
+- Setup: bit 17 of word 1 of the first M_ODR command (target 9) flipped, 0x1000000018360000 to
+  0x1000000018340000. Health check passed before the run.
+- Result: no crash. Tile 0 is almost entirely wrong (64,982 of 65,536 values mismatched, in every 64-column
+  block). Tiles 1 to 7 are at the normal rounding level (about 0.85% mismatched, 538 to 569 of 65,536).
+- Reading: bit 17 of the M_ODR command changes the output of its own tile across all columns. It is a
+  write-side field (output layout or format), not a crash field, at least on this shape.
+- Prediction check: the output-change branch of the prediction held; no crash. Confirming which bit does what
+  needs the next bits in the list.
