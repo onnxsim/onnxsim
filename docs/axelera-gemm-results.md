@@ -144,3 +144,19 @@ MACs are standard published values at 224×224.
 - Realistic next targets: a few more TOPS per core through better compiler output and the instance and width
   settings already found. Roughly 10 to 20 TOPS per core needs working overlap, which depends on the `lanes`
   fix or Axelera support.
+
+## Blocker attempt: tile loop as a registered operator (compiler, measured)
+
+- Goal: the `lanes > 1` error is raised for loop-form tile loops in prim_func. The SDK's pipelined templates
+  use `with A.tiles(...)` inside an operator's implementation. Test: a custom ScriptOp (`tiled_op.py`) whose
+  implementation runs the tile loop.
+- Results:
+  1. Inside `with A.script():` the `with A.tiles` form is rejected: "Invalid context expression".
+  2. Without `A.script()` (the SDK's pattern, where the implementation runs as ordinary Python), the with-form is
+     accepted and the operator compiles past the context check.
+  3. The next error: the input tile's shape is a symbolic `min(...)` expression, and the output tile is a
+     fixed 128 rows. The compiler's shape check rejects the mismatch.
+- Conclusion: the operator route removes the context error but not the symbolic-tile-shape error, which is the
+  same family as `lanes > 1`. The SDK avoids it with clamped ramps and `where=` predicates in its pipelined
+  templates; the loop form of those predicates is what fails for us. Closing this needs either a compiler fix
+  or matching the SDK's template exactly, which we haven't achieved.
