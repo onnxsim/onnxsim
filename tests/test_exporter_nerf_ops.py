@@ -299,13 +299,7 @@ def test_einsum_multiple_einsums_in_one_graph_all_lower():
 
 
 def _einsum_chain_model(equation: str, shapes):
-    """An N-operand ``Einsum`` with the output shape derived from the equation.
-
-    Like :func:`_einsum_model` but for chains: ``onnx.helper`` is used because
-    the text format has no spelling for the string ``equation`` attribute.
-    """
-    from onnx import helper
-
+    """An N-operand ``Einsum`` with the output shape derived from the equation."""
     lhs, out = equation.split("->")
     terms = lhs.split(",")
     assert len(terms) == len(shapes)
@@ -313,19 +307,17 @@ def _einsum_chain_model(equation: str, shapes):
     for term, shape in zip(terms, shapes):
         for c, d in zip(term, shape):
             dims[c] = d
-    names = [f"X{i}" for i in range(len(shapes))]
-    graph = helper.make_graph(
-        [helper.make_node("Einsum", names, ["Y"], equation=equation)],
-        "einsum",
-        [
-            helper.make_tensor_value_info(name, F, list(shape))
-            for name, shape in zip(names, shapes)
-        ],
-        [helper.make_tensor_value_info("Y", F, [dims[c] for c in out])],
+
+    def ty(shape):
+        return f"float[{','.join(str(d) for d in shape)}]"
+
+    ios = ", ".join(f"{ty(s)} X{i}" for i, s in enumerate(shapes))
+    ins = ", ".join(f"X{i}" for i in range(len(shapes)))
+    body = (
+        f"chain ({ios}) => ({ty([dims[c] for c in out])} Y) "
+        f'{{ Y = Einsum<equation="{equation}">({ins}) }}'
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 9
-    return model
+    return _model(body, opset=17)
 
 
 # Chains where every pairwise step is a batched matmul: the whole node lowers.
