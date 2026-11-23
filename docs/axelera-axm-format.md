@@ -234,3 +234,11 @@ card, which needs a reset plan first.
 - Remaining hypotheses: a different scale or rounding on this tile's write, or a permutation of lanes or column
   blocks. Next test: compare the histogram of tile 0's values with its reference, and check for a column
   permutation.
+
+## Tile 0 permutation test after the M_ODR bit 21 flip (measured)
+
+- No row of tile 0 is a permutation of its reference row (0 of 128 rows).
+- Tile 0's value histogram differs from the reference histogram.
+- So the corruption is not a lane or column reordering. The bit change alters the arithmetic for that tile.
+- Next: sweep a scale for tile 0 (powers of two) and check whether it matches one of them. That would show
+  whether the flip changes the requantization for that tile.
