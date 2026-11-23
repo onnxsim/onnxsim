@@ -6,10 +6,15 @@
 
 :func:`onnxsim.graph_partition.partition_graph` decides which device runs each
 node. This module writes that decision out as a model: every *convex*
-same-device region becomes one call to a model-local ``FunctionProto`` in the
+same-device region becomes one call to a model-local function in the
 ``onnxsim.partition`` domain, and the function body holds the region's original
 nodes. A runtime or a reader then sees one node per device region, with the
 region's boundary tensors as the call's inputs and outputs.
+
+The planning step reads the protobuf model. The graph editing (building the
+function bodies, replacing region nodes with calls, rewiring boundary tensors)
+runs on :mod:`onnx_ir` objects, converted at entry and exit by
+:mod:`onnxsim.ir_bridge`.
 
 Rules:
 
@@ -19,28 +24,27 @@ Rules:
   containing a subgraph attribute (``If``, ``Loop``, ``Scan``), whose bodies
   reference outer-scope names that a function cannot capture.
 * Collapsing regions can create a cycle between two regions that are each
-  convex on their own. The lowest-ordered region is kept when this happens;
-  the others are dropped until the outer graph is acyclic again.
-* Tensor names are unchanged, so graph inputs, outputs and initializers keep
-  their names. Each function's formal inputs and outputs use the outer names.
+  convex on their own. The highest-ordered region is dropped when this happens,
+  until the outer graph is acyclic again.
+* Tensor names are unchanged at the region boundaries, so graph inputs, outputs
+  and initializers keep their names.
 
-The output model is a plain ONNX model with functions. It is not the
-device-specific runtime artifact; it records the partition structure so that
-the plan can be inspected, verified (run with the reference evaluator), or
-lowered by a backend that supports model-local functions.
+The output is a plain ONNX model with functions. It records the partition
+structure so the plan can be inspected or verified (run with the reference
+evaluator), or lowered by a backend that supports model-local functions.
 """
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import heapq
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import onnx
-from onnx import helper
+import onnx_ir as ir
 
 from onnxsim.graph_partition import CPU, Partition, partition_graph
+from onnxsim.ir_bridge import as_ir, as_proto
 
 __all__ = [
     "EXPORT_DOMAIN",
@@ -96,15 +100,6 @@ class _Region:
 
 def _has_subgraph(node: onnx.NodeProto) -> bool:
     return any(a.HasField("g") or len(a.graphs) for a in node.attribute)
-
-
-def _opset_for_domain(model: onnx.ModelProto, domain: str) -> Optional[int]:
-    wanted = "" if domain in ("", "ai.onnx") else domain
-    for opset in model.opset_import:
-        norm = "" if opset.domain in ("", "ai.onnx") else opset.domain
-        if norm == wanted:
-            return opset.version
-    return None
 
 
 def _region_io(
@@ -177,62 +172,91 @@ def _order(
     return out
 
 
-def _build_function(
-    model: onnx.ModelProto,
-    region: _Region,
-    nodes: Sequence[onnx.NodeProto],
-) -> onnx.FunctionProto:
-    body = [copy.deepcopy(nodes[i]) for i in region.partition.node_indices]
-    domains = {node.domain for node in body}
-    opset_imports = []
-    for domain in sorted(domains):
-        version = _opset_for_domain(model, domain)
+def _outer_values(graph: ir.Graph) -> Dict[str, ir.Value]:
+    """Every named value in the outer graph, by name."""
+    values: Dict[str, ir.Value] = {}
+    for v in graph.inputs:
+        if v.name:
+            values[v.name] = v
+    for name, v in graph.initializers.items():
+        values[name] = v
+    for node in graph:
+        for v in node.outputs:
+            if v.name:
+                values[v.name] = v
+    return values
+
+
+def _function_opsets(model: ir.Model, nodes: Sequence[ir.Node]) -> Dict[str, int]:
+    """Opset versions for the domains the function body uses."""
+    out: Dict[str, int] = {}
+    for node in nodes:
+        domain = "" if node.domain in ("", "ai.onnx") else node.domain
+        if domain in out:
+            continue
+        version = model.opset_imports.get(domain)
         if version is None:
             raise ValueError(
                 f"model has no opset import for domain {domain!r} used by the region"
             )
-        norm_domain = "" if domain == "ai.onnx" else domain
-        opset_imports.append(helper.make_opsetid(norm_domain, version))
-    return helper.make_function(
-        EXPORT_DOMAIN,
-        region.name,
-        region.inputs,
-        region.outputs,
-        body,
-        opset_imports,
-    )
+        out[domain] = version
+    return out
 
 
-def _assemble(
-    regions: Sequence[_Region],
-    nodes: Sequence[onnx.NodeProto],
-) -> Optional[List[onnx.NodeProto]]:
-    """Outer node list with ``regions`` collapsed to calls, or ``None`` on a cycle."""
-    in_region: Dict[int, _Region] = {}
-    for r in regions:
-        for i in r.partition.node_indices:
-            in_region[i] = r
+def _build_body(
+    region: _Region,
+    ir_nodes: Sequence[ir.Node],
+    outer: Dict[str, ir.Value],
+    model: ir.Model,
+) -> ir.Function:
+    """The model-local function for ``region``, with a body copied from its nodes."""
+    fresh: Dict[str, ir.Value] = {}
+    formal_inputs: List[ir.Value] = []
+    for name in region.inputs:
+        src = outer[name]
+        value = ir.Value(name=name, type=src.type, shape=src.shape)
+        fresh[name] = value
+        formal_inputs.append(value)
 
-    entries: List[Tuple[int, List[str], List[str], object]] = []
-    for i, node in enumerate(nodes):
-        owner = in_region.get(i)
-        if owner is None:
-            entries.append((i, list(node.input), list(node.output), node))
-        elif i == owner.partition.node_indices[0]:
-            call = helper.make_node(
-                owner.name,
-                owner.inputs,
-                owner.outputs,
-                name=f"{owner.name}_call",
-                domain=EXPORT_DOMAIN,
-                doc_string=f"device={owner.partition.device}",
+    body: List[ir.Node] = []
+    for i in region.partition.node_indices:
+        node = ir_nodes[i]
+        inputs = [
+            fresh[v.name] if v is not None and v.name else None for v in node.inputs
+        ]
+        outputs: List[ir.Value] = []
+        for o in node.outputs:
+            if o.name:
+                value = ir.Value(name=o.name, type=o.type, shape=o.shape)
+                fresh[o.name] = value
+            else:
+                value = ir.Value()
+            outputs.append(value)
+        body.append(
+            ir.Node(
+                node.domain,
+                node.op_type,
+                inputs,
+                attributes=list(node.attributes.values()),
+                outputs=outputs,
+                overload=node.overload,
+                name=node.name,
+                doc_string=node.doc_string,
             )
-            entries.append((i, list(owner.inputs), list(owner.outputs), call))
-    return _order(entries)  # type: ignore[return-value]
+        )
+
+    graph = ir.Graph(
+        inputs=formal_inputs,
+        outputs=[fresh[name] for name in region.outputs],
+        nodes=body,
+        opset_imports=_function_opsets(model, body),
+        name=region.name,
+    )
+    return ir.Function(EXPORT_DOMAIN, region.name, graph=graph, attributes=())
 
 
 def export_partitioned_model(
-    model: Union[str, onnx.ModelProto],
+    model: Union[str, onnx.ModelProto, ir.Model],
     primary: str,
     fallback: Sequence[str] = (CPU,),
     *,
@@ -241,18 +265,23 @@ def export_partitioned_model(
     """Place ``model``'s nodes as :func:`partition_graph` does and export each
     convex device region as one model-local function call.
 
-    :param model: the ONNX model, or a file path. Run it on a simplified model.
+    :param model: the ONNX model, a file path, or an ``onnx_ir`` model. Run it on
+            a simplified model.
     :param primary: the preferred device, one of ``"webnn"``, ``"webgpu"``.
     :param fallback: devices tried in order after ``primary``.
     :param min_nodes: smallest region to outline; smaller regions stay inline.
     :returns: a :class:`PartitionExport`. The input model is not modified.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    plan = partition_graph(model, primary, fallback)
-    graph = model.graph
-    nodes = list(graph.node)
-    graph_outputs = {o.name for o in graph.output}
+    if isinstance(model, ir.Model):
+        model_proto = as_proto(model)
+    elif isinstance(model, str):
+        model_proto = onnx.load(model, load_external_data=False)
+    else:
+        model_proto = model
+
+    plan = partition_graph(model_proto, primary, fallback)
+    nodes = list(model_proto.graph.node)
+    graph_outputs = {o.name for o in model_proto.graph.output}
 
     readers: Dict[str, Set[int]] = {}
     for i, node in enumerate(nodes):
@@ -279,11 +308,16 @@ def export_partitioned_model(
                 continue
         skipped.append((part.device, tuple(members), reason))
 
+    ir_model = as_ir(model_proto)
+    ir_nodes = list(ir_model.graph)
+    if len(ir_nodes) != len(nodes):
+        raise RuntimeError("onnx_ir changed the node count during conversion")
+
     # Drop the highest-ordered region until the collapsed graph is acyclic.
     while True:
         for k, region in enumerate(candidates):
             region.name = f"{region.partition.device}_partition_{k}"
-        if _assemble(candidates, nodes) is not None:
+        if _collapsed_order(candidates, nodes) is not None:
             break
         dropped = candidates.pop()
         skipped.append(
@@ -294,28 +328,73 @@ def export_partitioned_model(
             )
         )
 
-    out = copy.deepcopy(model)
     if not candidates:
-        return PartitionExport(out, (), len(nodes), tuple(skipped))
+        return PartitionExport(as_proto(ir_model), (), len(nodes), tuple(skipped))
 
-    new_nodes = _assemble(candidates, nodes)
-    assert new_nodes is not None
-    functions = [_build_function(model, r, nodes) for r in candidates]
+    graph = ir_model.graph
+    outer = _outer_values(graph)
+    functions: List[ir.Function] = []
+    calls: Dict[str, ir.Node] = {}
 
-    in_region = {i for r in candidates for i in r.partition.node_indices}
-    internal = {name for i in in_region for name in nodes[i].output if name} - {
-        name for r in candidates for name in r.outputs
-    }
+    # 1. Replace each exported output with a fresh value, so the region's
+    #    consumers now read the call's output. Values are replaced in order, so
+    #    later regions see the already-replaced inputs.
+    for region in candidates:
+        for name in region.outputs:
+            old = outer[name]
+            new = ir.Value(name=name, type=old.type, shape=old.shape)
+            old.replace_all_uses_with(new, replace_graph_outputs=True)
+            outer[name] = new
 
-    del out.graph.node[:]
-    out.graph.node.extend(new_nodes)
-    kept_vi = [v for v in graph.value_info if v.name not in internal]
-    del out.graph.value_info[:]
-    out.graph.value_info.extend(kept_vi)
-    out.functions.extend(functions)
-    if not any(o.domain == EXPORT_DOMAIN for o in out.opset_import):
-        out.opset_import.append(helper.make_opsetid(EXPORT_DOMAIN, 1))
-    out.ir_version = max(out.ir_version, _MIN_IR_VERSION_FOR_FUNCTIONS)
+    # 2. Build each function body from the original nodes, and the call node
+    #    that replaces the region in the outer graph.
+    for region in candidates:
+        function = _build_body(region, ir_nodes, outer, ir_model)
+        functions.append(function)
+        call = ir.Node(
+            EXPORT_DOMAIN,
+            region.name,
+            [outer[name] for name in region.inputs],
+            outputs=[outer[name] for name in region.outputs],
+            name=f"{region.name}_call",
+            doc_string=f"device={region.partition.device}",
+        )
+        calls[region.name] = call
+
+    # 3. Rebuild the outer graph: region members out, calls in, in dependency
+    #    order.
+    member_of: Dict[int, _Region] = {}
+    for region in candidates:
+        for i in region.partition.node_indices:
+            member_of[i] = region
+    entries: List[Tuple[int, List[str], List[str], object]] = []
+    for i, node in enumerate(ir_nodes):
+        owner = member_of.get(i)
+        if owner is None:
+            entries.append(
+                (
+                    i,
+                    [v.name for v in node.inputs if v is not None and v.name],
+                    [v.name for v in node.outputs if v.name],
+                    node,
+                )
+            )
+        elif i == owner.partition.node_indices[0]:
+            entries.append(
+                (i, list(owner.inputs), list(owner.outputs), calls[owner.name])
+            )
+    ordered = _order(entries)
+    if ordered is None:
+        raise RuntimeError("collapsed graph is cyclic after IR rewrite")
+
+    graph.remove(list(graph), safe=False)
+    graph.extend(ordered)  # type: ignore[arg-type]
+
+    for function in functions:
+        ir_model.functions[function.identifier()] = function
+    if EXPORT_DOMAIN not in ir_model.opset_imports:
+        ir_model.opset_imports[EXPORT_DOMAIN] = 1
+    ir_model.ir_version = max(ir_model.ir_version, _MIN_IR_VERSION_FOR_FUNCTIONS)
 
     outlined = tuple(
         PartitionFunction(
@@ -327,8 +406,27 @@ def export_partitioned_model(
         for r in candidates
     )
     return PartitionExport(
-        model=out,
+        model=as_proto(ir_model),
         functions=outlined,
-        inline_nodes=len(new_nodes) - len(candidates),
+        inline_nodes=len(ordered) - len(candidates),
         skipped=tuple(skipped),
     )
+
+
+def _collapsed_order(
+    candidates: Sequence[_Region], nodes: Sequence[onnx.NodeProto]
+) -> Optional[List[object]]:
+    """Dependency order of the outer graph with ``candidates`` collapsed, or
+    ``None`` on a cycle. Used to choose which regions to keep."""
+    in_region: Dict[int, _Region] = {}
+    for r in candidates:
+        for i in r.partition.node_indices:
+            in_region[i] = r
+    entries: List[Tuple[int, List[str], List[str], object]] = []
+    for i, node in enumerate(nodes):
+        owner = in_region.get(i)
+        if owner is None:
+            entries.append((i, list(node.input), list(node.output), node))
+        elif i == owner.partition.node_indices[0]:
+            entries.append((i, list(owner.inputs), list(owner.outputs), owner))
+    return _order(entries)
