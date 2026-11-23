@@ -26,7 +26,32 @@ import onnxruntime as ort
 import pytest
 from onnx import TensorProto, numpy_helper, parser
 
-from onnxsim.einsum_decompose import decompose_einsum
+try:
+    from onnxsim.einsum_decompose import decompose_einsum
+except ImportError:  # the installed onnxsim predates einsum_decompose; load it
+    # straight from the source tree so these tests exercise the working copy.
+    import importlib.util as _ilu
+    import pathlib as _pl
+
+    _spec = _ilu.spec_from_file_location(
+        "einsum_decompose",
+        str(
+            _pl.Path(__file__).resolve().parents[1] / "onnxsim" / "einsum_decompose.py"
+        ),
+    )
+    assert _spec is not None and _spec.loader is not None
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    decompose_einsum = _mod.decompose_einsum
+    opt_einsum = _mod.opt_einsum
+else:
+    import onnxsim.einsum_decompose as _mod
+
+    opt_einsum = _mod.opt_einsum
+
+needs_opt_einsum = pytest.mark.skipif(
+    opt_einsum is None, reason="opt_einsum is not installed"
+)
 
 F = TensorProto.FLOAT
 
@@ -108,6 +133,14 @@ BATCHED_MATMUL_EQUATIONS = [
     ("bij,bjk->bik", (2, 5, 3), (2, 3, 4), ["MatMul"]),
     # operand 2's free axis precedes the contracted one, so it needs a transpose
     ("mj,nj->mn", (5, 3), (7, 3), ["Transpose", "MatMul"]),
+    # per-side broadcast: the batch axis rides on operand 1 while rank-2
+    # operand 2 broadcasts over it (and symmetrically a 3-D operand-1 axis).
+    ("bnc,cd->bnd", (4, 6, 8), (8, 3), ["MatMul"]),
+    ("abc,cd->abd", (2, 3, 4), (4, 5), ["MatMul"]),
+    ("ijk,jl->ikl", (2, 3, 4), (3, 5), ["Transpose", "MatMul"]),
+    # output order interleaves batch and free axes differently from MatMul's
+    # `batch ++ [m, n]`, so an output transpose is appended.
+    ("bnc,cd->bdn", (4, 6, 8), (8, 3), ["MatMul", "Transpose"]),
 ]
 
 # Equations that are NOT a single matrix multiplication. Each must be left
@@ -121,15 +154,8 @@ NON_BATCHED_MATMUL_EQUATIONS = [
     ("ij->", (3, 4), None),  # full reduction
     ("ij,jk->", (3, 4), (4, 5)),  # reduction to a scalar
     ("im,im->im", (2, 3), (2, 3)),  # shared axes that survive
-    ("ijk,jl->ikl", (2, 3, 4), (3, 5)),  # two shared axes both kept
-    # Per-axis broadcast: the batch axis is on one operand only.
-    ("bnc,cd->bnd", (4, 6, 8), (8, 3)),
-    ("bj,bk->bk", (4, 6), (4, 7)),
-    ("abc,cd->abd", (2, 3, 4), (4, 5)),
-    ("nchw,ncd->ndh", (2, 3, 8, 8), (2, 3, 5)),
-    # Output order interleaves batch and free axes differently from MatMul's
-    # `batch ++ [m, n]`, which would need an output transpose.
-    ("bnc,cd->bdn", (4, 6, 8), (8, 3)),
+    ("bj,bk->bk", (4, 6), (4, 7)),  # contracts nothing
+    ("nchw,ncd->ndh", (2, 3, 8, 8), (2, 3, 5)),  # two contractions at once
 ]
 
 _TWO_OPERAND_REFUSED = [e for e in NON_BATCHED_MATMUL_EQUATIONS if e[2] is not None]
@@ -265,6 +291,105 @@ def test_einsum_multiple_einsums_in_one_graph_all_lower():
         "C": rng.random((3, 4)).astype(np.float32),
     }
     _assert_same_result(model, rewritten, feed)
+
+
+# ---------------------------------------------------------------------------
+# Einsum chains (opt_einsum contraction paths)
+# ---------------------------------------------------------------------------
+
+
+def _einsum_chain_model(equation: str, shapes):
+    """An N-operand ``Einsum`` with the output shape derived from the equation.
+
+    Like :func:`_einsum_model` but for chains: ``onnx.helper`` is used because
+    the text format has no spelling for the string ``equation`` attribute.
+    """
+    from onnx import helper
+
+    lhs, out = equation.split("->")
+    terms = lhs.split(",")
+    assert len(terms) == len(shapes)
+    dims = {}
+    for term, shape in zip(terms, shapes):
+        for c, d in zip(term, shape):
+            dims[c] = d
+    names = [f"X{i}" for i in range(len(shapes))]
+    graph = helper.make_graph(
+        [helper.make_node("Einsum", names, ["Y"], equation=equation)],
+        "einsum",
+        [
+            helper.make_tensor_value_info(name, F, list(shape))
+            for name, shape in zip(names, shapes)
+        ],
+        [helper.make_tensor_value_info("Y", F, [dims[c] for c in out])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 9
+    return model
+
+
+# Chains where every pairwise step is a batched matmul: the whole node lowers.
+CHAIN_EQUATIONS = [
+    # (equation, operand shapes)
+    ("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)]),
+    ("bij,bjk,bkl->bil", [(2, 3, 4), (2, 4, 5), (2, 5, 6)]),
+    ("bnc,cd,df->bnf", [(4, 6, 8), (8, 3), (3, 5)]),
+    ("ij,jk,kl,lm->im", [(2, 3), (3, 4), (4, 5), (5, 6)]),
+]
+
+# Chains whose optimal path contains a non-matmul step (an outer product or a
+# double contraction): the node is left alone so the exporter still raises its
+# usual "unsupported op" error rather than lowering it to something wrong.
+CHAIN_REFUSED_EQUATIONS = [
+    ("nchw,ncd->ndh", [(2, 3, 8, 8), (2, 3, 5)]),  # two contractions at once
+    ("ab,bc,de,ef->acdf", [(2, 3), (3, 4), (5, 6), (6, 7)]),  # ends in outer
+]
+
+
+@needs_opt_einsum
+@pytest.mark.parametrize(
+    "equation,shapes",
+    CHAIN_EQUATIONS,
+    ids=[eq for eq, _ in CHAIN_EQUATIONS],
+)
+def test_einsum_chain_is_lowered(equation, shapes):
+    model = _einsum_chain_model(equation, shapes)
+    rewritten = decompose_einsum(model)
+    assert "Einsum" not in [n.op_type for n in rewritten.graph.node]
+    assert any(n.op_type == "MatMul" for n in rewritten.graph.node)
+    rng = np.random.default_rng(0)
+    feed = {
+        f"X{i}": rng.random(shape).astype(np.float32) for i, shape in enumerate(shapes)
+    }
+    _assert_same_result(model, rewritten, feed)
+
+
+@needs_opt_einsum
+@pytest.mark.parametrize(
+    "equation,shapes",
+    CHAIN_REFUSED_EQUATIONS,
+    ids=[eq for eq, _ in CHAIN_REFUSED_EQUATIONS],
+)
+def test_einsum_chain_with_non_matmul_step_is_left_alone(equation, shapes):
+    """A path containing an outer product or double contraction stays Einsum."""
+    model = _einsum_chain_model(equation, shapes)
+    assert decompose_einsum(model) is model
+    assert [n.op_type for n in model.graph.node] == ["Einsum"]
+
+
+@needs_opt_einsum
+def test_einsum_chain_without_shapes_is_left_alone():
+    """Unknown input shapes mean no contraction path: the node stays Einsum."""
+    model = _einsum_chain_model("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)])
+    model.graph.input[1].type.tensor_type.ClearField("shape")
+    assert decompose_einsum(model) is model
+
+
+def test_einsum_chain_without_opt_einsum_is_left_alone(monkeypatch):
+    """Without the optional dependency a chain stays Einsum (never an error)."""
+    monkeypatch.setattr(_mod, "opt_einsum", None)
+    model = _einsum_chain_model("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)])
+    assert decompose_einsum(model) is model
 
 
 def test_einsum_is_absent_from_every_exporter_op_table():

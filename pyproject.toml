@@ -45,6 +45,13 @@ onnxruntime = ["onnxruntime >= 1.6.0"]
 # sympy lets the MACs/FLOPs report keep dynamic dimensions (dim_param, e.g.
 # "batch") as symbols and produce a formula instead of assuming them to be 1.
 symbolic = ["sympy"]
+# opt-einsum computes the contraction path that onnxsim.einsum_decompose uses
+# to split three-or-more-operand Einsum nodes into pairwise steps, each lowered
+# to Transpose/MatMul on the way into the Core ML, TFLite and WebNN exporters.
+# Without it those chains (and anything its path deems non-matmul) are left as
+# Einsum; two-operand batched matmuls never need it. Lazy-imported, so the base
+# install stays dependency-free.
+einsum = ["opt-einsum >= 3.3.0"]
 # onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference) is
 # used by ModelInfo (the MACs/FLOPs/memory report) as a drop-in replacement for
 # onnx.shape_inference when installed: it resolves more shapes via symbolic
