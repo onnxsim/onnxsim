@@ -231,3 +231,20 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
   COMMAND 26, TOKEN 5) and the same size (2240 bytes).
 - So these options did not change the schedule for this shape. The 4% difference is within run-to-run noise.
 - Likely reason: the shape gives the pipeliner no tiles to overlap. Not tested at shapes that tile.
+
+## Compiler pipelining on a shape that tiles (measured)
+
+- Shape M=4096, K=2048, N=2048, 1×1 conv, one instance, double buffering on.
+- The same four pipelining options as before (`pipeline_spatial_tiles`, `pipeline_channel_tiles`,
+  `imc_double_buffer_pipeline`, `use_list_scheduler`).
+
+  | Build | Task stream | Aggregate TOPS (ops convention) |
+  |---|---|---|
+  | Default | 93,056 bytes; COMMAND 12,599, TOKEN 21, START_DMA 71 | 3.11 |
+  | Pipelined | 99,328 bytes; COMMAND 289, TOKEN 83, START_DMA 55 | 3.71 |
+
+- The task streams differ in structure, unlike the smaller 4096×512×512 shape, where the options changed
+  nothing. The pipelined build has about 40 times fewer commands and more tokens, consistent with a loop
+  that overlaps tiles and synchronizes between them.
+- Result: about 19% faster. The first measured gain from the compiler's pipelining.
+- Card healthy before and after.
