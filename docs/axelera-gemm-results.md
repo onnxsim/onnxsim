@@ -177,3 +177,41 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
 - The four-core build produces four kernels, one per core, so the split is real.
 - With this model the four-core split is slower than one core. Per-core kernels add cross-core synchronization.
 - The card stayed healthy after every run.
+
+
+## Corrections: TOPS convention and hardware checks (2026-11-24)
+
+### TOPS convention
+- The SDK hardware reference defines 1 TOPS = 10¹² multiply-accumulate (MAC) operations per second.
+- Earlier figures in this document used 2 ops per MAC (2 × MACs × FPS). Under the SDK convention they are about
+  half the values shown. Restated:
+
+  | Result | Earlier (2 ops/MAC) | SDK convention (MAC/s) |
+  |---|---|---|
+  | Best GEMM, 2 to 3 instances | 1.73 | 0.87 |
+  | ResNet-50, 1 instance, 1 core | 3.1 | 1.6 |
+  | ResNet-50, 4 instances | 8.9 | 4.5 |
+  | ResNet-50, vendor published (M.2, 1756 FPS) | 14.4 | 7.2 |
+  | Peak, 4 cores at 800 MHz | 214 (marketing) | 214 |
+
+- The percentages of peak in earlier sections were computed against the 2-op figures. Against the SDK-convention
+  peak they are about half as large. The conclusions are unchanged: utilization is far below peak.
+
+### Per-clock peak (derived)
+- 214 TOPS ÷ 4 cores ÷ 800 MHz ≈ 66,900 MACs per clock per core, close to 2¹⁶.
+- Derived from the marketing peak; not measured. If the peak assumed 2 ops per MAC, the per-clock figure would be
+  about 33,400 MACs.
+
+### Hardware checks on the 113m card
+
+| Hardware reference claim | Card | Status |
+|---|---|---|
+| 4 AI cores | 4 (`axcmd --get-aicore-count`) | matches |
+| 0 PVE cores | 0 (`axcmd --get-pvecore-count`) | matches |
+| 800 MHz clock | 800 MHz (`axdevice`) | matches |
+| 4 GB DDR (PCIe / M.2) | 8 GiB (`axdevice`) | mismatch for the 113m M.2 |
+| PCIe Gen 3 ×4 | slot max 8 GT/s ×4; link trained at 8 GT/s ×2 | link width is ×2 |
+| ~214 INT8 TOPS | not directly measurable | unverified |
+
+- On-chip memory sizes are not in the reference. Measured limits: about 4 MiB L1 (compiler constraint error) and
+  an 8 MiB L2 workspace (runtime allocation error).
