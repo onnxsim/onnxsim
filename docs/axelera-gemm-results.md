@@ -160,3 +160,20 @@ MACs are standard published values at 224×224.
   same family as `lanes > 1`. The SDK avoids it with clamped ramps and `where=` predicates in its pipelined
   templates; the loop form of those predicates is what fails for us. Closing this needs either a compiler fix
   or matching the SDK's template exactly, which we haven't achieved.
+
+## Shared-memory multi-core (SDK configuration, measured)
+
+The hardware reference describes a shared-memory mode with `aipu_cores_used: 4`. The SDK's deployment code
+compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.25 N`. Measured with ResNet-18
+(ONNX, random calibration, batch 1):
+
+| Build | Runtime config | Images/s |
+|---|---|---|
+| 1 core | 1 sub-device, 1 core | 671 |
+| 4 cores (4 kernels) | 1 sub-device, 4 cores | fails to create executor |
+| 4 cores (4 kernels) | 4 sub-devices, 4 cores | 540 |
+
+- The batch-4 build is rejected by the compiler: "Only batch sizes of 1 supported".
+- The four-core build produces four kernels, one per core, so the split is real.
+- With this model the four-core split is slower than one core. Per-core kernels add cross-core synchronization.
+- The card stayed healthy after every run.
