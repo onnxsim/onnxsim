@@ -98,3 +98,136 @@ So kernel execution is about 88% of each call.
   `reset` sysfs file fails with an I/O error, the link retrains to Gen1 and drops, and the driver probe fails.
   Only a host reboot restored the card, in every case so far.
 - Scripts: `scripts/axelera/axm/axm_scale.py` (scale show, set, check with reset), `pstream.py` (stream codec).
+
+
+## CNN throughput and instance scaling (measured on one Metis M.2 113m)
+
+Batch 1, streaming with one Python thread per instance, double buffering on. Effective TOPS = 2 × MACs × images/s.
+MACs are standard published values at 224×224.
+
+| Model | MACs | Config | Images/s | Effective TOPS |
+|---|---|---|---|---|
+| ResNet-18 | 1.82 G | 1 instance, 1 core | 685 | 2.5 |
+| ResNet-50 | 4.11 G | 1 instance, 1 core | 380 | 3.1 |
+| ResNet-50 | 4.11 G | 1 instance, 4 cores | 451 | 3.7 |
+| ResNet-50 | 4.11 G | 2 instances, 1 core each | 685 | 5.6 |
+| ResNet-50 | 4.11 G | 3 instances, 1 core each | 964 | 7.9 |
+| ResNet-50 | 4.11 G | 4 instances, 1 core each | 1085 | 8.9 |
+| MobileNetV2 | 0.30 G | 1 instance, 1 core | 766 | 0.46 |
+| EfficientNet-B0 | 0.39 G | 1 instance, 1 core | 356 | 0.28 |
+
+- Published vendor ResNet-50 (M.2): 1756 FPS, about 14.4 effective TOPS. Our four-instance result is about 62% of it.
+- Scaling levels off: three to four instances adds about 12%.
+- Multi-core within one instance gives about 19% at four cores. The gain from instances is larger.
+- DINOv2-S/14 is about 6.1 GMACs by our estimate. The vendor's 131 FPS is about 1.6 effective TOPS. Not measured on our card: the zoo has no prebuilt ViT package.
+
+
+## Single-core ceiling analysis
+
+- The SDK documents 214 INT8 TOPS as the theoretical peak across all four cores at 800 MHz. The per-core
+  peak is therefore about 53 TOPS.
+- Measured, as share of per-core peak:
+
+  | Result | Effective TOPS | Share of per-core peak |
+  |---|---|---|
+  | Best GEMM (3 instances) | 1.7 | about 3% |
+  | ResNet-50, 1 instance, 1 core | 3.1 | about 6% |
+  | ResNet-50, 4 instances | 8.9 total | about 4% per core |
+
+- 50 TOPS on one core would be about 93% of the per-core theoretical peak. We don't consider that reachable.
+- What would be needed:
+  - Matrix unit busy nearly all the time: DMA fully overlapped with compute. Blocked by the `lanes > 1` compiler
+    error for the loop form; the unrolled form compiles but does not overlap.
+  - Little synchronization inside a kernel. Each extra tile costs about 156 µs; each call has about 1 ms fixed
+    overhead.
+  - Large shapes with weights resident. The reload variant crashes the runtime.
+- Realistic next targets: a few more TOPS per core through better compiler output and the instance and width
+  settings already found. Roughly 10 to 20 TOPS per core needs working overlap, which depends on the `lanes`
+  fix or Axelera support.
+
+## Blocker attempt: tile loop as a registered operator (compiler, measured)
+
+- Goal: the `lanes > 1` error is raised for loop-form tile loops in prim_func. The SDK's pipelined templates
+  use `with A.tiles(...)` inside an operator's implementation. Test: a custom ScriptOp (`tiled_op.py`) whose
+  implementation runs the tile loop.
+- Results:
+  1. Inside `with A.script():` the `with A.tiles` form is rejected: "Invalid context expression".
+  2. Without `A.script()` (the SDK's pattern, where the implementation runs as ordinary Python), the with-form is
+     accepted and the operator compiles past the context check.
+  3. The next error: the input tile's shape is a symbolic `min(...)` expression, and the output tile is a
+     fixed 128 rows. The compiler's shape check rejects the mismatch.
+- Conclusion: the operator route removes the context error but not the symbolic-tile-shape error, which is the
+  same family as `lanes > 1`. The SDK avoids it with clamped ramps and `where=` predicates in its pipelined
+  templates; the loop form of those predicates is what fails for us. Closing this needs either a compiler fix
+  or matching the SDK's template exactly, which we haven't achieved.
+
+## Shared-memory multi-core (SDK configuration, measured)
+
+The hardware reference describes a shared-memory mode with `aipu_cores_used: 4`. The SDK's deployment code
+compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.25 N`. Measured with ResNet-18
+(ONNX, random calibration, batch 1):
+
+| Build | Runtime config | Images/s |
+|---|---|---|
+| 1 core | 1 sub-device, 1 core | 671 |
+| 4 cores (4 kernels) | 1 sub-device, 4 cores | fails to create executor |
+| 4 cores (4 kernels) | 4 sub-devices, 4 cores | 540 |
+
+- The batch-4 build is rejected by the compiler: "Only batch sizes of 1 supported".
+- The four-core build produces four kernels, one per core, so the split is real.
+- With this model the four-core split is slower than one core. Per-core kernels add cross-core synchronization.
+- The card stayed healthy after every run.
+
+
+## Corrections: TOPS convention and hardware checks (2026-11-24)
+
+### TOPS convention
+- The SDK hardware reference defines 1 TOPS = 10¹² multiply-accumulate (MAC) operations per second.
+- Earlier figures in this document used 2 ops per MAC (2 × MACs × FPS). Under the SDK convention they are about
+  half the values shown. Restated:
+
+  | Result | Earlier (2 ops/MAC) | SDK convention (MAC/s) |
+  |---|---|---|
+  | Best GEMM, 2 to 3 instances | 1.73 | 0.87 |
+  | ResNet-50, 1 instance, 1 core | 3.1 | 1.6 |
+  | ResNet-50, 4 instances | 8.9 | 4.5 |
+  | ResNet-50, vendor published (M.2, 1756 FPS) | 14.4 | 7.2 |
+  | Peak, 4 cores at 800 MHz | 214 (marketing) | 214 |
+
+- The percentages of peak in earlier sections were computed against the 2-op figures. Against the SDK-convention
+  peak they are about half as large. The conclusions are unchanged: utilization is far below peak.
+
+### Per-clock peak (derived)
+- 214 TOPS ÷ 4 cores ÷ 800 MHz ≈ 66,900 MACs per clock per core, close to 2¹⁶.
+- Derived from the marketing peak; not measured. If the peak assumed 2 ops per MAC, the per-clock figure would be
+  about 33,400 MACs.
+
+### Hardware checks on the 113m card
+
+| Hardware reference claim | Card | Status |
+|---|---|---|
+| 4 AI cores | 4 (`axcmd --get-aicore-count`) | matches |
+| 0 PVE cores | 0 (`axcmd --get-pvecore-count`) | matches |
+| 800 MHz clock | 800 MHz (`axdevice`) | matches |
+| 4 GB DDR (PCIe / M.2) | 8 GiB (`axdevice`) | mismatch for the 113m M.2 |
+| PCIe Gen 3 ×4 | slot max 8 GT/s ×4; link trained at 8 GT/s ×2 | link width is ×2 |
+| ~214 INT8 TOPS | not directly measurable | unverified |
+
+- On-chip memory sizes are not in the reference. Measured limits: about 4 MiB L1 (compiler constraint error) and
+  an 8 MiB L2 workspace (runtime allocation error).
+
+## Compiler pipelining options on the 1×1-conv GEMM (measured)
+
+- Options set: `pipeline_spatial_tiles`, `pipeline_channel_tiles`, `imc_double_buffer_pipeline`,
+  `use_list_scheduler`. The compiler accepted all four.
+- Shape M=4096, K=512, N=512, one instance, double buffering on:
+
+  | Build | Aggregate TOPS (ops convention) |
+  |---|---|
+  | Default config | 1.084 |
+  | Pipelining options | 1.128 |
+
+- The task streams are identical: same task counts by type (START_DMA 19, POLL_DMA 19, INSTRUCTION 3,
+  COMMAND 26, TOKEN 5) and the same size (2240 bytes).
+- So these options did not change the schedule for this shape. The 4% difference is within run-to-run noise.
+- Likely reason: the shape gives the pipeliner no tiles to overlap. Not tested at shapes that tile.
