@@ -248,3 +248,15 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
   that overlaps tiles and synchronizes between them.
 - Result: about 19% faster. The first measured gain from the compiler's pipelining.
 - Card healthy before and after.
+
+### Pipelining with more instances (same shape, measured)
+
+| Instances | Default (TOPS, ops convention) | Pipelined (TOPS) |
+|---|---|---|
+| 1 | 3.11 | 3.71 |
+| 2 | 4.19 | 4.35 |
+| 4 | 4.62 | 4.61 |
+
+- The pipelining gain shrinks as instances increase: about 19% at one instance, about 4% at two, none at four.
+- Running several instances already overlaps the transfers and matmuls, so the compiler's pipelining adds little on top.
+- Card healthy before and after.
