@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tempfile
+import warnings
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -1150,7 +1151,31 @@ def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelP
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
+    result = onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
+
+    # The C++ rewrite skips nodes silently (opset < 21, non-constant weights,
+    # K not divisible by 32, ...). Warn when no weight was actually quantized
+    # so a caller cannot ship an unchanged model believing it is INT4.
+    candidates = sum(n.op_type in ("MatMul", "Gemm", "Conv") for n in model.graph.node)
+    dq_before = sum(n.op_type == "DequantizeLinear" for n in model.graph.node)
+    dq_after = sum(n.op_type == "DequantizeLinear" for n in result.graph.node)
+    if candidates and dq_after == dq_before:
+        opset = _default_domain_opset(model)
+        hint = (
+            f"the model imports default-domain opset {opset}, but INT4 "
+            "DequantizeLinear needs opset >= 21 (use "
+            "simplify(..., target_opset_version=21))"
+            if opset < 21
+            else "no weight matched (weights must be constant float32 with a "
+            "reduction size divisible by 32)"
+        )
+        warnings.warn(
+            f"quantize_weight_only_int4 quantized 0 of {candidates} MatMul/Gemm/Conv "
+            f"nodes: {hint}.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return result
 
 
 def quantize_weight_only_matmul_nbits(
