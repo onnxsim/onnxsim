@@ -1151,7 +1151,9 @@ def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelP
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    result = onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
+    result = onnx.load_from_string(
+        C.quantize_weight_only_int4(model.SerializeToString())
+    )
 
     # The C++ rewrite skips nodes silently (opset < 21, non-constant weights,
     # K not divisible by 32, ...). Warn when no weight was actually quantized
