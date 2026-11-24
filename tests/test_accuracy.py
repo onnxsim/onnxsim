@@ -192,6 +192,25 @@ def _correlated_calibration(K=64, num_samples=64, rank=6, seed=1):
 # --------------------------------------------------------------------------- #
 # QuantizationConfig awq/gptq/gptaq/double_quant pipeline flags
 # --------------------------------------------------------------------------- #
+def test_quantize_weight_only_int4_warns_when_nothing_quantized_below_opset_21():
+    # Below opset 21 the C++ rewrite leaves every node untouched (no error, no
+    # DequantizeLinear). The wrapper must say so instead of returning silently.
+    model = _linear_model(K=64, N=32, opset=17, seed=0)
+    with pytest.warns(UserWarning, match="quantized 0 of 1 MatMul/Gemm/Conv"):
+        out = onnxsim.quantize_weight_only_int4(model)
+    assert not any(n.op_type == "DequantizeLinear" for n in out.graph.node)
+
+
+def test_quantize_weight_only_int4_no_warning_when_weights_quantized():
+    import warnings
+
+    model = _linear_model(K=64, N=32, opset=21, seed=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = onnxsim.quantize_weight_only_int4(model)
+    assert any(n.op_type == "DequantizeLinear" for n in out.graph.node)
+
+
 def test_quantize_weight_only_int4_default_flags_match_direct_call():
     model = _int4_matmul_model()
     config = onnxsim.QuantizationConfig(scheme="weight_only", dtype="int4")
