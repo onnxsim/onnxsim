@@ -215,3 +215,19 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
 
 - On-chip memory sizes are not in the reference. Measured limits: about 4 MiB L1 (compiler constraint error) and
   an 8 MiB L2 workspace (runtime allocation error).
+
+## Compiler pipelining options on the 1×1-conv GEMM (measured)
+
+- Options set: `pipeline_spatial_tiles`, `pipeline_channel_tiles`, `imc_double_buffer_pipeline`,
+  `use_list_scheduler`. The compiler accepted all four.
+- Shape M=4096, K=512, N=512, one instance, double buffering on:
+
+  | Build | Aggregate TOPS (ops convention) |
+  |---|---|
+  | Default config | 1.084 |
+  | Pipelining options | 1.128 |
+
+- The task streams are identical: same task counts by type (START_DMA 19, POLL_DMA 19, INSTRUCTION 3,
+  COMMAND 26, TOKEN 5) and the same size (2240 bytes).
+- So these options did not change the schedule for this shape. The 4% difference is within run-to-run noise.
+- Likely reason: the shape gives the pipeliner no tiles to overlap. Not tested at shapes that tile.
