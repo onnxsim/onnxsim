@@ -273,3 +273,18 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
   any overlap for this model.
 - The pipelining options help a large tiled matmul but hurt a convolutional network. Enable them per model, not globally.
 - Card healthy before and after.
+
+### Power limiter (measured)
+
+`axdevice --set-power-limit` enables a limiter that reduces AI-core performance when power exceeds the limit.
+The card was at 8.5 W. Measured with the limiter on, then off, then back on:
+
+| Workload | 8.5 W limit | Limiter off | Restored 8.5 W |
+|---|---|---|---|
+| 4096×2048×2048 GEMM, 1 instance (TOPS, ops convention) | 3.11 | 3.27 | not repeated |
+| ResNet-18, 1 core (images/s) | 673 | 827 | 645 |
+
+- With the limiter off, ResNet-18 is about 20% faster (827 against 645 to 673 with it on).
+- The GEMM gain is about 5%, within the range where the earlier runs varied.
+- Not measured: temperature and software throttling with the limiter off. Check before running sustained workloads.
+- The limiter was restored to 8.5 W after the test. Card healthy.
