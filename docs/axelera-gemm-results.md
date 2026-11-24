@@ -260,3 +260,16 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
 - The pipelining gain shrinks as instances increase: about 19% at one instance, about 4% at two, none at four.
 - Running several instances already overlaps the transfers and matmuls, so the compiler's pipelining adds little on top.
 - Card healthy before and after.
+
+### Pipelining options on ResNet-18 (one core, measured)
+
+| Build | Task stream | Images/s (1 instance, 1 core) |
+|---|---|---|
+| Default | 34,752 bytes; COMMAND 6,401 | 666 |
+| Pipelined | 57,408 bytes; COMMAND 24,835 | 579 |
+
+- The pipelined build is about 13% slower here, the reverse of the large GEMM, where it was about 19% faster.
+- Its stream is larger (more commands and tokens), so the extra synchronization and command overhead outweighs
+  any overlap for this model.
+- The pipelining options help a large tiled matmul but hurt a convolutional network. Enable them per model, not globally.
+- Card healthy before and after.
