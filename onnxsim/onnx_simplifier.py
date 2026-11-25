@@ -9805,7 +9805,9 @@ def _snapshot_graph_io_metadata(
     for kind in _GRAPH_IO_METADATA_KINDS:
         for vi in getattr(model.graph, kind):
             if vi.metadata_props:
-                snapshot[(kind, vi.name)] = [(p.key, p.value) for p in vi.metadata_props]
+                snapshot[(kind, vi.name)] = [
+                    (p.key, p.value) for p in vi.metadata_props
+                ]
     return snapshot
 
 
