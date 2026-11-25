@@ -321,3 +321,15 @@ Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the 
   wait (`NOWAIT=1`), so the copy can still be in flight. That is a timing effect of the schedule, not a
   failure of the address.
 - Card healthy before and after.
+
+### Input-slot timing check: a race, not a wrong address (device test, measured)
+
+- Build: 4-slot pipelined GEMM, 1024×512×1024, no explicit DMA waits (`NOWAIT=1`). Copies run three tiles ahead.
+- M_IFD_0 addresses cycle through four slots, 64 KiB apart. Baseline: every tile matches its own reference.
+- Test: tile 0's input fetch pointed at slot 1 (tile 1's slot). Tile 0 then matches tile 1's reference at 1%, not
+  its own, and best matches tile 5's reference at 75%, which is not an exact match.
+- Interpretation: slot 1 was overwritten by a later tile's copy (tile 5 uses slot 1) before tile 0's matmul read
+  it. The copies run ahead of the matmuls because nothing waits on them. So the earlier mismatch in the
+  two-slot build is the same race, not a wrong address.
+- Confirming the race exactly would need a build with working waits. Those did not compile in this route.
+- Card healthy before and after.
