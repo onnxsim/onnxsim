@@ -396,14 +396,17 @@ def export_causal_lm_static_cache(
             (input_ids, cache_position, attention_mask, *dummy_kv),
             dynamic_shapes=dynamic_shapes,
         )
-        torch.onnx.export(
+        # The helper exports in memory, records each graph I/O's pytree path
+        # (args/kwargs and output nesting) as metadata, then saves to ``path``.
+        from onnxsim.pytree_io import export_exported_program_to_onnx
+
+        export_exported_program_to_onnx(
             exported_program,
-            f=path,
+            path,
             input_names=["input_ids", "cache_position", "attention_mask"]
             + kv_input_names,
             output_names=["logits"] + kv_output_names,
             opset_version=18,
-            dynamo=True,
         )
         return path
 
