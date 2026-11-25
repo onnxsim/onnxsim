@@ -288,3 +288,21 @@ The card was at 8.5 W. Measured with the limiter on, then off, then back on:
 - The GEMM gain is about 5%, within the range where the earlier runs varied.
 - Not measured: temperature and software throttling with the limiter off. Check before running sustained workloads.
 - The limiter was restored to 8.5 W after the test. Card healthy.
+
+### Scheduler options on the large GEMM (measured, one instance)
+
+Shape 4096×2048×2048, 1×1 conv, double buffering on.
+
+| Build | Options | TOPS (ops convention) |
+|---|---|---|
+| Default | none | 3.11 |
+| List scheduler only | `use_list_scheduler` | 3.06 |
+| IFDW grouping only | `group_ifdw_tasks` | 3.10 |
+| Pipelining options (earlier) | four pipelining options | 3.71 |
+| Combined | pipelining + list scheduler + IFDW grouping | 3.79 |
+
+- Neither option helps alone: both are within run-to-run noise of the default.
+- Adding them to the pipelining options gives about 2% more, which is within noise.
+- The list-scheduler build's packed stream uses a different chunk layout from the default build. My stream
+  decoder doesn't parse it, so its task counts were not compared.
+- Card healthy before and after.
