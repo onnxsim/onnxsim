@@ -270,3 +270,16 @@ card, which needs a reset plan first.
 - The address varies with shape (for example `0x181e0000` at N=2048), so it is a staging location for the
   weight block, not a per-chunk pointer. Exact meaning still open; a test needs a second, different valid address.
 - Card healthy before and after.
+
+### TOKEN and INSTRUCTION payloads (read-only decode)
+
+- **TOKEN (type 2):** mode 1 in every token, with one target (id 1). The count is 16 in both the base kernel
+  (1024×512×512) and the 2048-wide kernel. Tokens look like fixed synchronization points per kernel, not
+  per chunk.
+- **INSTRUCTION (type 1):** each task carries a block of per-module instructions. Its target is a module ID and
+  its count is the number of entries.
+  - Entry size: 8 bytes for M_IFD_0 and M_IFD_W; 4 bytes for the other modules.
+  - Blocks: 3 in the base kernel, 5 in the 2048-wide kernel.
+  - Entry counts scale with the chunk count: M_IFD_0 has 4 entries and M_IFD_W has 10 in the 2048-wide kernel.
+- **Unverified:** which instruction entries drive which matrix operations. A test would change one entry and check
+  the output, which needs your approval.
