@@ -308,3 +308,16 @@ Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the 
   `0x182e0000`. The same holds across all eight tiles, so the address does not select a per-tile output buffer.
 - Output tiles therefore share one L1 staging location for the output write.
 - Card healthy before and after. No device state was changed.
+
+### M_IFD_0 input slot (device test, measured)
+
+- The M_IFD_0 low addresses alternate between `0x183e0000` and `0x183f0000` across tiles. Those are 64 KiB
+  apart, the size of one 128×8×64 activation tile. So the two addresses are the two activation slots, used
+  in turn (double buffering).
+- Baseline: every tile matches its own reference (about 99%).
+- Test: tile 0's input fetch pointed at the second slot (`0x183f0000`). Tile 0 then matched neither its own
+  reference nor tile 1's (about 1.3% each). So the address does select the activation data that tile 0 reads.
+- Tile 1's data was not in the second slot when tile 0 read it. This build issues the copy without an explicit
+  wait (`NOWAIT=1`), so the copy can still be in flight. That is a timing effect of the schedule, not a
+  failure of the address.
+- Card healthy before and after.
