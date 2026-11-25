@@ -283,3 +283,19 @@ card, which needs a reset plan first.
   - Entry counts scale with the chunk count: M_IFD_0 has 4 entries and M_IFD_W has 10 in the 2048-wide kernel.
 - **Unverified:** which instruction entries drive which matrix operations. A test would change one entry and check
   the output, which needs your approval.
+
+### Input fetch, output write, accumulate, digital path (read-only decode)
+
+Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the K=2048 kernel (fm-kwide4).
+
+- **M_IFD_0, M_ODR, D_IFD_0, D_ODR (word 1):** the low 32 bits are L1 addresses. They sit in the 0x18xxxxxx
+  region and change with shape, for example M_ODR at 0x18360000 (base), 0x181e0000 (N=2048), and 0x182c0000
+  (K=2048). The high bits (56 and 58) are flags. Bits 58 to 62 differ between M_IFD_0 variants.
+- **M_IAU (word 0):** bit 48 is set in the K=2048 kernel only. It is the accumulate-mode flag that changes with
+  the number of K chunks.
+- **M_DPU (word 1):** matches the earlier width code (4 times N/512, bits 40 to 44). Unchanged here.
+- **D_IFD_0 and D_ODR:** 16 commands each, in two word-0 patterns (0x1000000000000 and 0x1004000000000). The
+  second pattern is the same command with a different flag bit.
+- **Not yet verified:** the exact flag meanings and whether the L1 addresses map to specific weight, activation,
+  or output buffers. Testing that needs a device run that changes these addresses, which I'd only do with your
+  approval.
