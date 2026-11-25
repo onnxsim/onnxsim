@@ -299,3 +299,12 @@ Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the 
 - **Not yet verified:** the exact flag meanings and whether the L1 addresses map to specific weight, activation,
   or output buffers. Testing that needs a device run that changes these addresses, which I'd only do with your
   approval.
+
+### M_ODR output-write address (device check, measured)
+
+- 1024×512×1024 kernel, eight output writes (one per tile). Baseline: every tile matches its own reference
+  (about 99.1%).
+- The swap I planned (tiles 0 and 1) was a no-op: both output writes already carry the same low address,
+  `0x182e0000`. The same holds across all eight tiles, so the address does not select a per-tile output buffer.
+- Output tiles therefore share one L1 staging location for the output write.
+- Card healthy before and after. No device state was changed.
