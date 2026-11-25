@@ -260,3 +260,13 @@ card, which needs a reset plan first.
 - Result: both 512-column chunks mismatch about 99%, overall exact 0.9%.
 - Conclusion: the index selects which weight chunk a matrix program loads. Swapping makes each chunk's columns
   use the other chunk's weights. Confirmed prediction; no crash.
+
+### M_IFD_W address (device check, measured)
+
+- 1024×512×1024 kernel, two weight loads (M_IFD_W). Both word 1 values are identical: `0x40000000182e0000`.
+- Baseline matches the reference at 99.1%. The one-sided address change I planned was a no-op, because the
+  low 32 bits were already equal. No device change was made.
+- So the low address does not select the chunk. The chunk is selected by the matrix-program index (M_MVMPRG).
+- The address varies with shape (for example `0x181e0000` at N=2048), so it is a staging location for the
+  weight block, not a per-chunk pointer. Exact meaning still open; a test needs a second, different valid address.
+- Card healthy before and after.
