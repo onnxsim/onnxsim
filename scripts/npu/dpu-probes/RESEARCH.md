@@ -24,6 +24,22 @@ within the section: `inv` = `task.dpu.invariant.0.0`, `var` = `task.dpu.variant.
 | DMA sizes | Halving the input or the output transfer size is rejected by the device | Two runs, both device errors |
 | Generated conv | A 3x3 conv (cin 16, cout 32) with new weights, new biases and Relu, written by the layout rules into a compiled template | Maximum error 0.0075 against numpy, with and without Relu |
 
+## Generator coverage (device, ResNet50 conv shapes)
+
+A generator writes a conv from a compiled template of the same shape: new weights in the record layout, new fp32 bias records,
+and Relu through the lower clamp. The template's placement, read bases and DMA settings are kept from the compile.
+
+- **Single launch** (`gen_all_shapes.py`): 8 of 23 unique ResNet50 conv shapes pass (relative error about 3e-4). The 15
+  failures are all over the single-launch limits we measured (about 147k weights per launch, about 400k input or output
+  elements). Examples: the 3x3 with 512 channels (about 2.4M weights), the 1x1 with 256 by 64 (output about 800k elements).
+  The failures are inferred from the sizes, not checked one by one.
+- **Chunked** (`gen_chunked_device.py`, sub-launches sized by `chunked2.pick`): 23 of 23 pass, relative error 2e-4 to 4e-4.
+  The launch count per shape runs from 1 to 64.
+- Bias-record note: a template compiled with zero bias has no bias records to patch. The generator uses a nonzero template bias.
+
+Generator debugging (`debug_gen.py`): with the template self-patched, the output matches numpy (error 5e-4); with new weights
+and new bias, all four 16-channel groups match (error 1e-3) once the template's bias is nonzero.
+
 ## Compile-only (not checked on the device)
 
 - Size formulas, all compiled: input bytes = cin*hin^2*2 (`dma0.0` 286); output bytes = cout*hout^2*2 (`dma0.1` 6); weight bytes = 2*cout*R + 256*ceil(cout/16) (`dma1.0` 6). Matched in 80 of 80 configs.
