@@ -2286,3 +2286,51 @@ def test_inline_functions_flattens_local_function():
     # initializer/Constant, followed by Relu).
     assert "Relu" in op_types
     assert len(sim_model.functions) == 0
+
+
+def _set_io_metadata(vi, key, value):
+    entry = vi.metadata_props.add()
+    entry.key = key
+    entry.value = value
+
+
+def test_simplify_preserves_graph_io_metadata_props():
+    # Caller-written metadata on graph inputs/outputs (e.g. pytree paths) must
+    # survive simplify(), which otherwise drops it inside the C++ IR round trip.
+    model = parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["" : 17]>
+        g (float[2, 3] x, float[2, 3] y) => (float[2, 3] out, float[2, 3] unused)
+        {
+            t = Add(x, y)
+            out = Relu(t)
+            unused = Neg(t)
+        }
+        """
+    )
+    _set_io_metadata(model.graph.input[0], "onnxsim.pytree", "cfg/scale/0")
+    _set_io_metadata(model.graph.input[1], "onnxsim.pytree", "cfg/bias")
+    _set_io_metadata(model.graph.output[0], "onnxsim.pytree", "out/0")
+    _set_io_metadata(model.graph.output[1], "onnxsim.pytree", "out/1")
+    _set_io_metadata(model.graph.output[1], "onnxsim.note", "dropped")
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    inputs = {vi.name: vi for vi in sim_model.graph.input}
+    outputs = {vi.name: vi for vi in sim_model.graph.output}
+    assert {p.key: p.value for p in inputs["x"].metadata_props} == {
+        "onnxsim.pytree": "cfg/scale/0"
+    }
+    assert {p.key: p.value for p in inputs["y"].metadata_props} == {
+        "onnxsim.pytree": "cfg/bias"
+    }
+    assert {p.key: p.value for p in outputs["out"].metadata_props} == {
+        "onnxsim.pytree": "out/0"
+    }
+    # The unused output may be removed by simplify; if it survives, its
+    # metadata must too.
+    if "unused" in outputs:
+        assert {p.key: p.value for p in outputs["unused"].metadata_props} == {
+            "onnxsim.pytree": "out/1",
+            "onnxsim.note": "dropped",
+        }

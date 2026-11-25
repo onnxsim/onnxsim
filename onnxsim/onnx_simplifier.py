@@ -9775,13 +9775,59 @@ def simplify(
     pair whose measured traffic saving is at least that many bytes is replaced by
     a call to a model-local function. See ``onnxsim.local_function_fusion``.
     """
+    io_metadata = _snapshot_graph_io_metadata(model)
     result, check_ok = _simplify(model, *args, **kwargs)
     if outline_residual_min_bytes is None:
+        _restore_graph_io_metadata(result, io_metadata)
         return result, check_ok
     from onnxsim.local_function_fusion import outline_residual_add_norm
 
     outlined = outline_residual_add_norm(result, outline_residual_min_bytes)
+    _restore_graph_io_metadata(outlined.model, io_metadata)
     return outlined.model, check_ok
+
+
+# ``ValueInfoProto.metadata_props`` on graph inputs/outputs (e.g. pytree paths
+# written by a caller) is not carried through onnxsim's C++ core: its IR
+# converter keeps only name/type/doc_string for graph I/O, so the simplified
+# model comes back with the entries stripped. Snapshot them by value name
+# before simplifying and re-attach them afterwards.
+_GRAPH_IO_METADATA_KINDS = ("input", "output")
+
+
+def _snapshot_graph_io_metadata(
+    model: Union[str, onnx.ModelProto],
+) -> Dict[Tuple[str, str], List[Tuple[str, str]]]:
+    if isinstance(model, str):
+        # Only the graph I/O is read, so skip loading external tensor data.
+        model = onnx.load_model(model, load_external_data=False)
+    snapshot: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    for kind in _GRAPH_IO_METADATA_KINDS:
+        for vi in getattr(model.graph, kind):
+            if vi.metadata_props:
+                snapshot[(kind, vi.name)] = [(p.key, p.value) for p in vi.metadata_props]
+    return snapshot
+
+
+def _restore_graph_io_metadata(
+    model: onnx.ModelProto,
+    snapshot: Dict[Tuple[str, str], List[Tuple[str, str]]],
+) -> None:
+    if not snapshot:
+        return
+    for kind in _GRAPH_IO_METADATA_KINDS:
+        for vi in getattr(model.graph, kind):
+            for key, value in snapshot.get((kind, vi.name), ()):
+                # Overwrite an existing entry with the same key rather than
+                # duplicating it, so re-running is idempotent.
+                for p in vi.metadata_props:
+                    if p.key == key:
+                        p.value = value
+                        break
+                else:
+                    entry = vi.metadata_props.add()
+                    entry.key = key
+                    entry.value = value
 
 
 class PyModelExecutor(C.ModelExecutor):
