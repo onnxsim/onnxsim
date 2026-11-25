@@ -251,3 +251,12 @@ card, which needs a reset plan first.
 - Remaining hypothesis: tile 0's matrix computation uses different operands (input or weight source) because
   bits 19 to 21 of its M_ODR write select them. Next test would compare tile 0 against products of other tiles'
   inputs and of permuted weights.
+
+### M_MVMPRG index (device test, measured)
+
+- Setup: 1024×512×1024 kernel, two matrix programs (M_MVMPRG). Bits 8–15 of word 1 are their index: 0 and 1.
+  Baseline run (no change) matches the reference at 99.1%.
+- Swap: the two indices exchanged (0 to 1, 1 to 0). Health check passed before and after.
+- Result: both 512-column chunks mismatch about 99%, overall exact 0.9%.
+- Conclusion: the index selects which weight chunk a matrix program loads. Swapping makes each chunk's columns
+  use the other chunk's weights. Confirmed prediction; no crash.
