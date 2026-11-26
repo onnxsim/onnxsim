@@ -379,3 +379,15 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   clearly separable with three compiles, so the earlier sublinear fit (33 µs at 512 rows) should not be relied on.
 - Reading: the 128-row point is reproducible. Above 256 rows the cost plateaus within this data, which fits a fixed
   per-call cost at larger shapes rather than a linear row term. Still above the full-array estimate at every size.
+
+### Other row counts, three compiles per point (device test, measured)
+
+- K=512, N=512, R=1 and 8, scale and cast once, 200 timed calls per point, three compiles per row count.
+- Per extra matmul (slope from R=1 to R=8), compiles a, b, c, with medians:
+  64 rows 6.5, -1.7, 0.2 µs (median 0.2); 128 rows 8.7 (median, from the previous section);
+  192 rows -0.2, -0.8, 8.5 µs (median -0.2); 256 rows median 25.1; 384 rows 17.2, 26.5, 9.0 µs (median 17.2);
+  512 rows median 26.6; 768 rows 24.9, 29.0, 44.4 µs (median 29.0).
+- The R=1 baseline also moves by 50 to 100 µs between compiles at 64 and 192 rows, which swamps the slope there.
+- Reading: no clean row law. The median slope is near zero at 64 and 192 rows, and rises to about 25 to 29 µs at 256 to
+  768 rows, with 384 rows in between. Per-compile noise is about ±15 µs, so these medians are not a fitted curve.
+- Full-array estimate at 768 rows is 3.75 µs per matmul; the measured median is about 29 µs, roughly 8 times above it.
