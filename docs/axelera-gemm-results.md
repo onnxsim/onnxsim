@@ -314,3 +314,15 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Four instances: 4.93 TOPS, the best measured so far. Only 20 calls per run, so treat as approximate.
 - Per core this is about 0.6 MAC-TOPS against an ideal of about 53 MAC-TOPS per core: roughly 1% of ideal.
 - Health check passed before and after.
+
+### Overlap with waits placed after both launches (device test, measured)
+
+- Form (AxelerScript guide section 12): for each tile, launch the copy for the next tile and the matmul for this
+  tile, each with an id, then wait for both after both launches. Two L1 slots; the first copy waited before the first matmul.
+- Compiled with working waits: no `DMA POLL` or `Cannot determine core` errors. The earlier wait failures came from
+  the wait placement, not from missing support.
+- Correct: 99.16% of values match the reference (same as the non-overlapped build).
+- Speed: 2316 µs kernel time at 1024×512×512, 8 tiles. The non-overlapped build measured 2355 µs. No gain.
+- Reading: the waits are correct, but the copy and the matmul still don't run at the same time in a way that shortens
+  the kernel. The per-tile cost is not mainly the DMA wait.
+- Card healthy before and after.
