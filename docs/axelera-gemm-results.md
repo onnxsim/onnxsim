@@ -461,3 +461,18 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   execute count is not the cost at this size. This supports the program-count hypothesis, but it does not isolate it: no
   setting found so far changes the program count with the executes fixed.
 - Drift: the same default shape measured 1717 µs earlier this session and 2035 µs here. Compare only within one session.
+
+### Programs versus executes, interleaved (device test, measured)
+
+- Compile-only: `min_tiling_factor=4` at 256×512×2048 gives 16 programs and 16 executes (the `=2` setting gives 8 and 4,
+  the default 8 and 2). Other settings tried (`max_tiling_attempts` 8, `enable_datapath_fusion` false, `enable_icr`,
+  `enable_2d_dma` false, `enable_dual_channel_dma` false, `enable_async_scheduling` false, `enable_buffer_promotion`
+  false, `enable_memory_paging`) left the count at 8 and 2. `max_tiling_attempts` 1 fails to compile.
+- Device, one block, rounds interleaved, three compiles per setting (kernel median):
+  - default (8 programs, 2 executes): 1660, 1659, 1664 and 1674, 1705, 1713 µs. Median about 1680 µs.
+  - min_tiling_factor 2 (8 programs, 4 executes): 1675, 1688, 1703 µs. Median 1688 µs.
+  - min_tiling_factor 4 (16 programs, 16 executes): 1869, 1838, 2094 µs. Median 1869 µs.
+- Fit T = a + b·programs + c·executes through the three medians (exact, three points): b about 17 µs per program,
+  c about 4 µs per execute, a about 1540 µs. The execute term is within noise; the program term is the one the data
+  support. This is still three points with no residual check.
+- Drift: the default measured 2035 µs in an earlier block and 1680 µs here. Only compare settings inside one block.
