@@ -348,3 +348,14 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - 128×512×512 (half the rows): R=1 756 µs, R=4 696 µs. The slope is inside the noise, so the per-row cost is not measured.
 - Reading: cost scales with 512-column chunks, matching the chunk-count model. Single-call time is dominated by a fixed
   cost of roughly 700 µs.
+
+### Row scaling of the resident-operand matmul (device test, measured)
+
+- K=512, N=512, R=1, 4, 8 per row count, scale and cast once, 200 timed calls per point, one compile per point.
+- Per extra matmul (slope R=1 to R=8): 128 rows 16.4 µs, 256 rows 25.2 µs, 512 rows 33.2 µs.
+- Four times the rows costs about two times the time, so the cost is not linear in rows. A linear fit gives roughly 11 µs
+  fixed per matmul plus about 0.044 µs per row.
+- Full-array estimates for these shapes: 0.63 µs (128 rows), 1.25 µs (256), 2.5 µs (512). The measured times are 20 to 26 times above
+  those estimates.
+- Reading: the fixed part per matmul plus the sublinear row term point to per-matmul overhead in the matrix program, not a
+  full array at 5% duty. This is not yet a proof of partial array use; it is consistent with it.
