@@ -421,3 +421,19 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Hypothesis, not verified: most single-call time is weight-program and weight-feed work rather than the execute itself.
   This fits the earlier observation that each extra 512-column chunk adds about 300 µs. Testing it needs a device run
   that varies the program count with the total work fixed.
+
+### Equal-work shapes versus program count (device test, measured)
+
+- Three shapes with the same total work (537 MMAC each), K=512, R=1, scale and cast once, 200 timed calls per point,
+  three compiles per shape. Matrix programs from the compile-only stream count:
+
+| Shape (M×K×N) | Matrix programs | Executes | Kernel median (three compiles) |
+|---|---|---|---|
+| 256×512×4096 | 32 | 8 | 3123 µs (3079, 3314, 3123) |
+| 512×512×2048 | 16 | 4 | 2335 µs (2335, 2329, 2341) |
+| 1024×512×1024 | 8 | 4 | 2169 µs (2166, 2214, 2169) |
+
+- Time falls as the program count falls: about 40 µs per program between 32 and 8, about 21 µs per program between 16 and 8.
+- Confounded: M changes from 256 to 1024 across the rows, so activation and output movement also change. This run cannot
+  separate program count from row count.
+- Reading: at equal work, the time is still about 200 times the full-array estimate (about 10 µs for 537 MMAC).
