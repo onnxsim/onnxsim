@@ -306,3 +306,11 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - The list-scheduler build's packed stream uses a different chunk layout from the default build. My stream
   decoder doesn't parse it, so its task counts were not compared.
 - Card healthy before and after.
+
+### Taller pipelined GEMM (8192×2048×2048, measured)
+
+- Build: pipelining options plus scheduler and IFDW grouping. Compiled without error.
+- One instance: 4.23 TOPS (ops convention), up from 3.71 for the 4096-row pipelined build.
+- Four instances: 4.93 TOPS, the best measured so far. Only 20 calls per run, so treat as approximate.
+- Per core this is about 0.6 MAC-TOPS against an ideal of about 53 MAC-TOPS per core: roughly 1% of ideal.
+- Health check passed before and after.
