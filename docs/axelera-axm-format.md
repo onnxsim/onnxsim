@@ -251,3 +251,107 @@ card, which needs a reset plan first.
 - Remaining hypothesis: tile 0's matrix computation uses different operands (input or weight source) because
   bits 19 to 21 of its M_ODR write select them. Next test would compare tile 0 against products of other tiles'
   inputs and of permuted weights.
+
+### M_MVMPRG index (device test, measured)
+
+- Setup: 1024×512×1024 kernel, two matrix programs (M_MVMPRG). Bits 8–15 of word 1 are their index: 0 and 1.
+  Baseline run (no change) matches the reference at 99.1%.
+- Swap: the two indices exchanged (0 to 1, 1 to 0). Health check passed before and after.
+- Result: both 512-column chunks mismatch about 99%, overall exact 0.9%.
+- Conclusion: the index selects which weight chunk a matrix program loads. Swapping makes each chunk's columns
+  use the other chunk's weights. Confirmed prediction; no crash.
+
+### M_IFD_W address (device check, measured)
+
+- 1024×512×1024 kernel, two weight loads (M_IFD_W). Both word 1 values are identical: `0x40000000182e0000`.
+- Baseline matches the reference at 99.1%. The one-sided address change I planned was a no-op, because the
+  low 32 bits were already equal. No device change was made.
+- So the low address does not select the chunk. The chunk is selected by the matrix-program index (M_MVMPRG).
+- The address varies with shape (for example `0x181e0000` at N=2048), so it is a staging location for the
+  weight block, not a per-chunk pointer. Exact meaning still open; a test needs a second, different valid address.
+- Card healthy before and after.
+
+### TOKEN and INSTRUCTION payloads (read-only decode)
+
+- **TOKEN (type 2):** mode 1 in every token, with one target (id 1). The count is 16 in both the base kernel
+  (1024×512×512) and the 2048-wide kernel. Tokens look like fixed synchronization points per kernel, not
+  per chunk.
+- **INSTRUCTION (type 1):** each task carries a block of per-module instructions. Its target is a module ID and
+  its count is the number of entries.
+  - Entry size: 8 bytes for M_IFD_0 and M_IFD_W; 4 bytes for the other modules.
+  - Blocks: 3 in the base kernel, 5 in the 2048-wide kernel.
+  - Entry counts scale with the chunk count: M_IFD_0 has 4 entries and M_IFD_W has 10 in the 2048-wide kernel.
+- **Unverified:** which instruction entries drive which matrix operations. A test would change one entry and check
+  the output, which needs your approval.
+
+### Input fetch, output write, accumulate, digital path (read-only decode)
+
+Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the K=2048 kernel (fm-kwide4).
+
+- **M_IFD_0, M_ODR, D_IFD_0, D_ODR (word 1):** the low 32 bits are L1 addresses. They sit in the 0x18xxxxxx
+  region and change with shape, for example M_ODR at 0x18360000 (base), 0x181e0000 (N=2048), and 0x182c0000
+  (K=2048). The high bits (56 and 58) are flags. Bits 58 to 62 differ between M_IFD_0 variants.
+- **M_IAU (word 0):** bit 48 is set in the K=2048 kernel only. It is the accumulate-mode flag that changes with
+  the number of K chunks.
+- **M_DPU (word 1):** matches the earlier width code (4 times N/512, bits 40 to 44). Unchanged here.
+- **D_IFD_0 and D_ODR:** 16 commands each, in two word-0 patterns (0x1000000000000 and 0x1004000000000). The
+  second pattern is the same command with a different flag bit.
+- **Not yet verified:** the exact flag meanings and whether the L1 addresses map to specific weight, activation,
+  or output buffers. Testing that needs a device run that changes these addresses, which I'd only do with your
+  approval.
+
+### M_ODR output-write address (device check, measured)
+
+- 1024×512×1024 kernel, eight output writes (one per tile). Baseline: every tile matches its own reference
+  (about 99.1%).
+- The swap I planned (tiles 0 and 1) was a no-op: both output writes already carry the same low address,
+  `0x182e0000`. The same holds across all eight tiles, so the address does not select a per-tile output buffer.
+- Output tiles therefore share one L1 staging location for the output write.
+- Card healthy before and after. No device state was changed.
+
+### M_IFD_0 input slot (device test, measured)
+
+- The M_IFD_0 low addresses alternate between `0x183e0000` and `0x183f0000` across tiles. Those are 64 KiB
+  apart, the size of one 128×8×64 activation tile. So the two addresses are the two activation slots, used
+  in turn (double buffering).
+- Baseline: every tile matches its own reference (about 99%).
+- Test: tile 0's input fetch pointed at the second slot (`0x183f0000`). Tile 0 then matched neither its own
+  reference nor tile 1's (about 1.3% each). So the address does select the activation data that tile 0 reads.
+- Tile 1's data was not in the second slot when tile 0 read it. This build issues the copy without an explicit
+  wait (`NOWAIT=1`), so the copy can still be in flight. That is a timing effect of the schedule, not a
+  failure of the address.
+- Card healthy before and after.
+
+### Input-slot timing check: a race, not a wrong address (device test, measured)
+
+- Build: 4-slot pipelined GEMM, 1024×512×1024, no explicit DMA waits (`NOWAIT=1`). Copies run three tiles ahead.
+- M_IFD_0 addresses cycle through four slots, 64 KiB apart. Baseline: every tile matches its own reference.
+- Test: tile 0's input fetch pointed at slot 1 (tile 1's slot). Tile 0 then matches tile 1's reference at 1%, not
+  its own, and best matches tile 5's reference at 75%, which is not an exact match.
+- Interpretation: slot 1 was overwritten by a later tile's copy (tile 5 uses slot 1) before tile 0's matmul read
+  it. The copies run ahead of the matmuls because nothing waits on them. So the earlier mismatch in the
+  two-slot build is the same race, not a wrong address.
+- Confirming the race exactly would need a build with working waits. Those did not compile in this route.
+- Card healthy before and after.
+
+## Field coverage summary
+
+| Field | Status | How verified |
+|---|---|---|
+| Requantization scale (L1 float array) | verified on device | rewrite to 1/2048 matches reference; zero gives all-zero output |
+| D_IFD_1 per-tile index | verified on device | remapping sets each tile's scale vector (8 of 8 tiles as predicted) |
+| M_MVMPRG index (bits 8–15) | verified on device | swap makes each chunk use the other chunk's weights |
+| M_MVMEXE chunk count (bits 16–18) | verified on device | count 0 and 2 each crashed the card; count equals chunks |
+| M_ODR output address | verified on device | identical across tiles; swap is a no-op |
+| M_IFD_0 input address | verified on device | selects the activation slot; mismatched slot gives a race |
+| M_ODR flag bits 17, 19, 20, 21 | verified on device | corrupt tile 0 only |
+| M_DPU width field (bits 40–44) | compile-only | 4 × N/512 for N ≥ 512; 0 at N=256 |
+| M_IFD_W address | open | identical per chunk; meaning not confirmed |
+| M_IAU bit 48 | compile-only | set only in the K-chunked build |
+| M_IFD_0, M_ODR, D_IFD_0, D_ODR flag bits | open | decoded, not tested |
+| TOKEN payload | decoded | mode 1, target 1, 16 per kernel |
+| INSTRUCTION payload | decoded | per-module entry blocks; semantics open |
+| Stream codec | verified | byte-for-byte round trip of compiled streams |
+| Bit 42 of M_DPU | crashes device | cleared bit 42 on one command |
+
+Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. The card needed reboots after these.
