@@ -1,5 +1,5 @@
 import struct, sys
-sys.path.insert(0, ".")
+sys.path.insert(0, "/home/takecheeze/layerprof")
 from decode_packed import load_words, to_bytes
 
 

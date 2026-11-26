@@ -371,3 +371,15 @@ Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. 
 - Not affected: the measured throughput results (device timing). The large-GEMM differential M_IFD_W test was
   not run on the device because the encoder failed on the misparsed stream; nothing changed on the card.
 - Next: find the chunk layout the convolution kernels use (chunk size and padding semantics) and fix the codec.
+
+## Parser fix and corrected convolution stream counts (2026-11-26)
+
+- Cause: the codec advanced each chunk by its size plus 8 bytes. The chunk size field already includes its own
+  8-byte header, and the kernel keeps the same boundaries in its chunk-sizes table (six 16 KiB chunks for the
+  4096×2048×2048 GEMM). Fixed in `scripts/axelera/axm/pstream.py`.
+- After the fix every convolution stream parses with no zero-size tasks and round-trips byte for byte.
+- Corrected counts (COMMAND, TOKEN, START_DMA):
+  - Large GEMM default: 1,792, 96, 385. Pipelined: 1,792, 512, 321.
+  - ResNet-18 default: 667, 55, 58. Pipelined: 1,021, 362, 96.
+- The earlier counts (12,599 and 289; 6,401 and 24,835) were parser artifacts and are withdrawn. Tokens rise with
+  pipelining in both models. The timing (faster for the large GEMM, slower for ResNet-18) fits that pattern.
