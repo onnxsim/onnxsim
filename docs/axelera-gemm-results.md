@@ -359,3 +359,13 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   those estimates.
 - Reading: the fixed part per matmul plus the sublinear row term point to per-matmul overhead in the matrix program, not a
   full array at 5% duty. This is not yet a proof of partial array use; it is consistent with it.
+
+### K scaling of the resident-operand matmul (device test, measured)
+
+- M=256, N=512, R=1 and 8, scale and cast once, 200 timed calls per point, two compiles per K.
+- Per extra matmul (slope from R=1 to R=8), run a and run b: K=256 3.3 and 10.7 µs; K=512 17.1 and 17.8 µs;
+  K=1024 23.5 and 21.5 µs.
+- Slope rises about 3× for a 4× increase in K, so it is not proportional to K.
+- Noise: the K=512 point was 25.2 µs in an earlier single run and 17.5 µs here, and the R=1 baseline moved by about 50 µs
+  between sessions. Treat each slope as ±5 µs. The fixed-cost fit from the row-scaling section is not robust to this drift.
+- Full-array estimate for K=256 is 0.63 µs; the measured slopes are above it for every K.
