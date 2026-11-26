@@ -231,3 +231,78 @@ compiles with `MulticoreMode.BATCH`, `aipu_cores_used=N`, and `resources_used=0.
   COMMAND 26, TOKEN 5) and the same size (2240 bytes).
 - So these options did not change the schedule for this shape. The 4% difference is within run-to-run noise.
 - Likely reason: the shape gives the pipeliner no tiles to overlap. Not tested at shapes that tile.
+
+## Compiler pipelining on a shape that tiles (measured)
+
+- Shape M=4096, K=2048, N=2048, 1×1 conv, one instance, double buffering on.
+- The same four pipelining options as before (`pipeline_spatial_tiles`, `pipeline_channel_tiles`,
+  `imc_double_buffer_pipeline`, `use_list_scheduler`).
+
+  | Build | Task stream | Aggregate TOPS (ops convention) |
+  |---|---|---|
+  | Default | 93,056 bytes; COMMAND 12,599, TOKEN 21, START_DMA 71 | 3.11 |
+  | Pipelined | 99,328 bytes; COMMAND 289, TOKEN 83, START_DMA 55 | 3.71 |
+
+- The task streams differ in structure, unlike the smaller 4096×512×512 shape, where the options changed
+  nothing. The pipelined build has about 40 times fewer commands and more tokens, consistent with a loop
+  that overlaps tiles and synchronizes between them.
+- Result: about 19% faster. The first measured gain from the compiler's pipelining.
+- Card healthy before and after.
+
+### Pipelining with more instances (same shape, measured)
+
+| Instances | Default (TOPS, ops convention) | Pipelined (TOPS) |
+|---|---|---|
+| 1 | 3.11 | 3.71 |
+| 2 | 4.19 | 4.35 |
+| 4 | 4.62 | 4.61 |
+
+- The pipelining gain shrinks as instances increase: about 19% at one instance, about 4% at two, none at four.
+- Running several instances already overlaps the transfers and matmuls, so the compiler's pipelining adds little on top.
+- Card healthy before and after.
+
+### Pipelining options on ResNet-18 (one core, measured)
+
+| Build | Task stream | Images/s (1 instance, 1 core) |
+|---|---|---|
+| Default | 34,752 bytes; COMMAND 6,401 | 666 |
+| Pipelined | 57,408 bytes; COMMAND 24,835 | 579 |
+
+- The pipelined build is about 13% slower here, the reverse of the large GEMM, where it was about 19% faster.
+- Its stream is larger (more commands and tokens), so the extra synchronization and command overhead outweighs
+  any overlap for this model.
+- The pipelining options help a large tiled matmul but hurt a convolutional network. Enable them per model, not globally.
+- Card healthy before and after.
+
+### Power limiter (measured)
+
+`axdevice --set-power-limit` enables a limiter that reduces AI-core performance when power exceeds the limit.
+The card was at 8.5 W. Measured with the limiter on, then off, then back on:
+
+| Workload | 8.5 W limit | Limiter off | Restored 8.5 W |
+|---|---|---|---|
+| 4096×2048×2048 GEMM, 1 instance (TOPS, ops convention) | 3.11 | 3.27 | not repeated |
+| ResNet-18, 1 core (images/s) | 673 | 827 | 645 |
+
+- With the limiter off, ResNet-18 is about 20% faster (827 against 645 to 673 with it on).
+- The GEMM gain is about 5%, within the range where the earlier runs varied.
+- Not measured: temperature and software throttling with the limiter off. Check before running sustained workloads.
+- The limiter was restored to 8.5 W after the test. Card healthy.
+
+### Scheduler options on the large GEMM (measured, one instance)
+
+Shape 4096×2048×2048, 1×1 conv, double buffering on.
+
+| Build | Options | TOPS (ops convention) |
+|---|---|---|
+| Default | none | 3.11 |
+| List scheduler only | `use_list_scheduler` | 3.06 |
+| IFDW grouping only | `group_ifdw_tasks` | 3.10 |
+| Pipelining options (earlier) | four pipelining options | 3.71 |
+| Combined | pipelining + list scheduler + IFDW grouping | 3.79 |
+
+- Neither option helps alone: both are within run-to-run noise of the default.
+- Adding them to the pipelining options gives about 2% more, which is within noise.
+- The list-scheduler build's packed stream uses a different chunk layout from the default build. My stream
+  decoder doesn't parse it, so its task counts were not compared.
+- Card healthy before and after.
