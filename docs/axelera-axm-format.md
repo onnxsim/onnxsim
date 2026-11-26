@@ -383,3 +383,13 @@ Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. 
   - ResNet-18 default: 667, 55, 58. Pipelined: 1,021, 362, 96.
 - The earlier counts (12,599 and 289; 6,401 and 24,835) were parser artifacts and are withdrawn. Tokens rise with
   pipelining in both models. The timing (faster for the large GEMM, slower for ResNet-18) fits that pattern.
+
+### M_IFD_W address on the large convolution-compiled GEMM (device test, measured)
+
+- Build: 4096×2048×2048 default (the conv form). With the parser fixed, the stream has 512 M_IFD_W commands
+  using two addresses, `0x18200000` and `0x18300000`.
+- The unmodified build is deterministic (two runs identical).
+- Swapping the addresses of weight load 0 and weight load 4: the output is identical (mean difference 0).
+- So in this kernel the M_IFD_W address does not change the output. Either both locations hold the same weights,
+  or the address is not used for the data. Not resolved which.
+- Card healthy before and after.
