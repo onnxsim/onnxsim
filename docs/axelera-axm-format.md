@@ -393,3 +393,12 @@ Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. 
 - So in this kernel the M_IFD_W address does not change the output. Either both locations hold the same weights,
   or the address is not used for the data. Not resolved which.
 - Card healthy before and after.
+
+### M_ODR flag-bit tests: crashes (device, measured)
+
+- Bit 56 of the first M_ODR command (0 to 1): crashed the card (`ZE_RESULT_ERROR_DEVICE_LOST`). Health check passed
+  before the run.
+- Bit 58 of the same command (0 to 1): crashed the card the same way. Health check passed before the run.
+- Two crashes in a row. Testing stopped, and the card needed a reboot to recover.
+- Bits 17 and 19 to 21 of this command corrupted tile 0 without crashing. Bits 56 and 58 crash, so the high flag
+  bits are not free to set.
