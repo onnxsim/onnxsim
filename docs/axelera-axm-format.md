@@ -355,3 +355,19 @@ Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the 
 | Bit 42 of M_DPU | crashes device | cleared bit 42 on one command |
 
 Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. The card needed reboots after these.
+
+## Correction: stream parser fails on convolution streams (2026-11-26)
+
+- The codec (`pstream.py`) parses the matmul streams we wrote (pipe_unroll, tiled_mm8) correctly, and it
+  round-trips them byte for byte.
+- On convolution-compiled streams it produces many zero-size tasks, so the parse is misaligned:
+  - big-def (4096×2048×2048, default): 12,297 zero-size tasks out of 12,769.
+  - rn18-def (ResNet-18, default): 6,152 zero-size tasks out of 6,510.
+  - rn18-pipe (ResNet-18, pipelined): 24,584 zero-size tasks out of 24,980.
+  - big-pipe (4096×2048×2048, pipelined): 3 zero-size tasks out of 485.
+- Consequence: the command counts reported for these builds (for example "12,599 vs 289" for the large GEMM and
+  "6,401 vs 24,835" for ResNet-18) are not reliable. The conclusion drawn from them, that the pipelined stream
+  is structurally smaller or larger for these models, is withdrawn until the parser is fixed.
+- Not affected: the measured throughput results (device timing). The large-GEMM differential M_IFD_W test was
+  not run on the device because the encoder failed on the misparsed stream; nothing changed on the card.
+- Next: find the chunk layout the convolution kernels use (chunk size and padding semantics) and fix the codec.
