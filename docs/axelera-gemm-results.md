@@ -391,3 +391,17 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Reading: no clean row law. The median slope is near zero at 64 and 192 rows, and rises to about 25 to 29 µs at 256 to
   768 rows, with 384 rows in between. Per-compile noise is about ±15 µs, so these medians are not a fitted curve.
 - Full-array estimate at 768 rows is 3.75 µs per matmul; the measured median is about 29 µs, roughly 8 times above it.
+
+### Single wide op versus repeated narrow ops (device test, measured)
+
+- K=512, R=1, scale and cast once, 200 timed calls per point, three compiles per point. Medians:
+  - 256 rows, 512 columns (one chunk): about 806 µs (earlier section).
+  - 256 rows, 1024 columns: 1146 µs. 256 rows, 2048 columns: 1717 µs. 256 rows, 4096 columns: 3159 µs.
+  - 64 rows, 2048 columns: 1276 µs.
+- Each extra 512-column chunk inside one op adds about 300 to 360 µs. Repeating a one-chunk op adds only about 25 µs
+  per repetition (the earlier repeat test). So per-op fixed cost is not what dominates a single wide call.
+- At 2048 columns, 192 extra rows add about 440 µs, about 2.3 µs per row.
+- Reading: the repeat test excludes the weight load and most of the data movement, so it measured matmul compute only.
+  In a single call, data movement (weights scaling with K×N, activations and outputs scaling with M×N) takes most of the
+  time. The matmul compute for 256×512×2048 would be about 5 µs at full-array rate and about 100 µs at the repeat-test
+  rate, against 1717 µs measured in a single call.
