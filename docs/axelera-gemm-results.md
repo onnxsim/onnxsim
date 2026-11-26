@@ -446,3 +446,18 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   - K at M=256, N=2048: K=256 8 programs, K=512 8, K=1024 16. K=2048 did not compile in this run (likely the 4 MiB L1 limit on
     the 2048×2048 weight block).
 - A clean program-count control needs a compiler setting that changes the tiling directly, not a shape change.
+
+### Compiler-setting control: executes doubled, matrix programs fixed (device test, measured)
+
+- Compile-only sweep at 256×512×2048 (K=512, one op), matrix-program and execute counts for each override:
+  - default, mvm_utilization_limit 0.5 or 1.0, max_tiling_depth 1, enable_software_pipeline true or false,
+    dpu_unroll true: 8 programs, 2 executes.
+  - min_tiling_factor 2: 8 programs, 4 executes.
+  - enable_auto_tiling false: fails to compile (pre-allocation L1 overflow by 256 bytes).
+- Device run, R=1, three compiles each, same session:
+  - default: 2061, 2035, 2033 µs (median 2035 µs).
+  - min_tiling_factor 2: 2031, 2010, 2056 µs (median 2031 µs).
+- Reading: doubling the executes with the program count fixed changed the time by about 4 µs, inside the noise. So
+  execute count is not the cost at this size. This supports the program-count hypothesis, but it does not isolate it: no
+  setting found so far changes the program count with the executes fixed.
+- Drift: the same default shape measured 1717 µs earlier this session and 2035 µs here. Compare only within one session.
