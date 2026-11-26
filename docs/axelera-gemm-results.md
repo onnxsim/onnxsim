@@ -340,3 +340,11 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Reading: with operands already resident and no DMA in the loop, the matmul is still far below full-array rate.
   DMA starvation does not explain this part. Either the input feed from L1 to the matrix array or the matrix
   program uses only part of the array. Not yet separated.
+
+### Width versus chunk count (device test, measured)
+
+- 256×512×1024 (two 512-column chunks): R=1 1089 µs, R=4 1242 µs. About 51 µs per extra matmul, about 25 µs per chunk.
+- 256×512×512 (one chunk): about 25 µs per extra matmul, as above.
+- 128×512×512 (half the rows): R=1 756 µs, R=4 696 µs. The slope is inside the noise, so the per-row cost is not measured.
+- Reading: cost scales with 512-column chunks, matching the chunk-count model. Single-call time is dominated by a fixed
+  cost of roughly 700 µs.
