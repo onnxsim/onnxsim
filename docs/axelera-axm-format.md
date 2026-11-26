@@ -430,3 +430,10 @@ Compile-only or unresolved:
 
 Open items to reach "mostly covered": flag-bit semantics (without crashing the card), instruction and token
 semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule.
+
+### M_IFD_0 flag bit 60 (device test, measured)
+
+- 1024×512×1024 kernel, bit 60 of word 1 of the first M_IFD_0 command, 0 to 1. Health check passed before and after.
+- Result: no crash. Tile 0 is corrupted (7.5% match to its reference). Tiles 1 to 7 are unchanged at the rounding level.
+- Reading: bit 60 changes how tile 0's input is fetched, similar to the M_ODR flag bits 17 and 19 to 21 that also
+  corrupt only tile 0. Its exact meaning is not resolved.
