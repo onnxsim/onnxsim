@@ -464,3 +464,10 @@ semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule
   before the run.
 - Result: crashed the card (health check fails afterward; the card is down pending reboot).
 - Word 0 bit 48 is therefore not a free flag. Status: crashes when set.
+
+### D_IFD_0 word 1, bit 60 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 60 of word 1 of the first D_IFD_0 command, 0 to 1 (word 1 was 0x20000000182e0000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Status: setting D_IFD_0 word 1 bit 60 crashes the card.
