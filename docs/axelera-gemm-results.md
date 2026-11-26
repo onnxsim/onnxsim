@@ -437,3 +437,12 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Confounded: M changes from 256 to 1024 across the rows, so activation and output movement also change. This run cannot
   separate program count from row count.
 - Reading: at equal work, the time is still about 200 times the full-array estimate (about 10 µs for 537 MMAC).
+
+### Matrix program count versus shape (compile-only, measured)
+
+- Program count depends on every dimension, so shape alone cannot hold it fixed while movement changes:
+  - Rows at N=2048, K=512: 64 rows 4 programs, 256 rows 8, 1024 rows 32.
+  - Columns at M=256, K=512: 512 cols 1, 1024 cols 2, 2048 cols 8, 4096 cols 32.
+  - K at M=256, N=2048: K=256 8 programs, K=512 8, K=1024 16. K=2048 did not compile in this run (likely the 4 MiB L1 limit on
+    the 2048×2048 weight block).
+- A clean program-count control needs a compiler setting that changes the tiling directly, not a shape change.
