@@ -479,3 +479,10 @@ semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule
 - Result: crashed the card (health check fails afterward; the card is down pending reboot).
 - Second crash on D_IFD_0 in a row (bit 60 before). Testing stopped per the two-crash rule.
 - Status: setting D_IFD_0 word 1 bits 60 and 62 both crash the card.
+
+### D_ODR word 1, bit 61 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 61 of word 1 of the first D_ODR command, 1 to 0 (word 1 was 0x2000000018360000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Status: clearing D_ODR word 1 bit 61 crashes the card.
