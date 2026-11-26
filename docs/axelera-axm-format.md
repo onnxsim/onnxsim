@@ -502,3 +502,11 @@ semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule
 - Result: crashed the card (health check fails afterward; the card is down pending reboot).
 - Status: setting D_IFD_0 word 1 bit 58 crashes the card. Together with bits 60 and 62, every D_IFD_0 word-1 bit
   tested so far has crashed the card, except none of the tested ones passed.
+
+## Current status summary (2026-11-26)
+
+Best measured GEMM: 4.6 TOPS (ops convention, 4 instances, default build, 4096×2048×2048). Pipelining options: +19% on one instance, about 0 at four instances. Ideal per core: about 53 MAC-TOPS (about 107 in ops convention). Current best per core: about 1.2 ops-TOPS.
+
+Command-field coverage: see the coverage table above. Device-verified fields are the scale constant, the D_IFD_1 index, the M_MVMPRG index, the M_MVMEXE chunk count, the M_ODR and M_IFD_0 addresses, and the M_IFD_0 and M_ODR flag bits 17, 19, 20, 21, 58, 60, 61, 62 (corrupt tile 0 only). Crashes: M_ODR bits 56 and 58, M_IFD_0 word 0 bit 48, D_IFD_0 word 1 bits 58, 60, and 62, D_ODR word 1 bits 61 and 62. Setting these bits is unsafe on this kernel.
+
+Open: INSTRUCTION and TOKEN semantics (decoded for structure only); M_IFD_W address meaning (swap gave identical output); M_DPU width rule (compile-verified only); D_ODR and remaining D_IFD_0 bits (untested).
