@@ -369,3 +369,13 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Noise: the K=512 point was 25.2 µs in an earlier single run and 17.5 µs here, and the R=1 baseline moved by about 50 µs
   between sessions. Treat each slope as ±5 µs. The fixed-cost fit from the row-scaling section is not robust to this drift.
 - Full-array estimate for K=256 is 0.63 µs; the measured slopes are above it for every K.
+
+### Row scaling repeated with three compiles per point (device test, measured)
+
+- K=512, N=512, R=1 and 8, scale and cast once, 200 timed calls per point, three compiles per row count.
+- Per extra matmul (slope from R=1 to R=8), compiles a, b, c: 128 rows 9.2, 8.7, 8.1 µs (mean 8.7, tight);
+  256 rows 25.1, 1.6, 25.5 µs (run b is an outlier at R=8); 512 rows 26.6, 26.2, 40.2 µs (run c is an outlier at R=8).
+- Using the median of three: 128 rows 8.7 µs, 256 rows 25.1 µs, 512 rows 26.6 µs. The 256 and 512 points are not
+  clearly separable with three compiles, so the earlier sublinear fit (33 µs at 512 rows) should not be relied on.
+- Reading: the 128-row point is reproducible. Above 256 rows the cost plateaus within this data, which fits a fixed
+  per-call cost at larger shapes rather than a linear row term. Still above the full-array estimate at every size.
