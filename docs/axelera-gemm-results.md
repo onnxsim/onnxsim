@@ -405,3 +405,19 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   In a single call, data movement (weights scaling with K×N, activations and outputs scaling with M×N) takes most of the
   time. The matmul compute for 256×512×2048 would be about 5 µs at full-array rate and about 100 µs at the repeat-test
   rate, against 1717 µs measured in a single call.
+
+### Compile-only stream counts for single matmuls (read-only, measured)
+
+- 256×512×N, one op, compiled without the device. Command counts from the packed stream:
+
+| N (columns) | M_MVMPRG (matrix program) | M_IFD_W (weight feed) | M_MVMEXE (execute) | M_DPU | Total tasks |
+|---|---|---|---|---|---|
+| 512 | 1 | 1 | 1 | 1 | 35 |
+| 2048 | 8 | 8 | 2 | 2 | 81 |
+| 4096 | 32 | 32 | 8 | 8 | 206 |
+
+- Matrix-program and weight-feed commands grow faster than the column count: 8 at 2048 and 32 at 4096. The execute count
+  grows about linearly (2 and 8). So the compiler issues about 4 weight-program loads per execute at these sizes.
+- Hypothesis, not verified: most single-call time is weight-program and weight-feed work rather than the execute itself.
+  This fits the earlier observation that each extra 512-column chunk adds about 300 µs. Testing it needs a device run
+  that varies the program count with the total work fixed.
