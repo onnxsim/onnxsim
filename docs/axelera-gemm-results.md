@@ -326,3 +326,17 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Reading: the waits are correct, but the copy and the matmul still don't run at the same time in a way that shortens
   the kernel. The per-tile cost is not mainly the DMA wait.
 - Card healthy before and after.
+
+### Repeated resident-operand matmul, scale and cast once (device test, measured)
+
+- Setup: 256×512×512. Activations and weights are copied to L1 once. Then R matmuls run with no DMA between them,
+  and only the last repetition applies scale and cast. 200 timed calls per point, one compile per point.
+- Matrix-execute commands in each stream: 1, 2, 4, 8 for R = 1, 2, 4, 8, so the compiler kept every matmul.
+- Kernel median: R=1 806 µs, R=2 813 µs, R=4 918 µs, R=8 982 µs.
+- Per extra matmul: about 25 µs. The full-array estimate is about 1.25 µs for this matmul, so the matmul alone runs
+  near 5% of the derived per-core peak.
+- Compared with scale and cast on every repetition (shared output, 808 µs to 1189 µs at R=8): the scale and cast
+  add about 29 µs per repetition, leaving about 25 µs for the matmul itself.
+- Reading: with operands already resident and no DMA in the loop, the matmul is still far below full-array rate.
+  DMA starvation does not explain this part. Either the input feed from L1 to the matrix array or the matrix
+  program uses only part of the array. Not yet separated.
