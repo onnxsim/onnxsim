@@ -355,3 +355,158 @@ Compared across the base 1024×512×512, the N=2048 kernel (fm-nwide4), and the 
 | Bit 42 of M_DPU | crashes device | cleared bit 42 on one command |
 
 Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. The card needed reboots after these.
+
+## Correction: stream parser fails on convolution streams (2026-11-26)
+
+- The codec (`pstream.py`) parses the matmul streams we wrote (pipe_unroll, tiled_mm8) correctly, and it
+  round-trips them byte for byte.
+- On convolution-compiled streams it produces many zero-size tasks, so the parse is misaligned:
+  - big-def (4096×2048×2048, default): 12,297 zero-size tasks out of 12,769.
+  - rn18-def (ResNet-18, default): 6,152 zero-size tasks out of 6,510.
+  - rn18-pipe (ResNet-18, pipelined): 24,584 zero-size tasks out of 24,980.
+  - big-pipe (4096×2048×2048, pipelined): 3 zero-size tasks out of 485.
+- Consequence: the command counts reported for these builds (for example "12,599 vs 289" for the large GEMM and
+  "6,401 vs 24,835" for ResNet-18) are not reliable. The conclusion drawn from them, that the pipelined stream
+  is structurally smaller or larger for these models, is withdrawn until the parser is fixed.
+- Not affected: the measured throughput results (device timing). The large-GEMM differential M_IFD_W test was
+  not run on the device because the encoder failed on the misparsed stream; nothing changed on the card.
+- Next: find the chunk layout the convolution kernels use (chunk size and padding semantics) and fix the codec.
+
+## Parser fix and corrected convolution stream counts (2026-11-26)
+
+- Cause: the codec advanced each chunk by its size plus 8 bytes. The chunk size field already includes its own
+  8-byte header, and the kernel keeps the same boundaries in its chunk-sizes table (six 16 KiB chunks for the
+  4096×2048×2048 GEMM). Fixed in `scripts/axelera/axm/pstream.py`.
+- After the fix every convolution stream parses with no zero-size tasks and round-trips byte for byte.
+- Corrected counts (COMMAND, TOKEN, START_DMA):
+  - Large GEMM default: 1,792, 96, 385. Pipelined: 1,792, 512, 321.
+  - ResNet-18 default: 667, 55, 58. Pipelined: 1,021, 362, 96.
+- The earlier counts (12,599 and 289; 6,401 and 24,835) were parser artifacts and are withdrawn. Tokens rise with
+  pipelining in both models. The timing (faster for the large GEMM, slower for ResNet-18) fits that pattern.
+
+### M_IFD_W address on the large convolution-compiled GEMM (device test, measured)
+
+- Build: 4096×2048×2048 default (the conv form). With the parser fixed, the stream has 512 M_IFD_W commands
+  using two addresses, `0x18200000` and `0x18300000`.
+- The unmodified build is deterministic (two runs identical).
+- Swapping the addresses of weight load 0 and weight load 4: the output is identical (mean difference 0).
+- So in this kernel the M_IFD_W address does not change the output. Either both locations hold the same weights,
+  or the address is not used for the data. Not resolved which.
+- Card healthy before and after.
+
+### M_ODR flag-bit tests: crashes (device, measured)
+
+- Bit 56 of the first M_ODR command (0 to 1): crashed the card (`ZE_RESULT_ERROR_DEVICE_LOST`). Health check passed
+  before the run.
+- Bit 58 of the same command (0 to 1): crashed the card the same way. Health check passed before the run.
+- Two crashes in a row. Testing stopped, and the card needed a reboot to recover.
+- Bits 17 and 19 to 21 of this command corrupted tile 0 without crashing. Bits 56 and 58 crash, so the high flag
+  bits are not free to set.
+
+## Decode coverage status (2026-11-26)
+
+Status: NOT mostly covered.
+
+Verified on the device:
+- Requantization scale: float32 array in L1; rewriting it changes the output.
+- D_IFD_1 per-tile index: selects the scale vector per tile.
+- M_MVMPRG index: selects which weight chunk each matrix program loads.
+- M_MVMEXE chunk count (bits 16–18): must equal the chunk count; 0 and 2 crashed the card.
+- M_ODR output address: shared across tiles.
+- M_IFD_0 input address: selects the activation slot; a mismatched slot gives a race.
+- M_ODR flag bits 17, 19, 20, 21: corrupt tile 0 only.
+- M_ODR flag bits 56 and 58: each crashed the card.
+- M_DPU bit 42: clearing it crashed the card.
+
+Decoded for structure only:
+- TOKEN payloads (mode 1, target 1, 16 per kernel).
+- INSTRUCTION payloads (per-module entry blocks; semantics open).
+- Stream format and chunk layout; codec round-trips all compiled streams byte for byte.
+
+Compile-only or unresolved:
+- M_DPU width rule (4 × N/512 for N ≥ 512; not confirmed on the card).
+- M_IFD_W address (swap gave identical output on the large convolution-compiled GEMM).
+- Flag bits in M_IFD_0, D_IFD_0, D_ODR (not tested).
+
+Open items to reach "mostly covered": flag-bit semantics (without crashing the card), instruction and token
+semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule.
+
+### M_IFD_0 flag bit 60 (device test, measured)
+
+- 1024×512×1024 kernel, bit 60 of word 1 of the first M_IFD_0 command, 0 to 1. Health check passed before and after.
+- Result: no crash. Tile 0 is corrupted (7.5% match to its reference). Tiles 1 to 7 are unchanged at the rounding level.
+- Reading: bit 60 changes how tile 0's input is fetched, similar to the M_ODR flag bits 17 and 19 to 21 that also
+  corrupt only tile 0. Its exact meaning is not resolved.
+
+### M_IFD_0 flag bit 61 (device test, measured)
+
+- 1024×512×1024 kernel, bit 61 of word 1 of the first M_IFD_0 command, 0 to 1. Health check passed before and after.
+- Result: no crash. Tile 0 corrupted (5% match). Tiles 1 to 7 unchanged at the rounding level.
+- Bits 60 and 61 both corrupt tile 0 only, the same pattern as the M_ODR bits 17 and 19 to 21. Bits 56 and 58 of
+  M_ODR crashed the card; bits 60 and 61 of M_IFD_0 have not.
+
+### M_IFD_0 flag bit 58 (device test, measured)
+
+- 1024×512×1024 kernel, bit 58 of word 1 of the first M_IFD_0 command, 0 to 1. Health check passed before and after.
+- Result: no crash. Tile 0 corrupted (15% match). Tiles 1 to 7 unchanged at the rounding level.
+- Same pattern as M_IFD_0 bits 60 and 61: tile 0 only. Unlike M_ODR bits 56 and 58, this flag did not crash the card.
+
+### M_IFD_0 flag bit 62 (device test, measured)
+
+- 1024×512×1024 kernel, bit 62 of word 1 of the first M_IFD_0 command, 1 to 0 (the bit was set). Health check passed
+  before and after.
+- Result: no crash. Tile 0 corrupted (4% match). Tiles 1 to 7 unchanged at the rounding level.
+- Clearing this bit behaves like setting bits 58, 60, and 61: tile 0 only, no crash.
+
+### M_IFD_0 word 0, bit 48 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 48 of word 0 of the first M_IFD_0 command, 0 to 1 (word 0 was 0x0). Health check passed
+  before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Word 0 bit 48 is therefore not a free flag. Status: crashes when set.
+
+### D_IFD_0 word 1, bit 60 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 60 of word 1 of the first D_IFD_0 command, 0 to 1 (word 1 was 0x20000000182e0000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Status: setting D_IFD_0 word 1 bit 60 crashes the card.
+
+### D_IFD_0 word 1, bit 62 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 62 of word 1 of the first D_IFD_0 command, 0 to 1 (word 1 was 0x20000000182e0000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Second crash on D_IFD_0 in a row (bit 60 before). Testing stopped per the two-crash rule.
+- Status: setting D_IFD_0 word 1 bits 60 and 62 both crash the card.
+
+### D_ODR word 1, bit 61 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 61 of word 1 of the first D_ODR command, 1 to 0 (word 1 was 0x2000000018360000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Status: clearing D_ODR word 1 bit 61 crashes the card.
+
+### D_ODR word 1, bit 62 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 62 of word 1 of the first D_ODR command, 0 to 1 (word 1 was 0x2000000018360000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Second D_ODR crash in a row (bit 61 before). Testing stopped per the two-crash rule.
+- Status: setting D_ODR word 1 bit 62 crashes the card.
+
+### D_IFD_0 word 1, bit 58 (device test, measured): crash
+
+- 1024×512×1024 kernel, bit 58 of word 1 of the first D_IFD_0 command, 0 to 1 (word 1 was 0x20000000182e0000).
+  Health check passed before the run.
+- Result: crashed the card (health check fails afterward; the card is down pending reboot).
+- Status: setting D_IFD_0 word 1 bit 58 crashes the card. Together with bits 60 and 62, every D_IFD_0 word-1 bit
+  tested so far has crashed the card, except none of the tested ones passed.
+
+## Current status summary (2026-11-26)
+
+Best measured GEMM: 4.6 TOPS (ops convention, 4 instances, default build, 4096×2048×2048). Pipelining options: +19% on one instance, about 0 at four instances. Ideal per core: about 53 MAC-TOPS (about 107 in ops convention). Current best per core: about 1.2 ops-TOPS.
+
+Command-field coverage: see the coverage table above. Device-verified fields are the scale constant, the D_IFD_1 index, the M_MVMPRG index, the M_MVMEXE chunk count, the M_ODR and M_IFD_0 addresses, and the M_IFD_0 and M_ODR flag bits 17, 19, 20, 21, 58, 60, 61, 62 (corrupt tile 0 only). Crashes: M_ODR bits 56 and 58, M_IFD_0 word 0 bit 48, D_IFD_0 word 1 bits 58, 60, and 62, D_ODR word 1 bits 61 and 62. Setting these bits is unsafe on this kernel.
+
+Open: INSTRUCTION and TOKEN semantics (decoded for structure only); M_IFD_W address meaning (swap gave identical output); M_DPU width rule (compile-verified only); D_ODR and remaining D_IFD_0 bits (untested).

@@ -306,3 +306,56 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - The list-scheduler build's packed stream uses a different chunk layout from the default build. My stream
   decoder doesn't parse it, so its task counts were not compared.
 - Card healthy before and after.
+
+### Taller pipelined GEMM (8192×2048×2048, measured)
+
+- Build: pipelining options plus scheduler and IFDW grouping. Compiled without error.
+- One instance: 4.23 TOPS (ops convention), up from 3.71 for the 4096-row pipelined build.
+- Four instances: 4.93 TOPS, the best measured so far. Only 20 calls per run, so treat as approximate.
+- Per core this is about 0.6 MAC-TOPS against an ideal of about 53 MAC-TOPS per core: roughly 1% of ideal.
+- Health check passed before and after.
+
+### Overlap with waits placed after both launches (device test, measured)
+
+- Form (AxelerScript guide section 12): for each tile, launch the copy for the next tile and the matmul for this
+  tile, each with an id, then wait for both after both launches. Two L1 slots; the first copy waited before the first matmul.
+- Compiled with working waits: no `DMA POLL` or `Cannot determine core` errors. The earlier wait failures came from
+  the wait placement, not from missing support.
+- Correct: 99.16% of values match the reference (same as the non-overlapped build).
+- Speed: 2316 µs kernel time at 1024×512×512, 8 tiles. The non-overlapped build measured 2355 µs. No gain.
+- Reading: the waits are correct, but the copy and the matmul still don't run at the same time in a way that shortens
+  the kernel. The per-tile cost is not mainly the DMA wait.
+- Card healthy before and after.
+
+### Repeated resident-operand matmul, scale and cast once (device test, measured)
+
+- Setup: 256×512×512. Activations and weights are copied to L1 once. Then R matmuls run with no DMA between them,
+  and only the last repetition applies scale and cast. 200 timed calls per point, one compile per point.
+- Matrix-execute commands in each stream: 1, 2, 4, 8 for R = 1, 2, 4, 8, so the compiler kept every matmul.
+- Kernel median: R=1 806 µs, R=2 813 µs, R=4 918 µs, R=8 982 µs.
+- Per extra matmul: about 25 µs. The full-array estimate is about 1.25 µs for this matmul, so the matmul alone runs
+  near 5% of the derived per-core peak.
+- Compared with scale and cast on every repetition (shared output, 808 µs to 1189 µs at R=8): the scale and cast
+  add about 29 µs per repetition, leaving about 25 µs for the matmul itself.
+- Reading: with operands already resident and no DMA in the loop, the matmul is still far below full-array rate.
+  DMA starvation does not explain this part. Either the input feed from L1 to the matrix array or the matrix
+  program uses only part of the array. Not yet separated.
+
+### Width versus chunk count (device test, measured)
+
+- 256×512×1024 (two 512-column chunks): R=1 1089 µs, R=4 1242 µs. About 51 µs per extra matmul, about 25 µs per chunk.
+- 256×512×512 (one chunk): about 25 µs per extra matmul, as above.
+- 128×512×512 (half the rows): R=1 756 µs, R=4 696 µs. The slope is inside the noise, so the per-row cost is not measured.
+- Reading: cost scales with 512-column chunks, matching the chunk-count model. Single-call time is dominated by a fixed
+  cost of roughly 700 µs.
+
+### Row scaling of the resident-operand matmul (device test, measured)
+
+- K=512, N=512, R=1, 4, 8 per row count, scale and cast once, 200 timed calls per point, one compile per point.
+- Per extra matmul (slope R=1 to R=8): 128 rows 16.4 µs, 256 rows 25.2 µs, 512 rows 33.2 µs.
+- Four times the rows costs about two times the time, so the cost is not linear in rows. A linear fit gives roughly 11 µs
+  fixed per matmul plus about 0.044 µs per row.
+- Full-array estimates for these shapes: 0.63 µs (128 rows), 1.25 µs (256), 2.5 µs (512). The measured times are 20 to 26 times above
+  those estimates.
+- Reading: the fixed part per matmul plus the sublinear row term point to per-matmul overhead in the matrix program, not a
+  full array at 5% duty. This is not yet a proof of partial array use; it is consistent with it.
