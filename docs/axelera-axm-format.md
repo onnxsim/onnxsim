@@ -437,3 +437,10 @@ semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule
 - Result: no crash. Tile 0 is corrupted (7.5% match to its reference). Tiles 1 to 7 are unchanged at the rounding level.
 - Reading: bit 60 changes how tile 0's input is fetched, similar to the M_ODR flag bits 17 and 19 to 21 that also
   corrupt only tile 0. Its exact meaning is not resolved.
+
+### M_IFD_0 flag bit 61 (device test, measured)
+
+- 1024×512×1024 kernel, bit 61 of word 1 of the first M_IFD_0 command, 0 to 1. Health check passed before and after.
+- Result: no crash. Tile 0 corrupted (5% match). Tiles 1 to 7 unchanged at the rounding level.
+- Bits 60 and 61 both corrupt tile 0 only, the same pattern as the M_ODR bits 17 and 19 to 21. Bits 56 and 58 of
+  M_ODR crashed the card; bits 60 and 61 of M_IFD_0 have not.
