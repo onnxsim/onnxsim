@@ -402,3 +402,31 @@ Device tests that crashed the card: count 0 and 2 on M_MVMEXE, bit 42 on M_DPU. 
 - Two crashes in a row. Testing stopped, and the card needed a reboot to recover.
 - Bits 17 and 19 to 21 of this command corrupted tile 0 without crashing. Bits 56 and 58 crash, so the high flag
   bits are not free to set.
+
+## Decode coverage status (2026-11-26)
+
+Status: NOT mostly covered.
+
+Verified on the device:
+- Requantization scale: float32 array in L1; rewriting it changes the output.
+- D_IFD_1 per-tile index: selects the scale vector per tile.
+- M_MVMPRG index: selects which weight chunk each matrix program loads.
+- M_MVMEXE chunk count (bits 16–18): must equal the chunk count; 0 and 2 crashed the card.
+- M_ODR output address: shared across tiles.
+- M_IFD_0 input address: selects the activation slot; a mismatched slot gives a race.
+- M_ODR flag bits 17, 19, 20, 21: corrupt tile 0 only.
+- M_ODR flag bits 56 and 58: each crashed the card.
+- M_DPU bit 42: clearing it crashed the card.
+
+Decoded for structure only:
+- TOKEN payloads (mode 1, target 1, 16 per kernel).
+- INSTRUCTION payloads (per-module entry blocks; semantics open).
+- Stream format and chunk layout; codec round-trips all compiled streams byte for byte.
+
+Compile-only or unresolved:
+- M_DPU width rule (4 × N/512 for N ≥ 512; not confirmed on the card).
+- M_IFD_W address (swap gave identical output on the large convolution-compiled GEMM).
+- Flag bits in M_IFD_0, D_IFD_0, D_ODR (not tested).
+
+Open items to reach "mostly covered": flag-bit semantics (without crashing the card), instruction and token
+semantics, the M_IFD_W address, and on-card confirmation of the M_DPU width rule.
