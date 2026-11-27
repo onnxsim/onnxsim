@@ -495,3 +495,12 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Difference about 148 µs (about 8%). Skipping the scale also changes the compiler's tiling (programs 8 to 4, executes 2
   to 1), so this is a combined effect, not a pure scale cost. The program-count fit predicts about 70 µs, so the
   scale step may account for the rest, but the two cannot be separated with these builds.
+
+### Weight load per repetition (device test, attempted, not valid)
+
+- Variant: each repetition copies the weights into one shared L1 buffer, runs load_imc, then matmul.
+- Result: the first baseline run (base, one repetition) measured 814 µs and the eight-repetition baseline measured 929 µs.
+  The next baseline run lost the device. A weight-load run then lost the device at one repetition.
+- Reading: this variant is not a valid measurement. The reused L1 buffer is written again without a wait before load_imc.
+  It is also not yet known whether the device loss came from the variant or from the card state. Card rebooted and healthy.
+- Next: a weight-load variant that gives each repetition its own L1 weight buffer and explicit waits, tested one run at a time.
