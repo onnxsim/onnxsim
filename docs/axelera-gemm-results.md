@@ -553,3 +553,17 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   about 46 to 56 µs per repetition in both.
 - Caveats: two rounds, one compile each per round. The buffer-count effect is not separated from total DDR footprint
   (R distinct buffers of 128 KB each).
+
+### Single output buffer in the pipelined GEMM (device test, measured)
+
+- 1024×512×512, 8 tiles, overlapped form (waits after both launches), two slots. Each tile casts into its row slice of
+  one DDR output (OUTSLICE=1) instead of allocating a new output buffer per tile (OUTSLICE=0). Three rounds interleaved,
+  health check before and after each run. Kernel medians:
+  - per-tile buffers: 2313, 2303, 2309 µs (median 2309 µs).
+  - single output buffer: 2033, 2035, 1869 µs (median 2033 µs).
+  - About 12% faster at the median.
+- Correctness: both builds match the numpy reference for 99.16% of values, the same as the earlier overlapped result.
+  The 0.84% difference is the rounding convention used in the reference check, shared by both builds.
+- Two-axis slices (rows and all columns) were needed; a single-axis row slice failed to compile.
+- The non-overlapped two-slot form still fails in the wait placement ("DMA POLL has no matching START"), so it is not
+  a baseline here.
