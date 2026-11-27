@@ -577,3 +577,13 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Fit over the three points: about 0.4 ms fixed per call and about 170 µs per 128-row tile. Larger calls amortize the
   fixed cost, but the per-tile cost stays far above the full-array estimate for a 128×512×512 tile (about 0.63 µs).
 - Caveat: one run per point; no interleaving.
+
+### Per-tile ablations in the pipelined GEMM (device test, measured)
+
+- 1024×512×512, 8 tiles, OVERLAP=1, OUTSLICE=1, NSLOTS=2. Interleaved rounds, health check before and after each run:
+  - full: 1842, 1866 µs (first batch); 1864, 1893, 1851 µs (second batch, median 1864 µs).
+  - no input copy after tile 0 (ABL_NOIN): 1852, 1846 µs. Median 1849 µs, no change from full. Input DMA is hidden.
+  - no scale multiply (ABL_NOSCALE): 1789, 1816, 1792 µs. Median 1792 µs, about 70 µs (about 4%) below full in the same batch.
+- Reading: input transfer is not on the critical path in this kernel. The scale step costs about 9 µs per tile here, but
+  it is an ablation that also changes tiling in the unpipelined builds, so treat it as an upper bound on the scale cost.
+- Caveat: the first full and no-input runs were not interleaved with the others, so only the second batch is used for the median.
