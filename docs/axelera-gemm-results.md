@@ -504,3 +504,10 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Reading: this variant is not a valid measurement. The reused L1 buffer is written again without a wait before load_imc.
   It is also not yet known whether the device loss came from the variant or from the card state. Card rebooted and healthy.
 - Next: a weight-load variant that gives each repetition its own L1 weight buffer and explicit waits, tested one run at a time.
+
+#### Per-run status for the interleaved weight-load batch (wl-*.log)
+
+- base, one repetition: a 814.0 µs; b and c lost the device (ZE_RESULT_ERROR_DEVICE_LOST).
+- base, eight repetitions: a 928.9 µs; b and c lost the device.
+- wload, one and eight repetitions: all six runs lost the device.
+- Only two valid numbers came out of this batch. The rest of the batch are not usable. The card was rebooted and healthy afterward.
