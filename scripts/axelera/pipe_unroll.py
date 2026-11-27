@@ -36,6 +36,8 @@ KB, NB = K // 64, N // 64
 SCALE = 1.0 / float(os.environ.get('SCALE_DEN', '4096'))
 NOWAIT = os.environ.get('NOWAIT', '0') == '1'
 NOID = os.environ.get('NOID', '0') == '1'
+OVERLAP = os.environ.get('OVERLAP', '0') == '1'
+OUTSLICE = os.environ.get('OUTSLICE', '0') == '1'  # one DDR output buffer, each tile casts into its row slice
 NSLOTS = int(os.environ.get('NSLOTS', '2'))
 CHAN = os.environ.get('CHAN', 'default')  # default | alt (even tiles ch0, odd tiles ch1)
 
@@ -77,21 +79,59 @@ def build_source():
         cid = "" if NOID else ", id=" + repr("c" + str(j))
         return f"        axol.atomic.copy(x{j}, output=s{j % NSLOTS}{cid}{chan_arg(j)})"
 
-    for j in range(min(depth, NT)):
-        body.append(copy_line(j))
-    outs = []
-    for i in range(NT):
-        if i + depth < NT:
-            body.append(copy_line(i + depth))
-        body += [
-            *([] if NOWAIT else [f"        A.waits('c{i}')"]),
-            f"        acc{i} = axol.atomic.matmul(matrix_ifd=s{i % NSLOTS}, matrix_imc=w_imc, id='mm{i}')",
-            f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})",
-            f'        o{i} = A.alloc_buffer(({TILE}, {NB}), "int8x64", scope=A.DDR)',
-            f"        axol.atomic.dpu_cast(sc{i}, o{i})",
-        ]
-        outs.append(f"o{i}")
-    body.append("        A.output(" + ", ".join(outs) + ")")
+    if OVERLAP:
+        # Overlapped form (AxelerScript guide, section 12): each iteration launches the copy for the
+        # next tile and the matmul for this tile with ids, then waits for both after both launches.
+        assert NSLOTS == 2 and not NOID
+        outs = []
+        if OUTSLICE:
+            body.append(f'        o_full = A.alloc_buffer(({NT * TILE}, {NB}), "int8x64", scope=A.DDR)')
+        body.append(copy_line(0))
+        body.append("        A.waits('c0')")
+        for i in range(NT):
+            if i + 1 < NT:
+                body.append(copy_line(i + 1))
+            body.append(f"        acc{i} = axol.atomic.matmul(matrix_ifd=s{i % 2}, matrix_imc=w_imc, id='mm{i}')")
+            waits = [f"'mm{i}'"] + ([f"'c{i + 1}'"] if i + 1 < NT else [])
+            body.append("        A.waits(" + ", ".join(waits) + ")")
+            body.append(f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})")
+            if OUTSLICE:
+                body.append(f"        axol.atomic.dpu_cast(sc{i}, o_full[{i * TILE} : {(i + 1) * TILE}, 0 : {NB}])")
+            else:
+                body += [
+                    f'        o{i} = A.alloc_buffer(({TILE}, {NB}), "int8x64", scope=A.DDR)',
+                    f"        axol.atomic.dpu_cast(sc{i}, o{i})",
+                ]
+                outs.append(f"o{i}")
+        body.append("        A.output(" + ("o_full" if OUTSLICE else ", ".join(outs)) + ")")
+    else:
+        for j in range(min(depth, NT)):
+            body.append(copy_line(j))
+        outs = []
+        if OUTSLICE:
+            body.insert(len(body) - 0, f'        o_full = A.alloc_buffer(({NT * TILE}, {NB}), "int8x64", scope=A.DDR)')
+        for i in range(NT):
+            if i + depth < NT:
+                body.append(copy_line(i + depth))
+            if OUTSLICE:
+                dst = f"o_full[{i * TILE} : {(i + 1) * TILE}, 0 : {NB}]"
+                body += [
+                    *([] if NOWAIT else [f"        A.waits('c{i}')"]),
+                    f"        acc{i} = axol.atomic.matmul(matrix_ifd=s{i % NSLOTS}, matrix_imc=w_imc, id='mm{i}')",
+                    f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})",
+                    f"        axol.atomic.dpu_cast(sc{i}, {dst})",
+                ]
+                continue
+            body += [
+                *([] if NOWAIT else [f"        A.waits('c{i}')"]),
+                f"        acc{i} = axol.atomic.matmul(matrix_ifd=s{i % NSLOTS}, matrix_imc=w_imc, id='mm{i}')",
+                f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})",
+                f'        o{i} = A.alloc_buffer(({TILE}, {NB}), "int8x64", scope=A.DDR)',
+                f"        axol.atomic.dpu_cast(sc{i}, o{i})",
+            ]
+            outs.append(f"o{i}")
+        body.append("        A.output(" + (", ".join(outs) if not OUTSLICE else "o_full") + ")")
+
     return (
         "@A.ir_module\n"
         "class PipeUnroll:\n"
@@ -132,7 +172,7 @@ rng = np.random.default_rng(0)
 xs = [rng.integers(-128, 128, (TILE, KB, 64), dtype=np.int8) for _ in range(NT)]
 w = rng.integers(-128, 128, (K, NB, 64), dtype=np.int8)
 ins = xs + [w]
-outs = [np.zeros((TILE, NB, 64), dtype=np.int8) for _ in range(NT)]
+outs = [np.zeros((NT * TILE, NB, 64), dtype=np.int8)] if OUTSLICE else [np.zeros((TILE, NB, 64), dtype=np.int8) for _ in range(NT)]
 for _ in range(10):
     inst.run(ins, outs)
 _, offset = read_trace(TRACE.stat().st_size if TRACE.exists() else 0)
