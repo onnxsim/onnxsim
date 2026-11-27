@@ -523,3 +523,19 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Caveat: one compile per point. Earlier runs of the matmul-only slope ranged about ±15 µs, so the weight-load figure is
   roughly 26 ± 15 µs until repeated with more compiles.
 - Item 2 (activation DMA) is still not measured.
+
+### Activation DMA and output path per repetition (device test, measured)
+
+- 256×512×512, weights loaded once, one compile per point, one run each, health check before and after every run:
+  - base (matmul only, scale and cast once): R=1 805.6 µs, R=8 983.2 µs. Slope 25.4 µs per repetition.
+  - input DMA per repetition (xin: copy the input into a new L1 buffer, then matmul): R=1 850.9 µs, R=8 972.6 µs.
+    Slope 17.4 µs per repetition, not above base. Compiled streams show 14 extra DMA start and poll tasks for the
+    7 extra copies, so the DMA is issued. Its time appears hidden under the matmul.
+  - output path per repetition (outp: scale, cast, and a new DDR output buffer each repetition): R=1 859.1 µs,
+    R=8 2153.0 µs. Slope 184.8 µs per repetition.
+- Earlier, separate session: scale and cast with a shared output buffer, about 54 µs per repetition; with a new output
+  buffer per repetition, about 218 µs per repetition. Consistent with the new-buffer cost being the large part.
+- Reading: the activation input is not the bottleneck. The per-repetition output path to new DDR buffers is. The
+  shared-buffer result suggests about 54 µs of that is scale and cast, and the rest is DDR output handling.
+- Caveats: one compile per point. The base slope differs between this batch (25.4 µs) and the earlier batch (16.8 µs), so
+  slopes are only comparable within one batch. The DDR-buffer-count effect is not separated from the output size.
