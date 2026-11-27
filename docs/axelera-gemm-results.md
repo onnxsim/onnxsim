@@ -511,3 +511,15 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - base, eight repetitions: a 928.9 µs; b and c lost the device.
 - wload, one and eight repetitions: all six runs lost the device.
 - Only two valid numbers came out of this batch. The rest of the batch are not usable. The card was rebooted and healthy afterward.
+
+### Weight load per repetition, valid variant (device test, measured)
+
+- Variant fix: each repetition has its own L1 weight buffer, and the unused prelude weight load is removed.
+  The earlier variant lost the device because of the extra prelude load; the fixed variant ran cleanly.
+- 256×512×512, one compile per point, one run each, health check before and after every run:
+  - weight load plus matmul (wload): R=1 802.0 µs, R=8 1102.2 µs. Slope 42.9 µs per repetition.
+  - matmul only, weights resident (base): R=1 862.8 µs, R=8 980.7 µs. Slope 16.8 µs per repetition.
+- Weight load alone (copy of the 256 KB weight block plus load_imc): about 26 µs per repetition (42.9 minus 16.8).
+- Caveat: one compile per point. Earlier runs of the matmul-only slope ranged about ±15 µs, so the weight-load figure is
+  roughly 26 ± 15 µs until repeated with more compiles.
+- Item 2 (activation DMA) is still not measured.
