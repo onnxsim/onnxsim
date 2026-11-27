@@ -587,3 +587,13 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Reading: input transfer is not on the critical path in this kernel. The scale step costs about 9 µs per tile here, but
   it is an ablation that also changes tiling in the unpipelined builds, so treat it as an upper bound on the scale cost.
 - Caveat: the first full and no-input runs were not interleaved with the others, so only the second batch is used for the median.
+
+### Synchronization ablation and stream structure of the pipelined 8-tile build (device test, measured)
+
+- Removing every A.waits (ABL_NOWAITS, timing only, results invalid): 2033 and 1869 µs full versus 2098 and 1900 µs with
+  no waits. No speedup, so synchronization waits are not the per-tile cost.
+- Stream of the 8-tile overlapped build: 1 matrix program, 8 matrix executes, 8 M_IFD_0 and 8 M_ODR, 16 D_DWPU, 16 D_DPU,
+  16 D_ODR, 8 D_IFD_1, and 34 DMA start and 34 DMA poll tasks.
+- Accounting so far for about 230 µs per tile: matrix execute about 9 µs per 128-row tile (repeat test), scale about 4 to 9
+  µs, input copy hidden, waits none. The remaining cost is not attributed. The digital chains (two per tile) and the
+  DMA output path are the candidates; neither has been isolated with a valid stream.
