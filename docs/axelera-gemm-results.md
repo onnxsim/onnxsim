@@ -486,3 +486,12 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 5. Compiler limits. The lowering iteration limit blocks 4096³, and the L1 limit caps resident data.
 6. Measurement stability. Drift between blocks is about 18%; per-point noise is about ±15 µs.
 7. Command fields. INSTRUCTION and TOKEN semantics, the M_IFD_W address meaning, and the M_DPU width rule are unknown; some flag bits crash the device.
+
+### Scale step, combined effect (device test, measured)
+
+- 256×512×2048, one op, interleaved, three compiles each (kernel median):
+  - full (multiply, then cast): 1724, 1790, 1789 µs. Median 1789 µs. Matrix programs 8, executes 2.
+  - scale skipped (cast of the accumulator only): 1641, 1666, 1595 µs. Median 1641 µs. Matrix programs 4, executes 1.
+- Difference about 148 µs (about 8%). Skipping the scale also changes the compiler's tiling (programs 8 to 4, executes 2
+  to 1), so this is a combined effect, not a pure scale cost. The program-count fit predicts about 70 µs, so the
+  scale step may account for the rest, but the two cannot be separated with these builds.
