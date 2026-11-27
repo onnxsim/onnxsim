@@ -567,3 +567,13 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
 - Two-axis slices (rows and all columns) were needed; a single-axis row slice failed to compile.
 - The non-overlapped two-slot form still fails in the wait placement ("DMA POLL has no matching START"), so it is not
   a baseline here.
+
+### Rows per call, single-output pipelined GEMM (device test, measured)
+
+- 512×512 weights, overlapped form, single output buffer (OUTSLICE=1), one run each, health check before and after:
+  - 1024 rows (8 tiles): 1849 µs kernel, 0.290 TOPS.
+  - 2048 rows (16 tiles): 3143 µs kernel, 0.342 TOPS.
+  - 4096 rows (32 tiles): 5927 µs kernel, 0.362 TOPS.
+- Fit over the three points: about 0.4 ms fixed per call and about 170 µs per 128-row tile. Larger calls amortize the
+  fixed cost, but the per-tile cost stays far above the full-array estimate for a 128×512×512 tile (about 0.63 µs).
+- Caveat: one run per point; no interleaving.
