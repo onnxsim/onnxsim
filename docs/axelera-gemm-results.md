@@ -476,3 +476,13 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   c about 4 µs per execute, a about 1540 µs. The execute term is within noise; the program term is the one the data
   support. This is still three points with no residual check.
 - Drift: the default measured 2035 µs in an earlier block and 1680 µs here. Only compare settings inside one block.
+
+## Open issues for ideal GEMM performance
+
+1. Weight load cost. The fit gives about 17 µs per matrix program, but a weight load has not been timed on its own.
+2. Per-row cost breakdown. Input DMA, scale and cast, and output DMA are mixed in the measurements.
+3. Matrix unit utilization inside an execute. Unverified, because it needs matrix-program fields on the card.
+4. Larger matrix programs. Only settings that increase the program count were found; no control for bigger blocks yet.
+5. Compiler limits. The lowering iteration limit blocks 4096³, and the L1 limit caps resident data.
+6. Measurement stability. Drift between blocks is about 18%; per-point noise is about ±15 µs.
+7. Command fields. INSTRUCTION and TOKEN semantics, the M_IFD_W address meaning, and the M_DPU width rule are unknown; some flag bits crash the device.
