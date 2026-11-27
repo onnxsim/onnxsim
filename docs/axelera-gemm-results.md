@@ -539,3 +539,17 @@ Shape 4096×2048×2048, 1×1 conv, double buffering on.
   shared-buffer result suggests about 54 µs of that is scale and cast, and the rest is DDR output handling.
 - Caveats: one compile per point. The base slope differs between this batch (25.4 µs) and the earlier batch (16.8 µs), so
   slopes are only comparable within one batch. The DDR-buffer-count effect is not separated from the output size.
+
+### Output buffer reuse (device test, measured)
+
+- 256×512×512, weights loaded once, scale and cast each repetition, one compile per point, two rounds interleaved,
+  health check before and after every run. Kernel medians:
+  - shared output buffer (outs): round a R=1 838.6, R=8 1229.7 µs; round b R=1 803.6, R=8 1124.2 µs.
+    Slopes 55.9 and 45.8 µs per repetition.
+  - new DDR output buffer per repetition (outp): round a R=1 804.6, R=8 2133.6 µs; round b R=1 858.9, R=8 2143.9 µs.
+    Slopes 189.9 and 183.6 µs per repetition.
+- Reuse saves about 135 µs per repetition. Both variants write the same bytes per repetition, so the cost is tied to
+  the new buffer per repetition (allocation or footprint), not the bytes written. The scale and cast cost remains
+  about 46 to 56 µs per repetition in both.
+- Caveats: two rounds, one compile each per round. The buffer-count effect is not separated from total DDR footprint
+  (R distinct buffers of 128 KB each).
