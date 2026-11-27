@@ -39,6 +39,8 @@ NOID = os.environ.get('NOID', '0') == '1'
 OVERLAP = os.environ.get('OVERLAP', '0') == '1'
 OUTSLICE = os.environ.get('OUTSLICE', '0') == '1'  # one DDR output buffer, each tile casts into its row slice
 NSLOTS = int(os.environ.get('NSLOTS', '2'))
+ABL_NOIN = os.environ.get('ABL_NOIN', '0') == '1'      # ablation: no input copy after tile 0 (timing only)
+ABL_NOSCALE = os.environ.get('ABL_NOSCALE', '0') == '1'  # ablation: no scale multiply (timing only; changes tiling)
 CHAN = os.environ.get('CHAN', 'default')  # default | alt (even tiles ch0, odd tiles ch1)
 
 
@@ -89,14 +91,16 @@ def build_source():
         body.append(copy_line(0))
         body.append("        A.waits('c0')")
         for i in range(NT):
-            if i + 1 < NT:
+            if i + 1 < NT and not ABL_NOIN:
                 body.append(copy_line(i + 1))
             body.append(f"        acc{i} = axol.atomic.matmul(matrix_ifd=s{i % 2}, matrix_imc=w_imc, id='mm{i}')")
-            waits = [f"'mm{i}'"] + ([f"'c{i + 1}'"] if i + 1 < NT else [])
+            waits = [f"'mm{i}'"] + ([f"'c{i + 1}'"] if (i + 1 < NT and not ABL_NOIN) else [])
             body.append("        A.waits(" + ", ".join(waits) + ")")
-            body.append(f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})")
+            src_acc = f"acc{i}" if ABL_NOSCALE else f"sc{i}"
+            if not ABL_NOSCALE:
+                body.append(f"        sc{i} = axol.atomic.mul(acc{i}, {SCALE!r})")
             if OUTSLICE:
-                body.append(f"        axol.atomic.dpu_cast(sc{i}, o_full[{i * TILE} : {(i + 1) * TILE}, 0 : {NB}])")
+                body.append(f"        axol.atomic.dpu_cast({src_acc}, o_full[{i * TILE} : {(i + 1) * TILE}, 0 : {NB}])")
             else:
                 body += [
                     f'        o{i} = A.alloc_buffer(({TILE}, {NB}), "int8x64", scope=A.DDR)',
