@@ -14,7 +14,7 @@ session, fails to compile.
 quantizer does for such targets:
 
 - **Activations** (graph inputs and every float node output): uint8 (or
-  uint16) asymmetric, per tensor, from the calibrated ``(min, max)`` widened
+  uint16, int8, int16) asymmetric, per tensor, from the calibrated ``(min, max)`` widened
   to include 0. Value-preserving ops (Reshape, Transpose, MaxPool, Split,
   Slice, Resize...) reuse their input's scale and zero point instead.
 - **Conv/ConvTranspose/Gemm/MatMul weights** (constant input 1): INT8
@@ -131,13 +131,27 @@ def _weight_axis(node: onnx.NodeProto, w: np.ndarray) -> Optional[int]:
     return None
 
 
-def _activation_qparams(lo: float, hi: float, qmax: int) -> Tuple[float, int]:
+def _activation_qparams(
+    lo: float, hi: float, qmin: int, qmax: int
+) -> Tuple[float, int]:
+    """Asymmetric ``(scale, zero_point)`` for the calibrated ``[lo, hi]`` (widened
+    to contain 0) on the integer grid ``[qmin, qmax]``. ``qmin=0`` gives the
+    unsigned grid, ``qmin=-128`` / ``-32768`` the signed int8 / int16 one."""
     lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
     if not (np.isfinite(lo) and np.isfinite(hi)) or hi - lo <= 0.0:
         return 1.0, 0
-    scale = (hi - lo) / qmax
-    zp = int(np.clip(np.round(-lo / scale), 0, qmax))
+    scale = (hi - lo) / (qmax - qmin)
+    zp = int(np.clip(np.round(qmin - lo / scale), qmin, qmax))
     return scale, zp
+
+
+# Activation dtype -> (ONNX element type, numpy dtype, qmin, qmax).
+_ACT_DTYPES = {
+    "uint8": (TensorProto.UINT8, np.uint8, 0, 255),
+    "int8": (TensorProto.INT8, np.int8, -128, 127),
+    "uint16": (TensorProto.UINT16, np.uint16, 0, 65535),
+    "int16": (TensorProto.INT16, np.int16, -32768, 32767),
+}
 
 
 # Ops whose output range is bounded to at most [-1, 1] by construction.
@@ -251,12 +265,16 @@ def quantize_full_graph(
             rather than one per tensor
     :param nodes_to_exclude: node names left in float
     :param op_types_to_exclude: op types left in float
-    :param activation_type: ``"uint8"`` or ``"uint16"`` (needs opset >= 21)
+    :param activation_type: ``"uint8"`` (default), ``"int8"``, ``"uint16"`` or
+            ``"int16"``. The signed types quantize onto the full signed grid
+            ``[-128, 127]`` / ``[-32768, 32767]`` with the zero point fitted
+            the same way (asymmetric); ``uint16`` and ``int16`` need opset >= 21
     :returns: the quantized model
     """
-    if activation_type not in ("uint8", "uint16"):
+    if activation_type not in _ACT_DTYPES:
         raise ValueError(
-            f"activation_type must be uint8 or uint16, got {activation_type!r}"
+            "activation_type must be one of uint8, int8, uint16, int16, "
+            f"got {activation_type!r}"
         )
     opset = next(
         (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")), 0
@@ -265,10 +283,11 @@ def quantize_full_graph(
         raise ValueError(
             f"full-graph QDQ needs opset >= 13 (per-axis DequantizeLinear), got {opset}"
         )
-    if activation_type == "uint16" and opset < 21:
-        raise ValueError("uint16 QuantizeLinear/DequantizeLinear needs opset >= 21")
-    act_np = np.uint8 if activation_type == "uint8" else np.uint16
-    qmax = 255 if activation_type == "uint8" else 65535
+    if activation_type in ("uint16", "int16") and opset < 21:
+        raise ValueError(
+            f"{activation_type} QuantizeLinear/DequantizeLinear needs opset >= 21"
+        )
+    _, act_np, qmin, qmax = _ACT_DTYPES[activation_type]
 
     nodes, ops = set(nodes_to_exclude), set(op_types_to_exclude)
     m = _prepare(model)
@@ -305,7 +324,7 @@ def quantize_full_graph(
         return name
 
     def qdq_nodes(src: str, q_name: str, dst: str) -> List[onnx.NodeProto]:
-        scale, zp = _activation_qparams(*ranges[q_name], qmax)
+        scale, zp = _activation_qparams(*ranges[q_name], qmin, qmax)
         act_scale[q_name] = scale
         s = scalar(f"{q_name}_scale", scale, np.float32)
         z = scalar(f"{q_name}_zero_point", zp, act_np)
@@ -400,9 +419,9 @@ def quantize_full_graph(
     def const_act(name: str) -> str:
         c = numpy_helper.to_array(inits[name]).astype(np.float32)
         scale, zp = _activation_qparams(
-            c.min() if c.size else 0.0, c.max() if c.size else 0.0, qmax
+            c.min() if c.size else 0.0, c.max() if c.size else 0.0, qmin, qmax
         )
-        q = np.clip(np.round(c / scale) + zp, 0, qmax)
+        q = np.clip(np.round(c / scale) + zp, qmin, qmax)
         return dq_const(
             name, (name, "c"), q, np.float32(scale), act_np(zp), None, act_np
         )
