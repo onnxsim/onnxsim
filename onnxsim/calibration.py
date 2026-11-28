@@ -1014,6 +1014,117 @@ def _is_gate(n: onnx.NodeProto, consumers: Dict[str, List[onnx.NodeProto]]) -> b
     )
 
 
+def _feed_signature(feed: Tensors):
+    """Input names, non-batch shapes and dtypes of one calibration sample, or
+    ``None`` if the sample has a rank-0 input (which has no batch axis)."""
+    arrays = {k: np.asarray(v) for k, v in feed.items()}
+    if any(a.ndim == 0 for a in arrays.values()):
+        return None
+    return tuple(sorted((k, a.shape[1:], a.dtype.str) for k, a in arrays.items()))
+
+
+def _batched_feeds(calibration_data: Sequence[Tensors], batch_size: int):
+    """Yield the feeds to run: ``batch_size`` consecutive samples merged into one
+    feed by concatenating each input along axis 0. Samples merge only while
+    their input names, non-batch shapes and dtypes agree; a sample with a
+    rank-0 input runs alone. ``batch_size=1`` yields the samples unchanged."""
+    if batch_size <= 1:
+        yield from calibration_data
+        return
+
+    def merge(group: List[Tensors]) -> Tensors:
+        if len(group) == 1:
+            return group[0]
+        return {
+            k: np.concatenate([np.asarray(f[k]) for f in group], axis=0)
+            for k in group[0]
+        }
+
+    group: List[Tensors] = []
+    group_sig = None
+    for feed in calibration_data:
+        sig = _feed_signature(feed)
+        if sig is None:
+            if group:
+                yield merge(group)
+            group, group_sig = [], None
+            yield feed
+            continue
+        if group and (sig != group_sig or len(group) == batch_size):
+            yield merge(group)
+            group = []
+        group.append(feed)
+        group_sig = sig
+    if group:
+        yield merge(group)
+
+
+def _observe_minmax_in_ort(
+    model: onnx.ModelProto,
+    names: Set[str],
+    calibration_data: Sequence[Tensors],
+    so: Any,
+    providers: Optional[Sequence[str]],
+    batch_size: int,
+    stats: "CalibrationStats",
+) -> None:
+    """Pass 1 of :func:`collect_calibration_stats` for the min/max methods.
+
+    Instead of returning every candidate activation to Python and reducing it
+    there, this appends a ``ReduceMin`` and a ``ReduceMax`` node per candidate
+    to a copy of the model and runs that once per calibration feed, so
+    onnxruntime computes the per-batch extremes itself and only two scalars per
+    tensor cross the boundary (the full tensors are not kept alive either).
+    With ``batch_size > 1`` consecutive samples share one run (see
+    :func:`_batched_feeds`), which is exact when every graph input carries the
+    batch on axis 0 and the graph treats samples independently; the default of
+    1 is exact for any graph. Fills ``stats.observed`` and
+    ``stats.mean_observed`` (the mean of the per-run extremes, as
+    ``"minmax_mean"`` needs).
+    """
+    import onnxruntime as ort
+
+    taken = {x for n in model.graph.node for x in [*n.input, *n.output]}
+    taken |= {i.name for i in model.graph.input} | {o.name for o in model.graph.output}
+    reduced = onnx.ModelProto()
+    reduced.CopyFrom(model)
+    order = sorted(names)
+    outputs: List[str] = []
+    for name in order:
+        for kind, op in (("min", "ReduceMin"), ("max", "ReduceMax")):
+            out = f"{name}__onnxsim_{kind}"
+            while out in taken:
+                out += "_"
+            taken.add(out)
+            reduced.graph.node.append(
+                onnx.helper.make_node(op, [name], [out], name=f"{out}_{op}", keepdims=0)
+            )
+            reduced.graph.output.append(onnx.ValueInfoProto(name=out))
+            outputs.append(out)
+
+    sess = ort.InferenceSession(
+        reduced.SerializeToString(),
+        so,
+        providers=list(providers) if providers else None,
+    )
+    per_batch: Dict[str, Tuple[List, List]] = {}
+    for feed in _batched_feeds(calibration_data, batch_size):
+        values = sess.run(outputs, feed)
+        for i, name in enumerate(order):
+            lo, hi = values[2 * i][()], values[2 * i + 1][()]
+            if lo > hi:  # an empty tensor reduces to (+inf, -inf)
+                continue
+            lists = per_batch.setdefault(name, ([], []))
+            lists[0].append(lo)
+            lists[1].append(hi)
+    for name, (lo_list, hi_list) in per_batch.items():
+        stats.observed[name] = (float(np.min(lo_list)), float(np.max(hi_list)))
+    stats.mean_observed = {
+        n: (float(np.nanmean(np.array(lo))), float(np.nanmean(np.array(hi))))
+        for n, (lo, hi) in per_batch.items()
+    }
+
+
 def collect_calibration_stats(
     model: Union[str, onnx.ModelProto],
     calibration_data: Sequence[Tensors],
@@ -1025,6 +1136,7 @@ def collect_calibration_stats(
     pof2_histograms: bool = False,
     quark_hist: Optional[Tuple[bool, int]] = None,
     exact_session: bool = False,
+    calibration_batch_size: int = 1,
 ) -> CalibrationStats:
     """Run the float ``model`` over ``calibration_data`` once and record what
     every calibration method needs (see :class:`CalibrationStats`): pass 1
@@ -1081,6 +1193,16 @@ def collect_calibration_stats(
     if not names:
         return stats
 
+    so = ort.SessionOptions()
+    if exact_session:
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    if not histograms and not pof2_histograms and quark_hist is None:
+        # min/max only: reduce inside onnxruntime (see _observe_minmax_in_ort)
+        _observe_minmax_in_ort(
+            model, names, calibration_data, so, providers, calibration_batch_size, stats
+        )
+        return stats
+
     # Expose every candidate tensor as an extra graph output, so onnxruntime
     # computes (and returns) it without the graph itself needing to change.
     calib_model = onnx.ModelProto()
@@ -1090,9 +1212,6 @@ def collect_calibration_stats(
         if name not in existing_outputs:
             calib_model.graph.output.append(onnx.ValueInfoProto(name=name))
 
-    so = ort.SessionOptions()
-    if exact_session:
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     sess = ort.InferenceSession(
         calib_model.SerializeToString(),
         so,
@@ -1177,6 +1296,7 @@ def calibrate(
     percentile_candidates: Sequence[float] = (99.99, 99.999, 99.99999),
     lwp_metric: str = "mae",
     exact_session: Optional[bool] = None,
+    calibration_batch_size: int = 1,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Run the float ``model`` over every batch in ``calibration_data`` through
@@ -1306,6 +1426,12 @@ def calibrate(
     :param exact_session: run the calibration session with ONNX Runtime's graph
             optimizations off, as Quark's calibrators do (default: on for
             ``"minmse_pof2"`` and the Quark methods, off otherwise)
+    :param calibration_batch_size: (``"minmax"`` only) merge this many
+            consecutive calibration samples into one ONNX Runtime run, by
+            concatenating each input along axis 0. The min/max reduction runs
+            inside onnxruntime either way, so this only cuts the number of runs.
+            Exact when the graph treats the batch's samples independently and
+            every input carries the batch on axis 0; leave at 1 otherwise
     :returns: ``{tensor_name: (min, max)}`` for every tensor
             ``onnxsim_cpp2py_export.list_quantizable_activations`` reports
             (or ``tensor_names``), plus ``extra_tensor_names`` if given
@@ -1335,6 +1461,17 @@ def calibrate(
         raise ValueError(f"unknown calibration method: {method!r}")
     if method == "percentile" and not 50.0 < percentile <= 100.0:
         raise ValueError(f"percentile must be in (50, 100], got {percentile}")
+    if calibration_batch_size < 1:
+        raise ValueError(
+            f"calibration_batch_size must be >= 1, got {calibration_batch_size}"
+        )
+    if calibration_batch_size > 1 and method != "minmax":
+        # minmax_mean averages per-batch extremes, which a merged run would change;
+        # the histogram methods need every sample's full tensor anyway.
+        raise ValueError(
+            "calibration_batch_size > 1 needs method='minmax' (the merged run "
+            f"changes what {method!r} measures)"
+        )
 
     stats = collect_calibration_stats(
         model,
@@ -1352,6 +1489,7 @@ def calibrate(
         exact_session=(
             method == "minmse_pof2" if exact_session is None else exact_session
         ),
+        calibration_batch_size=calibration_batch_size,
     )
     if method in ("minmax", "minmax_mean") and range_symmetric:
         out = dict(stats.mean_observed if method == "minmax_mean" else stats.observed)
@@ -1497,6 +1635,7 @@ def quantize_static(
     minmax_tensor_names: Optional[Sequence[str]] = None,
     auto_options: Optional[Dict] = None,
     infer_shapes: bool = True,
+    calibration_batch_size: int = 1,
 ) -> onnx.ModelProto:
     """
     Unless ``infer_shapes=False``, shape inference first fills in missing
@@ -1538,8 +1677,9 @@ def quantize_static(
             (a method per tensor -- :meth:`CalibrationStats.auto_ranges`;
             to pick one method for the whole model by a task metric, see
             :func:`pick_calibration`).
-    :param full_graph: QDQ *every* float activation (uint8/uint16
-            asymmetric), with INT8 weights and INT32 biases, instead of only
+    :param full_graph: QDQ *every* float activation (asymmetric, in
+            ``activation_type``: uint8 by default, or int8/uint16/int16),
+            with INT8 weights and INT32 biases, instead of only
             the MatMul/Gemm/Conv inputs -- what a whole-graph integer NPU
             (e.g. the Qualcomm HTP through ORT's QNN EP) needs; see
             :mod:`onnxsim.qdq_full_graph`. Graph inputs and the outputs of
@@ -1550,7 +1690,11 @@ def quantize_static(
             scales; the default scheme is always per channel
     :param nodes_to_exclude: (``full_graph`` only) node names left in float
     :param op_types_to_exclude: (``full_graph`` only) op types left in float
-    :param activation_type: (``full_graph`` only) ``"uint8"`` or ``"uint16"``
+    :param activation_type: (``full_graph`` only) ``"uint8"`` (default),
+            ``"int8"``, ``"uint16"`` or ``"int16"`` -- the signed types use
+            the full signed integer grid (see
+            :func:`onnxsim.qdq_full_graph.quantize_full_graph`); 16-bit
+            types need opset >= 21
     :param percentile: (``method="percentile"`` only) passed to
             :func:`calibrate`
     :param auto_options: (``method="auto"`` only) passed to
@@ -1561,6 +1705,8 @@ def quantize_static(
             so the rare large logits that *are* the detections sit above any
             percentile/entropy/mse clip (YOLO11n at the 99.99th percentile
             clips its class logits to ~0, capping every score at ~0.5)
+    :param calibration_batch_size: (``method="minmax"`` only) merge this many
+            calibration samples into one ONNX Runtime run -- see :func:`calibrate`
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -1601,6 +1747,7 @@ def quantize_static(
         auto_options=dict(auto_options or {}, activation_type=activation_type)
         if method == "auto"
         else None,
+        calibration_batch_size=calibration_batch_size,
     )
     return plan.apply(ranges)
 
