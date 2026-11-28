@@ -1125,6 +1125,169 @@ def _observe_minmax_in_ort(
     }
 
 
+# Opt-in: count pass-2 histograms with ONNX nodes inside ONNX Runtime instead of
+# np.histogram on each full tensor. The counts are identical, but on a CPU conv
+# stack (4 x 64ch 56x56 tensors, 8 samples, 2048 bins) it was 0.23s vs 0.14s and
+# 138 vs 109 MiB peak RSS, so it stays off until a workload where it wins is found.
+_COUNT_HISTOGRAMS_IN_ORT = False
+
+
+def _histogram_opset(model: onnx.ModelProto) -> int:
+    return max(
+        (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")),
+        default=0,
+    )
+
+
+def _append_histogram_nodes(
+    g: onnx.GraphProto,
+    name: str,
+    abs_max: float,
+    num_bins: int,
+    taken: Set[str],
+    dtype: np.dtype,
+) -> str:
+    """Append ONNX nodes that count ``name``'s values into ``num_bins`` uniform
+    bins over ``[-abs_max, abs_max]``, exactly as ``np.histogram`` with that
+    explicit range does (values outside it, NaN and inf included, are dropped),
+    and return the int64 output name, shape ``[num_bins]``.
+
+    The bin index is estimated from the uniform width, then corrected against
+    the actual float64 edges in the same way numpy does, since the estimate can
+    be one bin off at an edge. Counting is ``ScatterElements`` with
+    ``reduction="add"`` into a zero vector, so the cost is linear in the
+    tensor's size and the output is ``num_bins`` integers, not the tensor."""
+
+    def fresh(base: str) -> str:
+        out = base
+        while out in taken:
+            out += "_"
+        taken.add(out)
+        return out
+
+    B = num_bins
+    dtype = np.dtype(dtype)
+    # numpy builds np.histogram's edges, and compares values against them, in the
+    # input's own dtype (float32 samples get float32 edges), so mirror that here
+    edges = np.histogram_bin_edges(
+        np.zeros(1, dtype), bins=B, range=(-abs_max, abs_max)
+    )
+    inits = {
+        "edges": edges,
+        "scale": np.array(B / (2 * abs_max), dtype),
+        "A": np.array(abs_max, dtype),
+        "negA": np.array(-abs_max, dtype),
+        "i0": np.array(0, np.int64),
+        "i1": np.array(1, np.int64),
+        "bm1": np.array(B - 1, np.int64),
+        "overflow": np.array(B, np.int64),
+        "st": np.array([0], np.int64),
+        "en": np.array([B], np.int64),
+        "flat": np.array([-1], np.int64),
+        "zeros": np.zeros(B + 1, np.int64),
+    }
+    ini = {k: fresh(f"{name}__hist_{k}") for k in inits}
+    for k, v in inits.items():
+        g.initializer.append(
+            onnx.numpy_helper.from_array(np.asarray(v, dtype=v.dtype), ini[k])
+        )
+
+    def n(op, ins, outs, **attrs):
+        node = onnx.helper.make_node(
+            op,
+            [ini.get(i, i) for i in ins],
+            outs,
+            name=fresh(outs[0] + "_" + op),
+            **attrs,
+        )
+        g.node.append(node)
+        return outs[0]
+
+    def t(base: str) -> str:
+        return fresh(f"{name}__hist_{base}")
+
+    x = name
+    xd = x
+    ge = n("GreaterOrEqual", [xd, ini["negA"]], [t("ge")])
+    le = n("LessOrEqual", [xd, ini["A"]], [t("le")])
+    inr = n("And", [ge, le], [t("inr")])
+    oob = n("Not", [inr], [t("oob")])
+    shifted = n("Add", [xd, ini["A"]], [t("shift")])
+    scaled = n("Mul", [shifted, ini["scale"]], [t("scaled")])
+    floored = n("Floor", [scaled], [t("floor")])
+    fi = n("Cast", [floored], [t("fi")], to=onnx.TensorProto.INT64)
+    idx0 = n("Clip", [fi, ini["i0"], ini["bm1"]], [t("idx0")])
+    lo_e = n("Gather", [ini["edges"], idx0], [t("lo_e")])
+    below = n("Less", [xd, lo_e], [t("below")])
+    below_i = n("Cast", [below], [t("below_i")], to=onnx.TensorProto.INT64)
+    idx_d = n("Sub", [idx0, below_i], [t("idx_d")])
+    idx_dc = n("Clip", [idx_d, ini["i0"], ini["bm1"]], [t("idx_dc")])
+    idx_p1 = n("Add", [idx_dc, ini["i1"]], [t("idx_p1")])
+    idx_p1c = n("Clip", [idx_p1, ini["i0"], ini["bm1"]], [t("idx_p1c")])
+    hi_e = n("Gather", [ini["edges"], idx_p1c], [t("hi_e")])
+    above = n("GreaterOrEqual", [xd, hi_e], [t("above")])
+    above_i = n("Cast", [above], [t("above_i")], to=onnx.TensorProto.INT64)
+    idx_u = n("Add", [idx_dc, above_i], [t("idx_u")])
+    idx_f = n("Clip", [idx_u, ini["i0"], ini["bm1"]], [t("idx_f")])
+    idx_w = n("Where", [oob, ini["overflow"], idx_f], [t("idx_w")])
+    idx1 = n("Reshape", [idx_w, ini["flat"]], [t("idx1")])
+    ones_src = n(
+        "ConstantOfShape",
+        [n("Shape", [x], [t("shape")])],
+        [t("ones")],
+        value=onnx.numpy_helper.from_array(np.array([1], np.int64)),
+    )
+    upd = n("Reshape", [ones_src, ini["flat"]], [t("upd")])
+    counted = n(
+        "ScatterElements",
+        [ini["zeros"], idx1, upd],
+        [t("counted")],
+        axis=0,
+        reduction="add",
+    )
+    return n("Slice", [counted, ini["st"], ini["en"]], [t("counts")])
+
+
+def _accumulate_histograms_in_ort(
+    model: onnx.ModelProto,
+    histograms: Dict[str, "_StreamingHistogram"],
+    dtypes: Dict[str, np.dtype],
+    calibration_data: Sequence[Tensors],
+    so: Any,
+    providers: Optional[Sequence[str]],
+) -> None:
+    """Pass 2 of :func:`collect_calibration_stats`: add every batch's counts into
+    each tensor's histogram, with the counting done inside ONNX Runtime (see
+    :func:`_append_histogram_nodes`). The counts are exact and add across
+    batches, so the result equals the streamed ``np.histogram`` per batch."""
+    import onnxruntime as ort
+
+    if not histograms:
+        return
+    taken = {x for n in model.graph.node for x in [*n.input, *n.output]}
+    taken |= {i.name for i in model.graph.input} | {o.name for o in model.graph.output}
+    taken |= {t.name for t in model.graph.initializer}
+    counted = onnx.ModelProto()
+    counted.CopyFrom(model)
+    order = sorted(histograms)
+    outputs: List[str] = []
+    for name in order:
+        h = histograms[name]
+        out = _append_histogram_nodes(
+            counted.graph, name, h.abs_max, h.counts.size, taken, dtypes[name]
+        )
+        counted.graph.output.append(onnx.ValueInfoProto(name=out))
+        outputs.append(out)
+    sess = ort.InferenceSession(
+        counted.SerializeToString(),
+        so,
+        providers=list(providers) if providers else None,
+    )
+    for feed in calibration_data:
+        for name, value in zip(order, sess.run(outputs, feed)):
+            histograms[name].counts += value
+
+
 def collect_calibration_stats(
     model: Union[str, onnx.ModelProto],
     calibration_data: Sequence[Tensors],
@@ -1233,8 +1396,10 @@ def collect_calibration_stats(
     # histogram range for the others.
     ranges = stats.observed
     per_batch: Dict[str, Tuple[List, List]] = {}  # name -> (batch mins, batch maxes)
+    dtypes: Dict[str, np.dtype] = {}
     for batch in calibration_data:
         for name, arr in outputs_of(batch):
+            dtypes.setdefault(name, arr.dtype)
             batch_min = float(arr.min())
             batch_max = float(arr.max())
             lists = per_batch.setdefault(name, ([], []))
@@ -1267,6 +1432,17 @@ def collect_calibration_stats(
         abs_max = max(abs(lo), abs(hi))
         if 0.0 < abs_max < float("inf"):
             stats.histograms[name] = _StreamingHistogram(abs_max, num_bins)
+    # ScatterElements' reduction="add" needs opset 16; the in-graph counts cover
+    # float32 and float64 tensors (the dtypes whose np.histogram edges we mirror)
+    if (
+        _COUNT_HISTOGRAMS_IN_ORT
+        and _histogram_opset(model) >= 16
+        and all(dtypes.get(n) in (np.float32, np.float64) for n in stats.histograms)
+    ):
+        _accumulate_histograms_in_ort(
+            model, stats.histograms, dtypes, calibration_data, so, providers
+        )
+        return stats
     for batch in calibration_data:
         for name, arr in outputs_of(batch):
             if name in stats.histograms:
